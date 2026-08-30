@@ -115,7 +115,7 @@ function Layout() {
                 fontWeight: 640,
               }}
             >
-              WorkBuddy Switch
+              Switch Tidy
             </div>
             {demoModeEnabled && (
               <Badge variant="secondary" className="mt-1 h-5 border-0 px-1.5 text-[10px] text-sidebar-foreground/60 shadow-none">

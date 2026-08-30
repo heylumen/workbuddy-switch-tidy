@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Eraser, Layers, Loader2, RefreshCw, Sparkles, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -8,6 +8,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -16,7 +17,9 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
+import * as api from "@/lib/api";
 import type { AccountMeta, CreditExpiry, CreditResource } from "@/lib/types";
+import { toast } from "sonner";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -134,6 +137,10 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
 
 export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
+  const [dedupOpen, setDedupOpen] = useState(false);
+  const [dedupBusy, setDedupBusy] = useState(false);
+  const [collapseOpen, setCollapseOpen] = useState(false);
+  const [collapseBusy, setCollapseBusy] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(name);
@@ -215,6 +222,13 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                     <CircleCheck />手动签到
                   </DropdownMenuItem>
                 )}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setDedupOpen(true)}>
+                  <Eraser />清理重复会话
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setCollapseOpen(true)}>
+                  <Layers />折叠同名会话
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
                   <Trash2 />删除账号
@@ -410,6 +424,105 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               })}
             </div>
           )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={dedupOpen} onOpenChange={(open) => { if (!dedupBusy) setDedupOpen(open); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>清理重复会话</DialogTitle>
+            <DialogDescription>
+              {name} · 按 cwd + 正文一致去重，每个分组仅保留最近更新的一条
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 text-sm text-muted-foreground">
+            <p>
+              <strong className="text-foreground">不丢会话：</strong>
+              只有「工作目录相同且 jsonl 正文完全相同」的会话才会被合并；唯一的、内容不同的会话不会被删除。
+            </p>
+            <p>
+              <strong className="text-foreground">执行前请关闭 WorkBuddy 本体</strong>，否则数据库可能被占用导致失败。
+            </p>
+            <p>被清理的重复会话会被软删除（标记 deleted_at），不会从云端移除目标账号的已有副本。</p>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setDedupOpen(false)} disabled={dedupBusy}>
+              取消
+            </Button>
+            <Button
+              disabled={dedupBusy}
+              onClick={async () => {
+                setDedupBusy(true);
+                try {
+                  const res = await api.dedupSessions(account.id);
+                  if (res.ok) {
+                    toast.success(`已清理 ${res.removed} 个重复会话`, { description: name });
+                  } else {
+                    toast.error("清理失败", { description: res.reason || "未知错误" });
+                  }
+                } catch (e) {
+                  toast.error("清理失败", { description: api.asError(e) });
+                } finally {
+                  setDedupBusy(false);
+                  setDedupOpen(false);
+                }
+              }}
+            >
+              {dedupBusy ? <Loader2 className="size-4 animate-spin" /> : <Eraser className="size-4" />}
+              {dedupBusy ? "清理中…" : "确认清理"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={collapseOpen} onOpenChange={(open) => { if (!collapseBusy) setCollapseOpen(open); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>折叠同名会话</DialogTitle>
+            <DialogDescription>
+              {name} · 按 工作区 + 标题 分组，每组仅保留最近更新的一条
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 text-sm text-muted-foreground">
+            <p>
+              <strong className="text-foreground">数据不丢：</strong>
+              被折叠的会话仅做软隐藏（标记 deleted_at），<strong className="text-foreground">jsonl 正文原样保留在磁盘</strong>，以后仍可找回；左栏「空间 / 任务」每个同名分组只显示最新一份。
+            </p>
+            <p>
+              <strong className="text-foreground">与「清理重复会话」区别：</strong>
+              清理只合并逐字一致的副本；折叠按「工作区 + 标题」收起视图冗余，专治切换账号反复复制导致的同名重复。
+            </p>
+            <p>
+              <strong className="text-foreground">执行前请关闭 WorkBuddy 本体</strong>，否则数据库可能被占用导致失败。
+            </p>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setCollapseOpen(false)} disabled={collapseBusy}>
+              取消
+            </Button>
+            <Button
+              disabled={collapseBusy}
+              onClick={async () => {
+                setCollapseBusy(true);
+                try {
+                  const res = await api.collapseSessions(account.id);
+                  if (res.ok) {
+                    toast.success(`已折叠 ${res.removed} 个冗余会话（数据已保留）`, { description: name });
+                  } else {
+                    toast.error("折叠失败", { description: res.reason || "未知错误" });
+                  }
+                } catch (e) {
+                  toast.error("折叠失败", { description: api.asError(e) });
+                } finally {
+                  setCollapseBusy(false);
+                  setCollapseOpen(false);
+                }
+              }}
+            >
+              {collapseBusy ? <Loader2 className="size-4 animate-spin" /> : <Layers className="size-4" />}
+              {collapseBusy ? "折叠中…" : "确认折叠"}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </TooltipProvider>

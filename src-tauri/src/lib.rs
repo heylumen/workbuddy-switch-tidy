@@ -110,6 +110,8 @@ pub fn run() {
             commands::switch_account,
             commands::list_sessions,
             commands::copy_sessions,
+            commands::dedup_sessions,
+            commands::collapse_sessions,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,

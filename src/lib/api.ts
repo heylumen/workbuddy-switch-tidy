@@ -84,6 +84,8 @@ const ROUTES: Record<string, Route> = {
   switch_account: { method: "POST", path: "/api/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
+  dedup_sessions: { method: "POST", path: "/api/sessions/dedup" },
+  collapse_sessions: { method: "POST", path: "/api/sessions/collapse" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -250,6 +252,19 @@ export function copySessions(
   sessionIds: string[],
 ): Promise<{ sourceUid: string; targetUid: string; copied: CopyResult[] }> {
   return call("copy_sessions", { targetAccountId, sessionIds });
+}
+
+export function dedupSessions(
+  accountId: string,
+): Promise<{ ok: boolean; removed: number; removedIds?: string[]; reason?: string }> {
+  return call("dedup_sessions", { accountId });
+}
+
+/** 折叠同名/同目录会话（软隐藏冗余、保留数据）。每个 (工作区+标题) 分组仅保留最新一条。 */
+export function collapseSessions(
+  accountId: string,
+): Promise<{ ok: boolean; removed: number; removedIds?: string[]; reason?: string }> {
+  return call("collapse_sessions", { accountId });
 }
 
 /** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
