@@ -507,6 +507,7 @@ fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
             .build()
             .expect("failed to build reqwest client")
     })
@@ -539,6 +540,7 @@ pub async fn http_request_with_proxy(
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
             .proxy(match reqwest::Proxy::all(proxy) {
                 Ok(proxy) => proxy,
                 Err(e) => return json!({"code": -1, "message": format!("代理地址无效: {e}")}),
@@ -597,6 +599,7 @@ pub async fn http_request_raw(
         Some(proxy) => {
             let mut builder = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                 .proxy(match reqwest::Proxy::all(proxy) {
                     Ok(proxy) => proxy,
                     Err(e) => return (0, HashMap::new(), format!("代理地址无效: {e}")),
@@ -615,6 +618,7 @@ pub async fn http_request_raw(
             } else {
                 match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
+                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                 {
