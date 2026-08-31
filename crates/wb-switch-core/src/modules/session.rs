@@ -348,6 +348,9 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
 
     let mut removed = 0usize;
     let mut removed_ids: Vec<String> = Vec::new();
+    // 写库失败立即中止并回报原因：WorkBuddy 占用锁时不再静默丢结果、不虚报成功数，
+    // 也避免 UPDATE 未生效却把 jsonl 正文删掉造成数据丢失。
+    let mut failure: Option<String> = None;
     for ((_, _), mut members) in groups {
         if members.len() <= 1 {
             continue;
@@ -356,20 +359,30 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
         members.sort_by(|a, b| b.1.cmp(&a.1));
         let _keep = members.remove(0);
         for (cid, _ua, jsonl_path) in members {
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND user_id = ?3",
                 rusqlite::params![now_ms(), &cid, uid],
-            );
+            ) {
+                failure = Some(format!("写入 workbuddy.db 失败（请关闭 WorkBuddy 后重试）：{e}"));
+                break;
+            }
             if let Some(p) = jsonl_path {
                 let _ = std::fs::remove_file(&p);
             }
             removed += 1;
             removed_ids.push(cid);
         }
+        if failure.is_some() {
+            break;
+        }
     }
 
     if !removed_ids.is_empty() {
         delete_edge_sync_mappings(&edge_sync_db_path(), &removed_ids);
+    }
+
+    if let Some(reason) = failure {
+        return json!({ "ok": false, "reason": reason, "removed": removed });
     }
 
     json!({
@@ -379,14 +392,16 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
     })
 }
 
-/// 折叠某账号的「同名/同目录/同内容」会话：按 (归一化 cwd, 展示标题, 归一化正文) 分组，
+/// 折叠某账号的「同名/同目录」会话：按 (归一化 cwd, 展示标题) 分组，
 /// 每组保留 `updated_at` 最新一条，其余仅置 `deleted_at` 软隐藏（**不删 jsonl 正文**，
 /// 记忆全部留盘、以后可恢复），并清理其孤儿云端映射。
 ///
-/// 与 `dedup_sessions_for_user` 的区别：去重按「逐字内容一致」合并；折叠同样要求
-/// 「同内容」才收起，但额外要求「同工作区 + 同标题」——即只有「同空间下、标题相同、
-/// 且正文也相同」的重复副本才会被合并为一条；**同标题但内容不同的会话（用户就同一
-/// 任务反复新建的真实对话）全部保留**，不会误伤。请在 WorkBuddy 关闭后执行。
+/// 与 `dedup_sessions_for_user` 的区别（两者风险等级不同，故判定口径不同）：
+/// - `dedup_sessions_for_user`（清理重复会话）：按「正文逐字一致」合并，且会
+///   `remove_file` **删除 jsonl 正文**，不可恢复 → 保持严格口径，杜绝误删。
+/// - 本函数（折叠同名会话）：仅软隐藏，正文留盘可恢复 → 放宽为「同工作区 + 同标题」
+///   即可收起，用于消除切换账号反复复制产生的同名冗余。
+/// 请在 WorkBuddy 关闭后执行。
 pub fn collapse_sessions_for_user(uid: &str) -> Value {
     let db = workbuddy_db_path();
     if !db.is_file() {
@@ -422,13 +437,12 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
         return json!({ "ok": false, "reason": "查询会话失败", "removed": 0 });
     };
 
-    // 内容指纹索引：把正文里「会话自身 id」替换为中性占位符，使复制产生的
-    // 不同 id 副本在比对时视为同一份内容（与 dedup 同一套归一化口径）。
-    let index = index_project_jsonls();
-    // key = (归一化 cwd, 展示标题, 归一化正文) -> 成员 (cid, updated_at)
-    // 仅「同工作区 + 同标题 + 同内容」才收起；同标题但内容不同的会话
-    // （用户就同一任务反复新建的真实对话）全部保留，杜绝误伤。
-    let mut groups: std::collections::HashMap<(String, String, String), Vec<(String, i64)>> =
+    // 折叠口径：仅按「归一化 cwd + 展示标题」分组，不再要求正文内容一致。
+    // 依据：折叠只置 deleted_at 软隐藏，jsonl 正文原样留盘、随时可恢复；
+    // 而 dedup 会 remove_file 删除正文，故 dedup 保持「正文逐字一致」的严格口径。
+    // 放宽后能收起切换账号反复复制产生的同名冗余，且不会造成数据丢失。
+    // 附带收益：不再逐个读取 jsonl 正文，大仓库下折叠明显更快。
+    let mut groups: std::collections::HashMap<(String, String), Vec<(String, i64)>> =
         std::collections::HashMap::new();
     for r in rows.flatten() {
         let (cid, cwd, title, custom_title, ua) = r;
@@ -437,25 +451,17 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
         if is_claw_workspace(&cwd) {
             continue;
         }
-        // 无正文会话用唯一键（含 cid），不参与内容合并，避免误删空任务；
-        // 这与 dedup 的空会话保护口径一致。
-        let norm_jsonl = match index.get(&cid) {
-            Some(p) => std::fs::read_to_string(p)
-                .ok()
-                .map(|t| normalize_jsonl(&t, &cid))
-                .unwrap_or_else(|| format!("__nojsonl__{cid}")),
-            None => format!("__nojsonl__{cid}"),
-        };
         let key = (
             normalize_cwd(&cwd),
             session_display_title(title, custom_title),
-            norm_jsonl,
         );
         groups.entry(key).or_default().push((cid, ua.unwrap_or(0)));
     }
 
     let mut removed = 0usize;
     let mut removed_ids: Vec<String> = Vec::new();
+    // 写库失败立即中止并回报原因：WorkBuddy 占用锁时不再静默丢结果、不虚报成功数。
+    let mut failure: Option<String> = None;
     for (_, mut members) in groups {
         if members.len() <= 1 {
             continue;
@@ -464,18 +470,28 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
         members.sort_by(|a, b| b.1.cmp(&a.1));
         let _keep = members.remove(0);
         for (cid, _ua) in members {
-            let _ = conn.execute(
+            if let Err(e) = conn.execute(
                 "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND user_id = ?3",
                 rusqlite::params![now_ms(), &cid, uid],
-            );
+            ) {
+                failure = Some(format!("写入 workbuddy.db 失败（请关闭 WorkBuddy 后重试）：{e}"));
+                break;
+            }
             // 注意：不删除 jsonl 正文，记忆留盘、可恢复。
             removed += 1;
             removed_ids.push(cid);
+        }
+        if failure.is_some() {
+            break;
         }
     }
 
     if !removed_ids.is_empty() {
         delete_edge_sync_mappings(&edge_sync_db_path(), &removed_ids);
+    }
+
+    if let Some(reason) = failure {
+        return json!({ "ok": false, "reason": reason, "removed": removed });
     }
 
     json!({
@@ -1545,47 +1561,57 @@ mod e2e_sessions {
 
     fn scn_e14(home: &Path) {
         let uid = "uid-A";
-        // 方案 A 语义：仅「同工作区 + 同标题 + 同内容」才收起。
-        // 同标题但不同内容的会话必须全部保留（保护用户想留的同空间不同会话）。
+        // v1.0.2 放宽口径：折叠仅按「同工作区 + 同标题」判定，不再要求正文一致。
+        // 同工作区同标题的多个会话（内容可不同）一律收起，仅保留 updated_at 最新的一份；
+        // 被收起会话的 jsonl 正文原样留盘、可恢复（折叠只软隐藏，不删正文）。
         seed_session(home, uid, "a1", "需求评审", "/ws/项目甲/", Some("甲-v1"), None, 0, 1000);
-        seed_session(home, uid, "a2", "需求评审", "/ws/项目甲/", Some("甲-v1"), None, 0, 2000); // 同内容 → 合并，保留 a2
-        seed_session(home, uid, "a3", "需求评审", "/ws/项目甲/", Some("甲-v2"), None, 0, 3000); // 不同内容 → 单独保留
-        seed_session(home, uid, "a4", "空任务", "", None, None, 1, 1000);
-        seed_session(home, uid, "a5", "空任务", "", None, None, 1, 900); // 空会话唯一键 → 不合并
-        assert_eq!(active_count(home, &[uid]), 5, "折叠前 5 行");
+        seed_session(home, uid, "a2", "需求评审", "/ws/项目甲/", Some("甲-v2"), None, 0, 2000); // 不同内容
+        seed_session(home, uid, "a3", "需求评审", "/ws/项目甲/", Some("甲-v3"), None, 0, 3000); // 不同内容，最新
+        assert_eq!(active_count(home, &[uid]), 3, "折叠前 3 份同名会话");
 
         let res = collapse_sessions_for_user(uid);
-        assert_eq!(res["removed"].as_u64().unwrap(), 1, "仅 1 份同内容副本被折叠(a1)");
-        assert_eq!(active_count(home, &[uid]), 4, "折叠后剩 4 行(不同内容同名全部保留)");
+        assert_eq!(res["removed"].as_u64().unwrap(), 2, "同工作区+同标题 3 份收起 2 份，保留最新 a3");
+        assert_eq!(active_count(home, &[uid]), 1, "折叠后剩 1 行");
 
-        // 数据留盘：被折叠的 a1 正文仍存盘
+        // 数据留盘：被折叠的 a1/a2 正文仍存盘，仅软隐藏
         assert!(find_jsonl(home, "a1").is_some(), "a1 正文文件保留(数据不丢)");
+        assert!(find_jsonl(home, "a2").is_some(), "a2 正文文件保留(数据不丢)");
         let kept: Vec<String> = list_sessions_for_user(uid)
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v["id"].as_str().unwrap().to_string())
             .collect();
-        assert!(kept.contains(&"a2".to_string()), "保留同内容最新 a2");
-        assert!(kept.contains(&"a3".to_string()), "不同内容 a3 保留(不被误折叠)");
-        assert!(kept.contains(&"a4".to_string()), "空任务 a4 保留");
-        assert!(kept.contains(&"a5".to_string()), "空任务 a5 保留");
-        assert!(!kept.contains(&"a1".to_string()), "同内容旧 a1 被折叠");
+        assert!(kept.contains(&"a3".to_string()), "保留同工作区同标题最新 a3");
+        assert!(!kept.contains(&"a1".to_string()), "旧 a1 被折叠");
+        assert!(!kept.contains(&"a2".to_string()), "旧 a2 被折叠");
     }
 
     fn scn_e15(home: &Path) {
         let uid = "uid-A";
-        // 用户核心场景：同一工作区下，用户为同一任务反复新建了多个
-        // 「标题相同但内容完全不同」的会话。折叠绝不能误伤这些真实对话。
+        // 用户核心场景：同一工作区下，为同一任务反复新建了多个
+        // 「标题相同但内容完全不同」的会话。放宽后这些同名会话应被收起为最新一份。
         seed_session(home, uid, "s1", "牛牛文档工具", "/ws/牛牛/", Some("第1次需求A"), None, 0, 1000);
         seed_session(home, uid, "s2", "牛牛文档工具", "/ws/牛牛/", Some("第2次需求B"), None, 0, 2000);
-        seed_session(home, uid, "s3", "牛牛文档工具", "/ws/牛牛/", Some("第3次需求C"), None, 0, 3000);
-        assert_eq!(active_count(home, &[uid]), 3, "同空间同名不同内容 3 份");
+        seed_session(home, uid, "s3", "牛牛文档工具", "/ws/牛牛/", Some("第3次需求C"), None, 0, 3000); // 最新
+        // 对照组：不同标题、不同工作区，不应被收起
+        seed_session(home, uid, "s4", "牛牛文档工具-改", "/ws/牛牛/", Some("另一标题"), None, 0, 1500);
+        seed_session(home, uid, "s5", "牛牛文档工具", "/ws/牛牛-2/", Some("另一空间"), None, 0, 1500);
+        assert_eq!(active_count(home, &[uid]), 5, "同空间同名 3 份 + 对照组 2 份");
 
         let res = collapse_sessions_for_user(uid);
-        assert_eq!(res["removed"].as_u64().unwrap(), 0, "同内容才合并：不同内容同名会话零折叠");
-        assert_eq!(active_count(home, &[uid]), 3, "3 份全部保留");
+        assert_eq!(res["removed"].as_u64().unwrap(), 2, "仅同工作区+同标题的 3 份收起 2 份(s1,s2)");
+        assert_eq!(active_count(home, &[uid]), 3, "剩 s3 + 对照组 s4/s5 共 3 行");
 
+        let kept: Vec<String> = list_sessions_for_user(uid)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(kept.contains(&"s3".to_string()), "保留最新 s3");
+        assert!(kept.contains(&"s4".to_string()), "不同标题 s4 不被误折叠");
+        assert!(kept.contains(&"s5".to_string()), "不同工作区 s5 不被误折叠");
         // 三条正文都完整留盘
         for id in ["s1", "s2", "s3"] {
             assert!(find_jsonl(home, id).is_some(), "{} 正文保留", id);
