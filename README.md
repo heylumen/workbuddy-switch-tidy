@@ -1,29 +1,37 @@
-# workbuddy-switch
+# workbuddy-switch-tidy
 
-WorkBuddy（腾讯 AI 编程助手）账号切换工具。两种形态：
+WorkBuddy（腾讯 AI 编程助手）多账号切换工具。
 
-- **桌面 App**：从 GitHub Releases 下载 macOS、Windows 或 Linux 安装包（Tauri，推荐日常使用）
-- **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
-
-多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
+本项目 fork 自 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)，在保留上游全部功能的基础上，修复了多账号使用场景中的若干实际问题。
 
 <p align="center">
-  <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
+  <img src="public/icon-transparent.png" alt="Switch Tidy 图标" width="128" />
 </p>
 
 <p align="center">
-  <strong>workbuddy-switch</strong><br />
+  <strong>workbuddy-switch-tidy</strong><br />
   WorkBuddy 多账号切换工具
 </p>
 
+---
 
-### 在线演示
+## 下载
 
-[打开 GitHub Pages 在线演示](https://changexbc.github.io/workbuddy-switch/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用。）
+### 桌面 App（Windows 单 EXE）
 
-## 快速开始
+前往 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 下载最新版：
 
-### npm 安装（webui）
+| 平台 | 文件 | 使用方式 |
+| --- | --- | --- |
+| Windows x64 | `workbuddy-switch-tidy_<版本>.exe` | 双击直接运行，无需安装 |
+
+**首次运行**：Windows SmartScreen 可能提示「Windows 已保护你的电脑」，点击「更多信息」→「仍要运行」即可。
+
+> 本项目不做应用内自动更新，请到 Releases 手动下载新版本替换。
+
+### npm / webui（跨平台）
+
+macOS / Linux 暂无预编译 EXE，可通过 npm 使用：
 
 ```bash
 npm i -g workbuddy-switch
@@ -31,26 +39,9 @@ workbuddy-switch              # 启动本地服务 + 自动打开浏览器
 workbuddy-switch status       # 终端查看当前账号
 ```
 
-webui 界面与桌面 App 一致：账号管理、切换、会话复制、积分统计、自动签到、token 保活、更新检查。
+webui 界面与桌面 App 一致。
 
-### 桌面 App
-
-前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台的安装包：
-
-| 平台 | 安装包 | 安装方式 |
-| --- | --- | --- |
-| macOS Apple Silicon（M 系列，arm64） | `workbuddy-switch_<版本>_aarch64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
-| macOS Intel（x86_64） | `workbuddy-switch_<版本>_x86_64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
-| Windows x64 | `workbuddy-switch_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
-| Linux x64 | `workbuddy-switch_<版本>_amd64.deb` / `workbuddy-switch_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
-
-macOS 首次启动若提示无法验证开发者，先在 Finder 中按住 Control 点击应用并选择「打开」，或前往「系统设置 → 隐私与安全性」选择「仍要打开」。仅当安装包来自上述官方 Releases、且系统仍提示「已损坏」时，再执行：
-
-```bash
-xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
-```
-
-应用能启动但切换账号时提示无权限，请参阅下方 [macOS 权限说明](#macos-权限说明)。
+---
 
 ## 功能
 
@@ -58,39 +49,50 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 | --- | --- |
 | 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
-| 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
-| 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；一键全部签到；30 天签到日志 |
-| Token 保活 | 惰性刷新（操作前不足阈值刷新）+ 每日保活（默认每天无条件刷新一次，阈值 >0 时仅刷新剩余不足该天数的账号），避免 refresh token 过期 |
-| 积分到期查询 | 自动查询每个账号的 WorkBuddy 积分资源、剩余量和到期时间；7 天内到期高亮并按到期优先排序 |
-| 积分统计 | 汇总 WorkBuddy 官方请求用量，展示每日趋势、模型分布、账号消耗和请求明细；官方数据不可用时明确回退到本地余额快照观察 |
-| CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，但默认账号独立；macOS/Linux 通过 `apiKeyHelper`，Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置后续会话使用的账号；任何平台都不会修改正在运行的当前会话 |
-| 自动轮换 | 后台定时把 CodeBuddy CLI 的后续启动账号设为积分最紧迫（最早到期）的账号；当前会话保持原账号，重新加载会话或重启 CLI 后使用新的账号 |
-| 自动更新 | 配置 GitHub Releases 源检查新版本；整包更新经签名校验（tauri-updater） |
-| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
+| 会话复制 | 将勾选会话复制给目标账号；**复制前自动去重**，目标已存在等价会话则跳过 |
+| 清理重复会话 | 按「工作目录 + jsonl 正文逐字一致」合并副本，每组保留最近更新的一条 |
+| 折叠同名会话 | 按「工作区 + 标题」收起视图冗余，专治切换账号反复复制导致的同名重复 |
+| 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；30 天签到日志 |
+| Token 保活 | 惰性刷新 + 每日保活，避免 refresh token 过期 |
+| 积分到期查询 | 查询各账号积分资源、剩余量与到期时间；7 天内到期高亮并按到期优先排序 |
+| 积分统计 | 汇总官方请求用量，展示每日趋势、模型分布、账号消耗与请求明细 |
+| CodeBuddy CLI | 与 WorkBuddy 复用账号库，默认账号独立；Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置 |
+| 自动轮换 | 后台定时把 CLI 后续启动账号设为积分最紧迫的账号 |
+| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问） |
+
+### 两个整理功能的区别
+
+| | 清理重复会话 | 折叠同名会话 |
+| --- | --- | --- |
+| 判定依据 | 工作目录相同 **且** 正文逐字一致 | 工作区 + 标题（同标题不同内容**不折叠**） |
+| 处理对象 | 切换复制产生的完全相同的副本 | 同一对话被反复复制产生的同名冗余 |
+| 数据处理 | 软删除（标记 `deleted_at`） | 软隐藏，**jsonl 正文原样留盘**，可找回 |
+| 结果 | 列表中的重复项消失 | 左栏「空间 / 任务」每个同名分组只显示最新一份 |
+
+> 两者都只作用于**所选账号**，都需**先关闭 WorkBuddy** 再执行。
+
+---
 
 ## 使用
 
-1. **添加账号**：账号页 →「扫码登录」（OAuth device flow）或「从本机导入」「手动添加」
+1. **添加账号**：账号页 →「扫码登录」或「从本机导入」「手动添加」
 2. **切换账号**：账号卡片 →「切换」，可勾选复制当前会话
-3. **自动签到**：账号页可直接开关；设置页可调整保活参数、立即签到并查看日志
-4. **查看积分到期**：账号页会自动查询各账号积分资源；点击「刷新积分」可手动更新，临近到期的资源会高亮，并把快过期账号按最近到期时间排序，最前面的标记为「建议优先使用」
-5. **查看积分统计**：侧栏进入「积分统计」，查看总览、近 30 天趋势、模型分类、账号消耗与请求明细；筛选账号或时间范围不会重复请求官方接口，点击「刷新统计」才会重新采集
-6. **CodeBuddy CLI**：账号页可一键接入/更新认证。macOS/Linux 使用 `apiKeyHelper`，Windows 使用 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（保留其他配置，不依赖 `.cmd` 跳板）。「切换 CodeBuddy」只更新后续加载会话使用的默认账号，当前运行会话不会切换；请由 ACP 重新加载会话，或重启 CodeBuddy CLI 后生效。普通 CLI 在同一进程中执行 `/resume` 不保证重新读取认证配置。
-7. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后后台按间隔检查，并把积分最紧迫的账号设为后续会话的默认账号（策略见下）；正在运行的当前会话不会被自动切换。Windows 会同步最新 Token 到 settings，但仍需重新加载会话或重启 CLI。
-8. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
+3. **查看积分**：账号页自动查询；点「刷新积分」手动更新，临期账号排最前并标记「建议优先」
+4. **整理重复会话**：点账号卡片右上角的 **⋮ 菜单**，选择「清理重复会话」或「折叠同名会话」（**执行前请关闭 WorkBuddy**）
+5. **CodeBuddy CLI**：账号页一键接入；切换只影响后续会话，当前会话需重新加载或重启 CLI
+6. **更新版本**：本项目不做应用内自动更新，请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载新版本替换
+
+---
 
 ## 界面预览
 
-### 管理 WorkBuddy 与 CodeBuddy 账号
+### 账号管理
 
-账号卡片集中展示登录状态、签到状态、积分余额和到期资源，支持切换 WorkBuddy 当前账号，并设置 CodeBuddy CLI 后续会话的默认账号。临期积分会直接标注在对应卡片内，并按紧迫程度优先排列。
+账号卡片集中展示登录状态、签到状态、积分余额与到期资源。临期积分直接标注在卡片内，并按紧迫程度优先排列。
 
 <table>
   <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
+    <tr><th>浅色模式</th><th>深色模式</th></tr>
   </thead>
   <tbody>
     <tr>
@@ -102,14 +104,11 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 
 ### 积分统计
 
-积分统计页展示官方请求用量、每日趋势、模型分布、账号消耗和请求明细。数据来源和更新时间会明确显示；
+展示官方请求用量、每日趋势、模型分布、账号消耗与请求明细，并明确标注数据来源与更新时间。
 
 <table>
   <thead>
-    <tr>
-      <th>浅色模式</th>
-      <th>深色模式</th>
-    </tr>
+    <tr><th>浅色模式</th><th>深色模式</th></tr>
   </thead>
   <tbody>
     <tr>
@@ -119,36 +118,51 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
   </tbody>
 </table>
 
+> 以上截图取自上游项目，功能与布局一致；本版侧边栏品牌名为 `Switch Tidy`。
 
-### 自动轮换策略
+---
 
-自动轮换的目标是防止积分过期浪费：后台定时查询所有账号的积分到期情况，把 CodeBuddy CLI 后续会话的默认账号设为「最紧迫」的账号（最早到期且仍有剩余积分）。macOS/Linux 的 `apiKeyHelper` 与 Windows 的 settings env 都不会替换正在运行会话已经持有的 token；轮换结果需在 ACP 重新加载会话或重启 CLI 后生效。为避免默认账号频繁变化，每次检查按以下顺序决策：
+## 更新日志
 
-1. **有效账号**：查询成功、未过期、有剩余积分的账号才可被选为目标
-2. **紧迫度检查**：所有账号到期都还早（最紧迫的剩余超过 `min_urgency_hours`，默认 72 小时）→ 不切
-3. **已是目标**：CLI 默认账号就是最紧迫账号 → 不切
-4. **冷却期**：切换后 `cooldown_minutes`（默认 120）内不重复切
-5. **活跃保护**：最近 `active_guard_minutes`（默认 30）内 CLI 会话有写入（正在对话）→ 不切
-6. **价值过滤**：目标账号剩余积分低于 `min_remaining_credits` → 不值得切（默认 0 关闭；每次检查会把各账号剩余积分写入日志，可据此调整）
-7. **防抖动**：目标比当前早到期但差异小于 `min_gap_hours`（默认 24）→ 不切
+### v1.0.1
 
-> **生效边界**：自动轮换只更新后续 restore/load 使用的默认账号，不会热切换当前会话。macOS/Linux 下一次 helper 执行会读取最新账号；Windows 会把最新 Token 写入 settings。正在运行的会话继续使用启动或加载时取得的账号；请由 ACP 重新加载会话，或重启 CodeBuddy CLI。普通 CLI 在同一进程内执行 `/resume` 不保证重新读取认证配置。
+- 修复官方服务端增加 User-Agent 校验后，全部账号积分查询失败的问题（HTTP 403 / code=10085）
 
-配置项：`check_interval_minutes`（检查间隔，默认 5）、`cooldown_minutes`、`min_urgency_hours`、`active_guard_minutes`、`min_remaining_credits`、`min_gap_hours`。可在设置页调整，或直接编辑 `~/.wb-switch/auto_rotate_config.json`。
+### v1.0.0
 
-### macOS 权限说明
+- 修复折叠误伤真实会话：分组键加入正文指纹，仅「同工作区 + 同标题 + 同内容」才收起，同标题不同内容的会话全部保留
+- 修复多账号往返切换导致的会话重复累积（切换复制改为 upsert + 复制前去重 + 一键清理）
+- 版本号调整至 1.0.0，软件更名为 `workbuddy-switch-tidy`
+- 发布形态改为 Windows 单 EXE 便携版
 
-切换账号需要写入 WorkBuddy 认证文件，macOS 要求授权「App 管理」（或「完全磁盘访问」）：
+---
 
-1. 首次切换报「无权限」时，点「打开系统设置」
-2. 优先在 **App 管理** 里打开 workbuddy-switch 开关；若没有，则去 **完全磁盘访问** 把 workbuddy-switch 拖进带箭头的框
-3. 授权后重启本应用生效；设置页「权限检测」可随时验证
+## 从源码构建
 
-> webui 模式：由启动服务的终端进程权限决定；若终端已授权完全磁盘访问则无需额外操作。
+需要 Node.js 22+ 与 Rust 工具链（Windows 另需 MSVC Build Tools 与 WebView2）。
+
+```bash
+npm install
+npm run tauri build
+```
+
+产物位于 `target/release/`。
+
+---
+
+## 数据目录
+
+- 账号与配置：`~/.wb-switch/`
+- WorkBuddy 会话数据：`~/.workbuddy/`
+
+> 本工具不改动数据表结构，仅在整理会话时标记会话可见性（`deleted_at`）。
+> ⚠️ 执行「清理重复会话」「折叠同名会话」等写库操作前，请务必关闭 WorkBuddy 客户端，避免 SQLite 锁冲突。
+
+---
 
 ## 致谢
 
-感谢 [Linux.do](https://linux.do) 社区。
+- 上游项目 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 及 [Linux.do](https://linux.do) 社区
 
 ## 许可
 
