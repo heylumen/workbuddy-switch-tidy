@@ -536,10 +536,22 @@ pub async fn http_request_with_proxy(
     headers: Option<&HashMap<String, String>>,
     proxy: Option<&str>,
 ) -> Value {
+    http_request_with_proxy_timeout(url, method, body, headers, proxy, 30).await
+}
+
+/// 同 [`http_request_with_proxy`]，但可指定超时秒数（检查更新等需要快速降级的场景用短超时）。
+pub async fn http_request_with_proxy_timeout(
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+    proxy: Option<&str>,
+    timeout_secs: u64,
+) -> Value {
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
             .proxy(match reqwest::Proxy::all(proxy) {
                 Ok(proxy) => proxy,
@@ -562,6 +574,9 @@ pub async fn http_request_with_proxy(
     if let Some(b) = body {
         req = req.json(&b);
     }
+    // 显式超时（per-request），覆盖共享客户端的默认 30s——
+    // 否则无代理路径走共享 `http_client()` 时自定义超时不生效。
+    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -594,11 +609,24 @@ pub async fn http_request_raw(
     proxy: Option<&str>,
     follow_redirects: bool,
 ) -> (u16, HashMap<String, String>, String) {
+    http_request_raw_timeout(url, method, body, headers, proxy, follow_redirects, 30).await
+}
+
+/// 同 [`http_request_raw`]，但可指定超时秒数（检查更新等需要快速降级的场景用短超时）。
+pub async fn http_request_raw_timeout(
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+    proxy: Option<&str>,
+    follow_redirects: bool,
+    timeout_secs: u64,
+) -> (u16, HashMap<String, String>, String) {
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => {
             let mut builder = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(timeout_secs))
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                 .proxy(match reqwest::Proxy::all(proxy) {
                     Ok(proxy) => proxy,
@@ -617,7 +645,7 @@ pub async fn http_request_raw(
                 http_client().clone()
             } else {
                 match reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
+                    .timeout(std::time::Duration::from_secs(timeout_secs))
                     .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
@@ -638,6 +666,8 @@ pub async fn http_request_raw(
     if let Some(b) = body {
         req = req.json(&b);
     }
+    // 显式超时（per-request），覆盖共享客户端的默认 30s。
+    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
     match req.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
