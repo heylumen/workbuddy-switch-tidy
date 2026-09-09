@@ -27,7 +27,7 @@ WorkBuddy（腾讯 AI 编程助手）多账号切换工具。
 
 **首次运行**：Windows SmartScreen 可能提示「Windows 已保护你的电脑」，点击「更多信息」→「仍要运行」即可。
 
-> 本项目不做应用内自动更新，请到 Releases 手动下载新版本替换。
+> 应用会自动检查 GitHub Releases 并提示新版本，但不做应用内自动下载安装；升级时请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载新版本替换。
 
 ### npm / webui（跨平台）
 
@@ -35,7 +35,7 @@ macOS / Linux 暂无预编译 EXE，可通过 npm 使用：
 
 ```bash
 npm i -g workbuddy-switch
-workbuddy-switch              # 启动本地服务 + 自动打开浏览器
+workbuddy-switch              # 启动 WebUI 服务 + 自动打开浏览器
 workbuddy-switch status       # 终端查看当前账号
 ```
 
@@ -58,6 +58,7 @@ webui 界面与桌面 App 一致。
 | 积分统计 | 汇总官方请求用量，展示每日趋势、模型分布、账号消耗与请求明细 |
 | Token 统计 | 分别查看 WorkBuddy 与 CodeBuddy CLI 的 Token 总览；输入、输出、缓存读写按 K/M/B 展示，趋势图同时呈现每日 Token 构成与调用次数，并提供构成占比、热力图、项目/模型 Top 10 和会话排行 |
 | CodeBuddy CLI | 与 WorkBuddy 复用账号库，默认账号独立；Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置 |
+| CodeBuddy CN IDE | 向国内版桌面客户端注入 Safe Storage 凭证（`state.vscdb`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 相互独立 |
 | 自动轮换 | 后台定时把 CLI 后续启动账号设为积分最紧迫的账号 |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问） |
 
@@ -85,7 +86,8 @@ webui 界面与桌面 App 一致。
 4. **整理重复会话**：点账号卡片右上角的 **⋮ 菜单**，选择「清理重复会话」或「折叠同名会话」（**执行前请关闭 WorkBuddy**）
 5. **CodeBuddy CLI**：账号页一键接入；切换只影响后续会话，当前会话需重新加载或重启 CLI
 6. **查看 Token 统计**：侧栏进入「Token 统计」，选择 WorkBuddy 或 CodeBuddy CLI，查看输入、输出、缓存读写与调用次数
-7. **更新版本**：本项目不做应用内自动更新，请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载新版本替换
+7. **CodeBuddy IDE**：账号卡片一键切换国内版 CodeBuddy CN IDE；首次使用前请先手动打开并登录一次，以生成 Keychain Safe Storage；切换会关闭并重启 IDE
+8. **更新版本**：应用会自动检查新版本并提示；升级请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载替换
 
 ---
 
@@ -123,7 +125,7 @@ webui 界面与桌面 App 一致。
   </tbody>
 </table>
 
-> 以上截图取自上游项目，功能与布局一致；本版侧边栏品牌名为 `Switch Tidy`。
+> 以上截图取自上游项目，功能与布局一致；本项目的侧边栏品牌名为 `Switch Tidy`。
 
 ### Token 统计
 
@@ -133,9 +135,22 @@ webui 界面与桌面 App 一致。
 
 ## 更新日志
 
-### v1.0.2（最新）
+### v1.0.3（最新）
 
-- 合并上游 `changexbc/workbuddy-switch` 全部 15 个提交（分叉点 0.1.28 之后的全部更新），本地自定义功能（去重/折叠/UA 修复等）全部保留，无逻辑删除
+- 对齐上游 `changexbc/workbuddy-switch` 0.1.31 ～ 0.1.34 全部 13 个提交，自定义功能（清理重复会话 / 折叠同名会话 / 检查更新多源降级 / 积分查询 UA 修复）全部保留
+- 新增 **CodeBuddy CN IDE 账号切换**：复用同一账号库，向国内版桌面客户端（www.codebuddy.cn）注入 Safe Storage 凭证（`state.vscdb`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 相互独立。首次使用前需手动打开并登录一次以生成 Keychain Safe Storage
+- 账号页接入 CodeBuddy IDE 状态指示并统一产品图标；账号卡片「N 个工具正在使用」改为按实际接入数量动态统计（WorkBuddy / CLI / IDE）
+- 切换与状态查询移到后台线程：修复子进程管道死锁导致的卡死，避免 `ps` / `mdfind` 等检测阻塞主线程造成页面卡顿
+- 修复 WorkBuddy 升级后切换无法重启的问题（macOS）
+- 修复 CodeBuddy IDE 启动时的零钥匙串弹窗，检测改为显式触发
+- 补齐 macOS 专用代码的 `cfg` 门控（`codebuddy_cn_ide` macOS 专用项与 `Path` 导入），修复 Windows / Linux 构建失败
+- 对齐 WorkBuddy 进程契约，修正 Windows 下 CodeBuddy CN 关停识别
+- 安全修复：消除 `crates/wb-switch-server/src/main.rs` 的敏感信息明文日志（CodeQL `rust/cleartext-logging`，High）；账号模块 3 处告警经核查为旧版本残留，当前代码已剥离 token，下次扫描将自动关闭
+- 统一 11 处版本号至 1.0.3
+
+### v1.0.2
+
+- 合并上游 `changexbc/workbuddy-switch` 全部 15 个提交（分叉点 0.1.28 之后的全部更新），自定义功能（去重/折叠/UA 修复等）全部保留，无逻辑删除
 - 新增 Token 统计页：按会话统计 Token 用量（上游 token_stats 模块 + 前端 TokenStatsPage，同步提供 Tauri 命令与 HTTP API `/api/token-stats`）
 - 新增积分/Token 统计等页面的 UI 优化与组件更新（上游 tabs/skeleton 组件、积分页改版等）
 - 修复检查更新在国内网络（未开 VPN）下必然失败的问题：原先仅请求 `github.com`（国内不可达），改为三级更新源逐级降级——① GitHub 直连 + 国内镜像加速前缀拉取 release 清单，② `releases/latest` 302 跳转解析（VPN 场景），③ jsDelivr CDN 读取仓库 `package.json` 版本（国内一般可达）

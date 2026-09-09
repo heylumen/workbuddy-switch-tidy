@@ -75,7 +75,8 @@ fn print_status() {
         }
         None => println!("当前账号: 未登录"),
     }
-    println!("账号数: {}", account::load_accounts().len());
+    let account_count = account::load_accounts().len();
+    println!("账号数: {account_count}"); // codeql[rust/cleartext-logging] 仅输出账号数量，不含任何账号内容
 }
 
 #[tokio::main]
