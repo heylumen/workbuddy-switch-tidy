@@ -138,7 +138,7 @@ webui 界面与桌面 App 一致。
 ### v1.0.3（最新）
 
 - 对齐上游 `changexbc/workbuddy-switch` 0.1.31 ～ 0.1.34 全部 13 个提交，自定义功能（清理重复会话 / 折叠同名会话 / 检查更新多源降级 / 积分查询 UA 修复）全部保留
-- 新增 **CodeBuddy CN IDE 账号切换**：复用同一账号库，向国内版桌面客户端（www.codebuddy.cn）注入 Safe Storage 凭证（`state.vscdb`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 相互独立。首次使用前需手动打开并登录一次以生成 Keychain Safe Storage
+- 新增 **CodeBuddy CN IDE 账号切换**：复用同一账号库，向国内版桌面客户端（[www.codebuddy.cn](https://www.codebuddy.cn)）注入 Safe Storage 凭证（`state.vscdb`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 相互独立。首次使用前需手动打开并登录一次以生成 Keychain Safe Storage
 - 账号页接入 CodeBuddy IDE 状态指示并统一产品图标；账号卡片「N 个工具正在使用」改为按实际接入数量动态统计（WorkBuddy / CLI / IDE）
 - 切换与状态查询移到后台线程：修复子进程管道死锁导致的卡死，避免 `ps` / `mdfind` 等检测阻塞主线程造成页面卡顿
 - 修复 WorkBuddy 升级后切换无法重启的问题（macOS）
