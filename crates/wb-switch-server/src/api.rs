@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
-    export_import, oauth, process, refresh, rotate, session, switch, token_stats, update,
+    export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -94,6 +94,11 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        .route("/api/travel/status", get(api_travel_status))
+        .route(
+            "/api/travel/config",
+            get(api_travel_config).post(api_save_travel_config),
+        )
         .route(
             "/api/rotate/config",
             get(api_rotate_config).post(api_save_rotate_config),
@@ -549,6 +554,42 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
 
 async fn api_checkin_logs() -> Response {
     json_ok(json!({ "logs": config::load_checkin_logs() }))
+}
+
+async fn api_travel_status() -> Response {
+    travel::reconcile_due_travel(None).await;
+    let items = account::load_accounts()
+        .iter()
+        .map(|acc| {
+            let id = acc.get("id").and_then(Value::as_str).unwrap_or("");
+            let mut value = travel::travel_display(id);
+            value["accountId"] = acc.get("id").cloned().unwrap_or(Value::Null);
+            value["email"] = json!(account::account_display_name(acc));
+            value
+        })
+        .collect::<Vec<_>>();
+    json_ok(json!({ "accounts": items }))
+}
+
+async fn api_travel_config() -> Response {
+    json_ok(config::load_travel_config())
+}
+
+async fn api_save_travel_config(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").unwrap_or(&body);
+    match config::save_travel_config(submitted) {
+        Ok(()) => {
+            let saved = config::load_travel_config();
+            if saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+                tokio::spawn(async {
+                    let _ = travel::run_travel_cycle().await;
+                    let _ = travel::run_travel_claim_cycle().await;
+                });
+            }
+            json_ok(saved)
+        }
+        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
+    }
 }
 
 async fn api_refresh_token(Json(body): Json<Value>) -> Response {

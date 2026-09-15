@@ -44,3 +44,17 @@ npm/platform/*/bin/
 .agents/
 .codex/
 .grok/
+/.workbuddy/
+
+# 本地发布/构建辅助脚本与归档（不纳入开源仓库）
+releases/
+check_104.sh
+test_104.sh
+test_full_104.sh
+check_103.sh
+build.sh
+build.bat
+build.err
+check.txt
+probe.ps1
+_publish_*.py

@@ -1,8 +1,11 @@
-//! 本地 WorkBuddy / CodeBuddy CLI JSONL Token 统计。
+//! 本地 WorkBuddy / CodeBuddy CLI / CodeBuddy IDE Token 统计。
 //!
 //! 这个模块是统计数据的唯一归属：日志只在这里解码、去重和按时间聚合，
 //! Tauri 与 HTTP 层只负责转发结果。响应只包含聚合数字和脱敏标识，不返回
 //! 消息正文、arguments 或认证信息。
+//!
+//! CodeBuddy IDE 不写 JSONL，用量在 `CodeBuddyExtension/Data/**/history/**/index.json`
+//! 的 `requests[].usage` 中；消息正文文件（`messages/`）不会被扫描。
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
@@ -326,22 +329,142 @@ fn total_value(value: &Value) -> u64 {
         })
 }
 
+#[derive(Default)]
+struct SourceCollector {
+    total: Totals,
+    models: HashMap<String, Totals>,
+    projects: HashMap<String, Totals>,
+    sessions: Vec<SessionTotals>,
+    daily: HashMap<String, Totals>,
+    daily_by_model: HashMap<String, HashMap<String, Totals>>,
+    hours: HashMap<String, Totals>,
+    parse_errors: u64,
+    coverage_start_at: Option<i64>,
+    coverage_end_at: Option<i64>,
+    session_key_counts: HashMap<String, usize>,
+}
+
+impl SourceCollector {
+    fn note_parse_error(&mut self) {
+        self.parse_errors = self.parse_errors.saturating_add(1);
+    }
+
+    fn add(&mut self, usage: Usage, value: &Value, project: &str) {
+        self.total.add(usage);
+        let model_name = model(value);
+        self.models
+            .entry(model_name.clone())
+            .or_default()
+            .add(usage);
+        self.projects
+            .entry(project.to_string())
+            .or_default()
+            .add(usage);
+        if let Some(day) = date(value) {
+            self.daily.entry(day.clone()).or_default().add(usage);
+            self.daily_by_model
+                .entry(model_name)
+                .or_default()
+                .entry(day)
+                .or_default()
+                .add(usage);
+        }
+        if let Some(hour) = hour(value) {
+            self.hours.entry(hour).or_default().add(usage);
+        }
+        if let Some(timestamp) = timestamp(value) {
+            self.coverage_start_at = Some(
+                self.coverage_start_at
+                    .map_or(timestamp, |current| current.min(timestamp)),
+            );
+            self.coverage_end_at = Some(
+                self.coverage_end_at
+                    .map_or(timestamp, |current| current.max(timestamp)),
+            );
+        }
+    }
+
+    fn push_session(
+        &mut self,
+        session_id: String,
+        title: Option<String>,
+        project: String,
+        totals: Totals,
+    ) {
+        if totals.records == 0 {
+            return;
+        }
+        let base_key = format!("{project} · {session_id}");
+        let count = self.session_key_counts.entry(base_key.clone()).or_default();
+        *count += 1;
+        let key = if *count == 1 {
+            base_key
+        } else {
+            format!("{base_key} · {}", *count)
+        };
+        self.sessions.push(SessionTotals {
+            key,
+            title,
+            project,
+            session_id,
+            totals,
+        });
+    }
+
+    fn into_value(self, name: &str, files_scanned: usize) -> Value {
+        let daily_by_model = self
+            .daily_by_model
+            .into_iter()
+            .map(|(model, points)| (model, Value::Array(groups(points))))
+            .collect::<Map<String, Value>>();
+        json!({
+            "source": name,
+            "summary": self.total.value(),
+            "models": groups(self.models),
+            "projects": groups(self.projects),
+            "sessions": session_groups(self.sessions),
+            "daily": groups(self.daily),
+            "dailyByModel": daily_by_model,
+            "hours": groups(self.hours),
+            "filesScanned": files_scanned,
+            "parseErrors": self.parse_errors,
+            "coverageStartAt": self.coverage_start_at,
+            "coverageEndAt": self.coverage_end_at,
+        })
+    }
+}
+
+/// Usage fingerprint used to deduplicate copied session history: a copy of a
+/// session carries the full original history (usage records included), so the
+/// same request would otherwise be counted once per copy. Keyed by
+/// (timestamp, input, output, cacheRead, cacheWrite, model).
+type UsageFingerprint = (i64, u64, u64, u64, u64, String);
+
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
     let mut paths = Vec::new();
     files(&root, &mut paths);
-    let mut total = Totals::default();
-    let mut models = HashMap::new();
-    let mut projects = HashMap::new();
-    let mut sessions = Vec::new();
-    let mut daily = HashMap::new();
-    let mut daily_by_model: HashMap<String, HashMap<String, Totals>> = HashMap::new();
-    let mut hours = HashMap::new();
-    let mut parse_errors = 0_u64;
-    let mut coverage_start_at: Option<i64> = None;
-    let mut coverage_end_at: Option<i64> = None;
+    let mut collector = SourceCollector::default();
+    // 复制去重：同一条 usage 记录（同时间戳+用量+模型）在原始会话与其副本中
+    // 逐字重复，全局只统计第一次出现的一份；副本中的重复记录跳过，因此用量
+    // 归属原始会话。副本 mtime 晚于原始会话（复制必然后写），按 mtime 升序
+    // 处理即可保证原始会话先被统计；mtime 相同（同批写入）再按路径字典序，
+    // 保持结果确定。
+    // 已知边界：若原始会话在复制之后仍被继续使用（jsonl 追加导致 mtime 反超
+    // 副本），则该副本先被统计、重复记录归属副本——这只影响会话级归属的细分
+    // 展示，总用量仍然精确等于真实请求（同一指纹全局仅计一次）。与上游
+    // PR #32 的方案口径一致。
+    let mut seen_usage: std::collections::HashSet<UsageFingerprint> =
+        std::collections::HashSet::new();
 
-    paths.sort();
-    let mut session_key_counts = HashMap::<String, usize>::new();
+    paths.sort_by_cached_key(|p| {
+        let mtime = std::fs::metadata(p)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis())
+            .unwrap_or(0);
+        (mtime, p.clone())
+    });
     for path in &paths {
         let session_id = path
             .file_stem()
@@ -351,7 +474,7 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
             .to_string();
         let fallback_project = project_name(&root, path);
         let Ok(file) = std::fs::File::open(path) else {
-            parse_errors = parse_errors.saturating_add(1);
+            collector.note_parse_error();
             continue;
         };
 
@@ -362,11 +485,11 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
 
         for line in BufReader::new(file).lines() {
             let Ok(line) = line else {
-                parse_errors = parse_errors.saturating_add(1);
+                collector.note_parse_error();
                 continue;
             };
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                parse_errors = parse_errors.saturating_add(1);
+                collector.note_parse_error();
                 continue;
             };
             // Title metadata belongs to the whole JSONL session file. Read it
@@ -387,91 +510,295 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
             let Some(usage) = usage(&value) else {
                 continue;
             };
+            // 无时间戳的记录无法构造指纹（例如旧格式），保持原逻辑全部计入，
+            // 与有时间戳记录的处理分开，避免误跳真实请求。
+            if let Some(ts) = timestamp(&value) {
+                let fingerprint: UsageFingerprint = (
+                    ts,
+                    usage.input,
+                    usage.output,
+                    usage.read,
+                    usage.write,
+                    model(&value),
+                );
+                if !seen_usage.insert(fingerprint) {
+                    // 已由原始会话统计过：这是复制副本携带的历史记录，跳过。
+                    continue;
+                }
+            }
             let project = record_project(&value, &fallback_project);
             if session_project.is_none() {
                 session_project = Some(project.clone());
             }
             session_totals.add(usage);
-            total.add(usage);
-            let model_name = model(&value);
-            models
-                .entry(model_name.clone())
-                .or_insert_with(Totals::default)
-                .add(usage);
-            projects
-                .entry(project.clone())
-                .or_insert_with(Totals::default)
-                .add(usage);
-            if let Some(day) = date(&value) {
-                daily
-                    .entry(day.clone())
-                    .or_insert_with(Totals::default)
-                    .add(usage);
-                daily_by_model
-                    .entry(model_name)
-                    .or_default()
-                    .entry(day)
-                    .or_default()
-                    .add(usage);
-            }
-            if let Some(hour) = hour(&value) {
-                hours
-                    .entry(hour)
-                    .or_insert_with(Totals::default)
-                    .add(usage);
-            }
-            if let Some(timestamp) = timestamp(&value) {
-                coverage_start_at = Some(
-                    coverage_start_at.map_or(timestamp, |current| current.min(timestamp)),
-                );
-                coverage_end_at = Some(
-                    coverage_end_at.map_or(timestamp, |current| current.max(timestamp)),
-                );
-            }
+            collector.add(usage, &value, &project);
         }
 
-        if session_totals.records > 0 {
-            let project = session_project.unwrap_or(fallback_project);
-            let base_key = format!("{project} · {session_id}");
-            let count = session_key_counts.entry(base_key.clone()).or_default();
-            *count += 1;
-            let key = if *count == 1 {
-                base_key
-            } else {
-                format!("{base_key} · {}", *count)
-            };
-            sessions.push(SessionTotals {
-                key,
-                title: ai_title.or(summary),
-                project,
-                session_id,
-                totals: session_totals,
-            });
-        }
+        collector.push_session(
+            session_id,
+            ai_title.or(summary),
+            session_project.unwrap_or(fallback_project),
+            session_totals,
+        );
     }
 
-    let daily_by_model = daily_by_model
-        .into_iter()
-        .map(|(model, points)| (model, Value::Array(groups(points))))
-        .collect::<Map<String, Value>>();
-    json!({
-        "source": name,
-        "summary": total.value(),
-        "models": groups(models),
-        "projects": groups(projects),
-        "sessions": session_groups(sessions),
-        "daily": groups(daily),
-        "dailyByModel": daily_by_model,
-        "hours": groups(hours),
-        "filesScanned": paths.len(),
-        "parseErrors": parse_errors,
-        "coverageStartAt": coverage_start_at,
-        "coverageEndAt": coverage_end_at,
+    collector.into_value(name, paths.len())
+}
+
+fn codebuddy_extension_data_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("CodeBuddyExtension")
+        .join("Data")
+}
+
+fn is_ide_conversation_index(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("index.json")
+        && path
+            .parent()
+            .and_then(|parent| parent.parent())
+            .and_then(|parent| parent.parent())
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("history")
+}
+
+fn ide_index_files(root: &Path, output: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|name| name.to_str());
+            // Message bodies contain chat content and must not be scanned.
+            // Checkpoints and the shared Public bucket are unrelated to usage.
+            if !matches!(name, Some("messages" | "check-point" | "backups" | "Public")) {
+                ide_index_files(&path, output);
+            }
+        } else if is_ide_conversation_index(&path) {
+            output.push(path);
+        }
+    }
+}
+
+fn decode_genie_workspace(name: &str) -> Option<String> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let try_decode = |value: &str| -> Option<String> {
+        let padded = match value.len() % 4 {
+            0 => value.to_string(),
+            remainder => format!("{value}{}", "=".repeat(4 - remainder)),
+        };
+        let bytes = engine.decode(padded).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.contains('\0') {
+            return None;
+        }
+        Some(trimmed.to_string())
+    };
+    try_decode(name)
+        .or_else(|| try_decode(&name.replace('_', "/")))
+        .or_else(|| try_decode(&name.replace('_', "+")))
+}
+
+fn ide_project_by_session() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some(root) = crate::modules::vscode_cn_inject::codebuddy_cn_data_dir().map(|dir| {
+        dir.join("User")
+            .join("globalStorage")
+            .join("tencent-cloud.coding-copilot")
+            .join("genie-history")
+    }) else {
+        return map;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return map;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let folder = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let project = decode_genie_workspace(folder)
+            .as_deref()
+            .map(Path::new)
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && name.len() <= 120)
+            .unwrap_or("未知项目")
+            .to_string();
+        let Ok(conversations) = std::fs::read_dir(path.join("conversations")) else {
+            continue;
+        };
+        for conversation in conversations.flatten() {
+            if let Some(id) = conversation.file_name().to_str() {
+                if !id.is_empty() {
+                    map.insert(id.to_string(), project.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
+fn ide_workspace_meta(conv_index: &Path, conv_id: &str) -> (Option<String>, String) {
+    let Some(ws_index) = conv_index
+        .parent()
+        .and_then(|parent| parent.parent())
+        .map(|parent| parent.join("index.json"))
+    else {
+        return (None, "未知模型".to_string());
+    };
+    let Ok(text) = std::fs::read_to_string(ws_index) else {
+        return (None, "未知模型".to_string());
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return (None, "未知模型".to_string());
+    };
+    let Some(conversations) = value.get("conversations").and_then(Value::as_array) else {
+        return (None, "未知模型".to_string());
+    };
+    for conversation in conversations {
+        if conversation.get("id").and_then(Value::as_str) != Some(conv_id) {
+            continue;
+        }
+        let title = non_empty_text(conversation.get("name"))
+            .or_else(|| non_empty_text(conversation.get("title")));
+        let model = non_empty_text(conversation.get("selectedModelId"))
+            .or_else(|| non_empty_text(conversation.get("modelId")))
+            .or_else(|| non_empty_text(conversation.get("model")))
+            .unwrap_or_else(|| "未知模型".to_string());
+        return (title, model);
+    }
+    (None, "未知模型".to_string())
+}
+
+fn ide_request_usage(request: &Value) -> Option<Usage> {
+    let object = request.get("usage")?.as_object()?;
+    if field(object, &["inputTokens", "input_tokens", "prompt_tokens"]).is_none() {
+        return None;
+    }
+    Some(Usage {
+        input: field(object, &["inputTokens", "input_tokens", "prompt_tokens"]).unwrap_or(0),
+        output: field(
+            object,
+            &["outputTokens", "output_tokens", "completion_tokens"],
+        )
+        .unwrap_or(0),
+        read: field(
+            object,
+            &[
+                "cacheTokens",
+                "cacheReadInputTokens",
+                "cache_read_input_tokens",
+            ],
+        )
+        .unwrap_or(0),
+        write: positive_field(
+            object,
+            &[
+                "cachedWriteTokens",
+                "cacheWriteInputTokens",
+                "cache_write_input_tokens",
+                "cache_creation_input_tokens",
+            ],
+        )
+        .unwrap_or(0),
     })
 }
 
-/// Return independent WorkBuddy and CodeBuddy CLI aggregates. `days` is
-/// interpreted in Rust using the same millisecond clock for both sources.
+fn ide_request_timestamp(request: &Value) -> Option<i64> {
+    timestamp(request).or_else(|| {
+        request.get("startedAt").and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+                .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+        })
+    })
+}
+
+fn ide_source(
+    root: PathBuf,
+    name: &str,
+    cutoff: Option<i64>,
+    project_by_session: &HashMap<String, String>,
+) -> Value {
+    let mut paths = Vec::new();
+    ide_index_files(&root, &mut paths);
+    paths.sort();
+    let mut collector = SourceCollector::default();
+
+    for path in &paths {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            collector.note_parse_error();
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            collector.note_parse_error();
+            continue;
+        };
+        let Some(requests) = value.get("requests").and_then(Value::as_array) else {
+            continue;
+        };
+        let session_id = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("未知会话")
+            .to_string();
+        let (title, model_name) = ide_workspace_meta(path, &session_id);
+        let fallback_project = project_by_session
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_else(|| "未知项目".to_string());
+        let mut session_totals = Totals::default();
+        let mut session_project: Option<String> = None;
+
+        for request in requests {
+            let ts = ide_request_timestamp(request);
+            if cutoff.is_some_and(|minimum| ts.is_none_or(|value| value < minimum)) {
+                continue;
+            }
+            let Some(usage) = ide_request_usage(request) else {
+                continue;
+            };
+            let project = fallback_project.clone();
+            if session_project.is_none() {
+                session_project = Some(project.clone());
+            }
+            session_totals.add(usage);
+            collector.add(
+                usage,
+                &json!({
+                    "timestamp": ts,
+                    "providerData": { "model": model_name },
+                }),
+                &project,
+            );
+        }
+
+        collector.push_session(
+            session_id,
+            title,
+            session_project.unwrap_or(fallback_project),
+            session_totals,
+        );
+    }
+
+    collector.into_value(name, paths.len())
+}
+
+/// Return independent WorkBuddy, CodeBuddy CLI, and CodeBuddy IDE aggregates.
+/// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let generated_at = crate::modules::config::now_ms();
@@ -482,12 +809,19 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         _ => None,
     };
     let cutoff = range_days.map(|value| generated_at - value * 86_400_000);
+    let ide_projects = ide_project_by_session();
     json!({
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
             source(home.join(".workbuddy/projects"), "workbuddy", cutoff),
             source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff),
+            ide_source(
+                codebuddy_extension_data_dir(),
+                "codebuddy-ide",
+                cutoff,
+                &ide_projects,
+            ),
         ],
     })
 }
@@ -646,6 +980,89 @@ mod tests {
     }
 
     #[test]
+    fn source_deduplicates_copied_session_history() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-dedup-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        // 原始会话：1 条请求。副本：完整复制该请求（同时间戳+用量+模型）+ 1 条新请求。
+        let original_record = json!({
+            "timestamp": now,
+            "cwd": "/fixture/example-project",
+            "providerData": { "model": "fixture-model" },
+            "message": { "usage": {
+                "input_tokens": 10,
+                "output_tokens": 3,
+                "cache_read_input_tokens": 4
+            }}
+        });
+        let copied_record = original_record.clone();
+        let new_request = json!({
+            "timestamp": now + 1_000,
+            "cwd": "/fixture/example-project",
+            "providerData": { "model": "fixture-model" },
+            "message": { "usage": { "input_tokens": 7, "output_tokens": 2 } }
+        });
+        // 先写原始会话、再写副本，确保副本 mtime 更晚（后处理）。
+        fs::write(project.join("original.jsonl"), format!("{}\n", original_record))
+            .expect("write original fixture");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            project.join("copy.jsonl"),
+            format!("{}\n{}\n", copied_record, new_request),
+        )
+        .expect("write copy fixture");
+
+        let result = source(root.clone(), "fixture", None);
+        // 总量只计真实请求：原始 1 条 + 副本的新请求 1 条，重复记录不计。
+        assert_eq!(result["summary"]["records"], 2);
+        assert_eq!(result["summary"]["input"], 17);
+        assert_eq!(result["summary"]["output"], 5);
+        assert_eq!(result["summary"]["cacheRead"], 4);
+        // 归属：原始会话持有重复记录，副本只计自身新请求。
+        let groups = result["sessions"].as_array().expect("sessions");
+        let original = groups
+            .iter()
+            .find(|group| group["sessionId"] == "original")
+            .expect("original session");
+        let copy = groups
+            .iter()
+            .find(|group| group["sessionId"] == "copy")
+            .expect("copy session");
+        assert_eq!(original["records"], 1);
+        assert_eq!(original["input"], 10);
+        assert_eq!(copy["records"], 1);
+        assert_eq!(copy["input"], 7);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn source_keeps_records_without_timestamp() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-nostamp-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        // 无时间戳的记录无法构造指纹，保持原逻辑全部计入（不去重）。
+        let record = json!({
+            "cwd": "/fixture/example-project",
+            "message": { "usage": { "input_tokens": 10, "output_tokens": 2 } }
+        });
+        fs::write(project.join("a.jsonl"), format!("{}\n", record)).expect("write a");
+        fs::write(project.join("b.jsonl"), format!("{}\n", record)).expect("write b");
+
+        let result = source(root.clone(), "fixture", None);
+        assert_eq!(result["summary"]["records"], 2);
+        assert_eq!(result["summary"]["input"], 20);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn bounded_source_excludes_records_before_cutoff() {
         let now = crate::modules::config::now_ms();
         let root = std::env::temp_dir().join(format!(
@@ -759,5 +1176,134 @@ mod tests {
         assert_ne!(by_id("session-a")["key"], by_id("session-e")["key"]);
 
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn ide_source_reads_request_usage_and_skips_message_bodies() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-ide-{}-{now}",
+            std::process::id()
+        ));
+        let history = root
+            .join("uid")
+            .join("CodeBuddyIDE")
+            .join("uid")
+            .join("history")
+            .join("workspace-hash");
+        let conv_a = history.join("conv-a");
+        let conv_b = history.join("conv-b");
+        let messages = conv_a.join("messages");
+        fs::create_dir_all(&messages).expect("create ide fixture dirs");
+        fs::create_dir_all(&conv_b).expect("create second conversation");
+
+        fs::write(
+            history.join("index.json"),
+            json!({
+                "conversations": [
+                    {
+                        "id": "conv-a",
+                        "name": "IDE 会话标题",
+                        "selectedModelId": "deepseek-v4-flash"
+                    },
+                    {
+                        "id": "conv-b",
+                        "name": "范围外会话",
+                        "selectedModelId": "hy4-preview"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write workspace index");
+        fs::write(
+            conv_a.join("index.json"),
+            json!({
+                "messages": [{ "id": "m1", "role": "assistant", "isComplete": true }],
+                "requests": [{
+                    "id": "req-1",
+                    "state": "complete",
+                    "startedAt": now,
+                    "usage": {
+                        "inputTokens": 100,
+                        "outputTokens": 20,
+                        "cacheTokens": 40,
+                        "cachedWriteTokens": 5
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write conversation index");
+        fs::write(
+            conv_b.join("index.json"),
+            json!({
+                "requests": [{
+                    "id": "req-old",
+                    "state": "complete",
+                    "startedAt": now - 100_000,
+                    "usage": {
+                        "inputTokens": 999,
+                        "outputTokens": 9,
+                        "cacheTokens": 1,
+                        "cachedWriteTokens": 0
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write out-of-range conversation");
+        fs::write(
+            messages.join("ignored.json"),
+            json!({
+                "role": "assistant",
+                "usage": { "inputTokens": 10_000, "outputTokens": 10_000 }
+            })
+            .to_string(),
+        )
+        .expect("write ignored message body");
+
+        let mut projects = HashMap::new();
+        projects.insert("conv-a".to_string(), "example-project".to_string());
+        let result = ide_source(root.clone(), "codebuddy-ide", Some(now - 50_000), &projects);
+
+        assert_eq!(result["source"], "codebuddy-ide");
+        assert_eq!(result["filesScanned"], 2);
+        assert_eq!(result["summary"]["records"], 1);
+        assert_eq!(result["summary"]["input"], 100);
+        assert_eq!(result["summary"]["output"], 20);
+        assert_eq!(result["summary"]["cacheRead"], 40);
+        assert_eq!(result["summary"]["cacheWrite"], 5);
+        assert_eq!(result["summary"]["total"], 125);
+        assert_eq!(result["summary"]["uncachedInput"], 60);
+        assert_eq!(result["models"][0]["key"], "deepseek-v4-flash");
+        assert_eq!(result["projects"][0]["key"], "example-project");
+        assert_eq!(result["sessions"][0]["sessionId"], "conv-a");
+        assert_eq!(result["sessions"][0]["title"], "IDE 会话标题");
+        assert_eq!(result["sessions"].as_array().map(Vec::len), Some(1));
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(result["dailyByModel"]["deepseek-v4-flash"][0]["key"], today);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn decode_genie_workspace_recovers_unix_project_path() {
+        assert_eq!(
+            decode_genie_workspace("L1VzZXJzL2FwcGxlL0RvY3VtZW50cy9Qcm9qZWN0L215LWFnZW50")
+                .as_deref(),
+            Some("/Users/apple/Documents/Project/my-agent")
+        );
+    }
+
+    #[test]
+    fn get_statistics_returns_three_isolated_sources() {
+        let value = get_statistics(None);
+        let sources = value["sources"].as_array().expect("sources");
+        let names: Vec<_> = sources
+            .iter()
+            .map(|source| source["source"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(names, ["workbuddy", "codebuddy-cli", "codebuddy-ide"]);
     }
 }

@@ -125,6 +125,19 @@ export interface CheckinResult {
   error?: string;
 }
 
+export interface TravelConfig {
+  enabled: boolean;
+}
+
+export type TravelStatusLabel = "untraveled" | "no-buddy" | "traveling" | "finished";
+
+export interface TravelStatus {
+  label: TravelStatusLabel;
+  rewardCredit: number | null;
+  locationName?: string | null;
+  arriveAt?: number | null;
+}
+
 export interface AutoRotateConfig {
   enabled: boolean;
   check_interval_minutes: number;
@@ -316,7 +329,7 @@ export interface CreditStatistics {
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {

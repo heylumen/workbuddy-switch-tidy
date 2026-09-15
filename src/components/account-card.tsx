@@ -1,4 +1,4 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Eraser, Layers, Loader2, RefreshCw, Sparkles, Trash2 } from "lucide-react";
+import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Eraser, Layers, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -18,7 +18,7 @@ import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/p
 import { cn } from "@/lib/utils";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import * as api from "@/lib/api";
-import type { AccountMeta, CreditExpiry, CreditResource } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
 import { toast } from "sonner";
 
 const AVATAR_TONES = [
@@ -91,6 +91,75 @@ function accountIdentity(account: AccountMeta): string {
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
 
+function travelIconChip({
+  label,
+  tooltip,
+  variant,
+}: {
+  label: string;
+  tooltip: string;
+  variant: "secondary" | "success";
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={variant} className={cn(chipClass, "px-1")} aria-label={label}>
+          <PlaneTakeoff className="size-3.5" />
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="top">{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+function formatTravelRemaining(arriveAt: number | null | undefined): string | null {
+  if (!arriveAt || arriveAt <= 0) return null;
+  const arriveMs = arriveAt > 1e12 ? arriveAt : arriveAt * 1000;
+  const remainingMs = arriveMs - Date.now();
+  if (remainingMs <= 0) return "即将到达";
+  const totalMinutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0 && minutes > 0) return `剩余 ${hours} 小时 ${minutes} 分钟`;
+  if (hours > 0) return `剩余 ${hours} 小时`;
+  return `剩余 ${minutes} 分钟`;
+}
+
+function travelTooltip(status: TravelStatus): string {
+  const place = status.locationName?.trim();
+  const credit = status.rewardCredit;
+  const points = credit != null ? `+${credit}` : null;
+  const remaining = formatTravelRemaining(status.arriveAt);
+  if (status.label === "traveling") {
+    const parts = [place, points ? `预计 ${points}` : "旅行中", remaining].filter(Boolean);
+    return parts.length > 0 ? parts.join(" · ") : "旅行中";
+  }
+  if (status.label === "finished") {
+    if (place && points) return `${place} · ${points}`;
+    if (place) return `${place} · 已结束`;
+    if (points) return `已结束 · ${points}`;
+    return "已结束";
+  }
+  if (status.label === "no-buddy") return "无 Buddy";
+  return "未旅行";
+}
+
+/** 按旅行状态渲染标签：无 Buddy / 未旅行 / 旅行中 / 已结束。 */
+function travelChip(status: TravelStatus | undefined) {
+  if (!status) return null;
+  switch (status.label) {
+    case "no-buddy":
+      return <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>无 Buddy</Badge>;
+    case "traveling":
+      return travelIconChip({ label: travelTooltip(status), tooltip: travelTooltip(status), variant: "secondary" });
+    case "finished":
+      return travelIconChip({ label: travelTooltip(status), tooltip: travelTooltip(status), variant: "success" });
+    case "untraveled":
+    default:
+      return <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>未旅行</Badge>;
+  }
+}
+
 interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
@@ -98,6 +167,8 @@ interface Props {
   onRefresh?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
+  /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
+  travelStatus?: TravelStatus;
   credit?: CreditExpiry;
   creditLoading?: boolean;
   /** 该账号积分最近一次查询完成时间（时间戳） */
@@ -151,7 +222,7 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
@@ -181,8 +252,18 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
       {todayCheckedIn !== undefined && (
         <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
       )}
+      {travelChip(travelStatus)}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
-      {creditPriority && <Badge variant="warning" className={chipClass}>建议优先</Badge>}
+      {creditPriority && (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Badge variant="warning" className={cn(chipClass, "px-1")} aria-label="建议优先">
+              <Star className="size-3.5" />
+            </Badge>
+          </TooltipTrigger>
+          <TooltipContent side="top">建议优先使用</TooltipContent>
+        </Tooltip>
+      )}
       {!compact && activeProductCount >= 2 && <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>{activeProductCount} 个工具正在使用</Badge>}
     </>
   );
@@ -240,13 +321,6 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                     <CircleCheck />手动签到
                   </DropdownMenuItem>
                 )}
-                <DropdownMenuItem
-                  disabled={featuresDisabled || !codebuddyCnIdeAvailable || !onSwitchCodebuddyCnIde || codebuddyCnIdeBusy || codebuddyCnIdeActive}
-                  onSelect={() => onSwitchCodebuddyCnIde?.(account)}
-                >
-                  <CodeBuddyCnIdeMark size={14} />
-                  {codebuddyCnIdeLoading ? "正在切换 IDE…" : codebuddyCnIdeActive ? "已是 IDE 当前账号" : "切换到 CodeBuddy IDE"}
-                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setDedupOpen(true)}>
                   <Eraser />清理重复会话
@@ -354,13 +428,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         )}
       </header>
 
-      <section className={cn("flex flex-1 flex-col", compact ? "px-3.5 pb-3 pt-3" : "px-5 pb-4 pt-4")}>
+      <section className={cn("flex min-w-0 flex-1 flex-col", compact ? "px-3.5 pb-3 pt-3" : "px-5 pb-4 pt-4")}>
         {creditLoading ? (
           <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />积分查询中…</div>
         ) : !credit ? (
           <div className="py-3 text-sm text-muted-foreground">等待积分数据…</div>
         ) : !credit.ok ? (
-          <div className="flex items-center gap-2 py-3 text-sm text-destructive" title={credit.error}><Coins className="size-4" />积分查询失败</div>
+          <div className="flex min-w-0 items-center gap-2 py-3 text-sm text-destructive" title={credit.error}>
+            <Coins className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">{credit.error || "积分查询失败"}</span>
+          </div>
         ) : (
           <>
             <div className="flex items-baseline gap-x-3 gap-y-1">

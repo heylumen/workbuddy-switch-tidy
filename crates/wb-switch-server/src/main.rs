@@ -11,7 +11,7 @@ mod api;
 
 use serde_json::json;
 
-use wb_switch_core::modules::{account, auth_file, checkin, config, process, rotate, update};
+use wb_switch_core::modules::{auth_file, checkin, config, process, rotate, travel, update};
 
 fn default_port() -> u16 {
     57890
@@ -49,6 +49,24 @@ fn spawn_background_loops() {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         }
     });
+
+    // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
+    tokio::spawn(async move {
+        let _ = travel::run_travel_cycle().await;
+        loop {
+            tokio::time::sleep(travel::TRAVEL_RETRY_INTERVAL).await;
+            let _ = travel::run_travel_cycle().await;
+        }
+    });
+
+    // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
+    tokio::spawn(async move {
+        let _ = travel::run_travel_claim_cycle().await;
+        loop {
+            tokio::time::sleep(travel::TRAVEL_CLAIM_INTERVAL).await;
+            let _ = travel::run_travel_claim_cycle().await;
+        }
+    });
 }
 
 fn print_status() {
@@ -75,8 +93,6 @@ fn print_status() {
         }
         None => println!("当前账号: 未登录"),
     }
-    let account_count = account::load_accounts().len();
-    println!("账号数: {account_count}"); // codeql[rust/cleartext-logging] 仅输出账号数量，不含任何账号内容
 }
 
 #[tokio::main]

@@ -22,9 +22,22 @@ pub const CHECKIN_API_PREFIX: &str = "/v2/billing/meter";
 pub const CHECKIN_LOG_KEEP_DAYS: i64 = 30;
 pub const CHECKIN_LOG_MAX_RECORDS: usize = 500;
 
+/// 派猫猫旅行接口前缀（成长中心，非 /v2/plugin 体系，直接挂在 API 域名下）。
+pub const TRAVEL_API_PREFIX: &str = "/activity/growth/buddy/travel";
+
 static CHECKIN_LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static TRAVEL_CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize travel-cache read-modify-write across depart and claim cycles.
+pub fn with_travel_cache_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = TRAVEL_CACHE_WRITE_LOCK.lock().unwrap();
+    f()
+}
 
 pub const ROTATE_LOG_MAX_RECORDS: usize = 200;
+
+/// 官网套餐页桌面 Chrome UA（plans-usage 捕获）。
+pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 
 // ---------------------------------------------------------------------------
 // 路径
@@ -59,6 +72,14 @@ pub fn checkin_config_file() -> PathBuf {
 
 pub fn checkin_logs_file() -> PathBuf {
     store_dir().join("auto_checkin_logs.json")
+}
+
+pub fn travel_config_file() -> PathBuf {
+    store_dir().join("auto_travel_config.json")
+}
+
+pub fn travel_cache_file() -> PathBuf {
+    store_dir().join("travel_cache.json")
 }
 
 pub fn credit_usage_snapshots_file() -> PathBuf {
@@ -353,6 +374,62 @@ pub fn add_checkin_log(entry: &Value) {
 }
 
 // ---------------------------------------------------------------------------
+// 派猫猫旅行配置 / 缓存
+// ---------------------------------------------------------------------------
+
+/// 默认自动旅行配置。
+pub fn default_travel_config() -> Value {
+    json!({ "enabled": true })
+}
+
+/// 读取自动旅行配置（缺失/损坏时合并默认值）。
+pub fn load_travel_config() -> Value {
+    let mut cfg = default_travel_config();
+    let f = travel_config_file();
+    if f.exists() {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+                if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
+                    cfg["enabled"] = json!(enabled);
+                }
+            }
+        }
+    }
+    cfg
+}
+
+/// 保存自动旅行配置（只保留已知字段）。
+pub fn save_travel_config(cfg: &Value) -> std::io::Result<()> {
+    let mut merged = default_travel_config();
+    if let Some(enabled) = cfg.get("enabled").and_then(Value::as_bool) {
+        merged["enabled"] = json!(enabled);
+    }
+    std::fs::create_dir_all(store_dir())?;
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(&travel_config_file(), &content)
+}
+
+/// 读取旅行缓存（`{ date, completed, results: { accountId: {...} } }`）。
+pub fn load_travel_cache() -> Value {
+    let f = travel_cache_file();
+    if f.exists() {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+                return Value::Object(map);
+            }
+        }
+    }
+    json!({})
+}
+
+/// 保存旅行缓存。
+pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
+    std::fs::create_dir_all(store_dir())?;
+    let content = serde_json::to_string_pretty(cache).unwrap_or_default();
+    atomic_write(&travel_cache_file(), &content)
+}
+
+// ---------------------------------------------------------------------------
 // 自动轮换配置 / 日志（CodeBuddy CLI 账号轮换）
 // ---------------------------------------------------------------------------
 
@@ -532,11 +609,15 @@ pub fn norm_ts(v: Option<&Value>) -> Option<i64> {
 
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+fn http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(DEFAULT_HTTP_USER_AGENT)
+}
+
 fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+        http_client_builder()
             .build()
             .expect("failed to build reqwest client")
     })
@@ -579,9 +660,8 @@ pub async fn http_request_with_proxy_timeout(
 ) -> Value {
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(proxy) => match reqwest::Client::builder()
+        Some(proxy) => match http_client_builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
             .proxy(match reqwest::Proxy::all(proxy) {
                 Ok(proxy) => proxy,
                 Err(e) => return json!({"code": -1, "message": format!("代理地址无效: {e}")}),
@@ -654,9 +734,8 @@ pub async fn http_request_raw_timeout(
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => {
-            let mut builder = reqwest::Client::builder()
+            let mut builder = http_client_builder()
                 .timeout(std::time::Duration::from_secs(timeout_secs))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                 .proxy(match reqwest::Proxy::all(proxy) {
                     Ok(proxy) => proxy,
                     Err(e) => return (0, HashMap::new(), format!("代理地址无效: {e}")),
@@ -673,9 +752,8 @@ pub async fn http_request_raw_timeout(
             if follow_redirects {
                 http_client().clone()
             } else {
-                match reqwest::Client::builder()
+                match http_client_builder()
                     .timeout(std::time::Duration::from_secs(timeout_secs))
-                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                 {

@@ -35,7 +35,18 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         .icon_as_template(true)
         .tooltip(DEFAULT_TOOLTIP)
         .menu(&menu)
-        .show_menu_on_left_click(true)
+        // 菜单仅在右键单击时弹出；左键单击唤起主界面（见 on_tray_icon_event）。
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        })
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open-main-window" => show_main_window(app),
             "open-github" => open_github(app),

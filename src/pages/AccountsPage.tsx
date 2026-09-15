@@ -9,7 +9,6 @@ import {
   QrCode,
   RefreshCw,
   Rows3,
-  ScanSearch,
   Terminal,
 } from "lucide-react";
 
@@ -35,7 +34,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -95,6 +94,29 @@ async function fetchTodayCheckinMap(
   return next;
 }
 
+/** 并行查询各账号今日旅行状态；失败的账号不写入，由调用方保留原值。 */
+async function fetchTravelMap(
+  accountIds: string[],
+  isStale?: () => boolean,
+): Promise<Record<string, TravelStatus>> {
+  const entries = await Promise.all(
+    accountIds.map(async (id) => {
+      try {
+        const res = await api.getTravelStatus(id);
+        if (isStale?.()) return null;
+        return [id, res] as const;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const next: Record<string, TravelStatus> = {};
+  for (const entry of entries) {
+    if (entry) next[entry[0]] = entry[1];
+  }
+  return next;
+}
+
 export default function AccountsPage() {
   const {
     accounts,
@@ -120,12 +142,14 @@ export default function AccountsPage() {
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
   const [checkinMap, setCheckinMap] = useState<Record<string, boolean>>({});
+  const [autoTravelConfig, setAutoTravelConfig] = useState<TravelConfig | null>(null);
+  const [autoTravelSaving, setAutoTravelSaving] = useState(false);
+  /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
+  const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
   const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
   const [codebuddyCnIdeSwitchingId, setCodebuddyCnIdeSwitchingId] = useState<string | null>(null);
-  /** 「检测本机登录」进行中（读钥匙串可能等待授权数秒） */
-  const [detectingCodebuddyCnIde, setDetectingCodebuddyCnIde] = useState(false);
   const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
@@ -175,6 +199,23 @@ export default function AccountsPage() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAutoTravelConfig()
+      .then((config) => {
+        if (!cancelled) setAutoTravelConfig(config);
+      })
+      .catch((e) => {
+        if (!cancelled) {
+          toast.error("自动旅行配置加载失败", { description: api.asError(e) });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   /** 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默） */
   const autoImportTried = useRef(false);
   useEffect(() => {
@@ -204,8 +245,21 @@ export default function AccountsPage() {
   }
 
   useEffect(() => {
+    let cancelled = false;
     void refreshCodebuddyCliStatus();
-    void refreshCodebuddyCnIdeStatus();
+    void (async () => {
+      if (!api.isDemoMode()) {
+        try {
+          await api.detectCodebuddyCnIdeAccount();
+        } catch {
+          /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
+        }
+      }
+      if (!cancelled) await refreshCodebuddyCnIdeStatus();
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [accounts.length]);
 
   // 账号列表变化后并行查询各账号今日签到状态
@@ -222,6 +276,28 @@ export default function AccountsPage() {
     });
     return () => {
       cancelled = true;
+    };
+  }, [accounts]);
+
+  async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
+    const next = await fetchTravelMap(accountIds, isStale);
+    if (!isStale?.() && Object.keys(next).length > 0) {
+      setTravelMap((prev) => ({ ...prev, ...next }));
+    }
+  }
+
+  // 账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  useEffect(() => {
+    if (!accounts.length) return;
+    let cancelled = false;
+    const ids = accounts.map((account) => account.id);
+    void loadTravelMap(ids, () => cancelled);
+    const timer = window.setInterval(() => {
+      void loadTravelMap(ids, () => cancelled);
+    }, 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
     };
   }, [accounts]);
 
@@ -256,6 +332,28 @@ export default function AccountsPage() {
       toast.error("自动签到设置保存失败", { description: api.asError(e) });
     } finally {
       setAutoCheckinSaving(false);
+    }
+  }
+
+  async function onAutoTravelChange(enabled: boolean) {
+    if (!autoTravelConfig || autoTravelSaving) return;
+    const previous = autoTravelConfig;
+    const next = { ...previous, enabled };
+    setAutoTravelConfig(next);
+    setAutoTravelSaving(true);
+    try {
+      setAutoTravelConfig(await api.saveAutoTravelConfig(next));
+      if (enabled) {
+        toast.success("自动旅行已开启", { description: "正在按官方状态派发或领取" });
+        window.setTimeout(() => {
+          void loadTravelMap(accounts.map((account) => account.id));
+        }, 2500);
+      }
+    } catch (e) {
+      setAutoTravelConfig(previous);
+      toast.error("自动旅行设置保存失败", { description: api.asError(e) });
+    } finally {
+      setAutoTravelSaving(false);
     }
   }
 
@@ -362,6 +460,7 @@ export default function AccountsPage() {
         toast.error("批量签到失败", { description: api.asError(e) });
       }
       await refreshCredits(accounts.map((account) => account.id));
+      await loadTravelMap(accounts.map((account) => account.id));
       toast.success("积分到期情况已刷新");
     } finally {
       setCheckinAllRunning(false);
@@ -411,42 +510,6 @@ export default function AccountsPage() {
       });
     } finally {
       setCodebuddyCnIdeSwitchingId(null);
-    }
-  }
-
-  /** 显式检测本机 CodeBuddy IDE 登录态（会读钥匙串，可能触发一次系统授权弹窗）。 */
-  async function onDetectCodebuddyCnIde() {
-    if (detectingCodebuddyCnIde) return;
-    setDetectingCodebuddyCnIde(true);
-    const toastId = toast.loading("正在检测本机 CodeBuddy IDE 登录…", {
-      description: "检测过程可能需要系统授权，请按提示允许",
-    });
-    try {
-      const result = await api.detectCodebuddyCnIdeAccount();
-      if (result.found) {
-        // 匹配成功时后端会把账号写回状态文件；刷新以高亮对应账号卡
-        await refreshCodebuddyCnIdeStatus();
-      }
-      if (result.found && result.matched) {
-        toast.success("检测成功", {
-          id: toastId,
-          description: "已在本机检测到 CodeBuddy IDE 登录账号并匹配到账号库",
-        });
-      } else if (result.found) {
-        toast.info("已检测到本机登录，但未匹配到账号", {
-          id: toastId,
-          description: result.message,
-        });
-      } else {
-        toast.info("未检测到本机 CodeBuddy IDE 登录", {
-          id: toastId,
-          description: result.message ?? "本机 CodeBuddy CN 未找到登录 secret",
-        });
-      }
-    } catch (error) {
-      toast.error("检测失败", { id: toastId, description: api.asError(error) });
-    } finally {
-      setDetectingCodebuddyCnIde(false);
     }
   }
 
@@ -548,33 +611,6 @@ export default function AccountsPage() {
                   CodeBuddy IDE：{codebuddyCnIde?.installed ? (codebuddyCnIde.running ? "运行中" : "已接入") : "未接入"} · 当前账号：{cnIdeCurrentName}
                 </span>
               </span>
-              {codebuddyCnIde?.installed && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <DemoAction>
-                        <Button
-                          variant="outline"
-                          size="icon"
-                          className="size-8 rounded-lg"
-                          disabled={detectingCodebuddyCnIde}
-                          onClick={() => void onDetectCodebuddyCnIde()}
-                          aria-label="检测本机 CodeBuddy IDE 登录账号"
-                        >
-                          {detectingCodebuddyCnIde ? (
-                            <Loader2 className="animate-spin" />
-                          ) : (
-                            <ScanSearch />
-                          )}
-                        </Button>
-                      </DemoAction>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom">
-                    {api.isDemoMode() ? "演示模式下不可操作" : "检测本机 CodeBuddy IDE 登录账号"}
-                  </TooltipContent>
-                </Tooltip>
-              )}
               <span className="group relative inline-flex cursor-default">
                 <span
                   className={
@@ -710,6 +746,21 @@ export default function AccountsPage() {
                 </DemoAction>
                 {autoCheckinSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动签到设置" />}
               </div>
+              <div className="mr-1 flex items-center gap-2.5">
+                <label htmlFor="accounts-auto-travel" className="cursor-pointer text-xs font-medium text-muted-foreground">
+                  自动旅行
+                </label>
+                <DemoAction>
+                  <Switch
+                    id="accounts-auto-travel"
+                    checked={autoTravelConfig?.enabled ?? false}
+                    disabled={!autoTravelConfig || autoTravelSaving}
+                    onCheckedChange={(enabled) => void onAutoTravelChange(enabled)}
+                    aria-label="自动旅行"
+                  />
+                </DemoAction>
+                {autoTravelSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动旅行设置" />}
+              </div>
               <Separator orientation="vertical" className="mx-2 h-5" />
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -768,6 +819,7 @@ export default function AccountsPage() {
                 onCheckin={onCheckin}
                 onRefresh={onRefresh}
                 todayCheckedIn={checkinMap[a.id]}
+                travelStatus={travelMap[a.id]}
                 credit={creditMap[a.id]}
                 creditLoading={creditLoadingMap[a.id]}
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}

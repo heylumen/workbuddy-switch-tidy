@@ -2,6 +2,7 @@ import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
+  TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 
@@ -326,6 +327,18 @@ function checkinConfig(): CheckinConfig {
   return { enabled: true, keepalive_days: 7, lazy_refresh_hours: 12 };
 }
 
+function travelConfig(): TravelConfig {
+  return { enabled: true };
+}
+
+function travelStatus(accountId: string): TravelStatus {
+  const index = Math.max(0, accounts.findIndex((account) => account.id === accountId));
+  // 演示三种状态：旅行中 / 已结束 / 无 Buddy
+  if (index % 3 === 0) return { label: "traveling", rewardCredit: 7, locationName: "咖啡馆", arriveAt: Math.floor(Date.now() / 1000) + 2 * 3600 + 40 * 60 };
+  if (index % 3 === 1) return { label: "finished", rewardCredit: 20, locationName: "健身房" };
+  return { label: "no-buddy", rewardCredit: null, locationName: null };
+}
+
 function rotateConfig(): AutoRotateConfig {
   return { enabled: true, check_interval_minutes: 15, cooldown_minutes: 120, min_gap_hours: 24, min_urgency_hours: 72, active_guard_minutes: 30, min_remaining_credits: 50 };
 }
@@ -382,11 +395,11 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
     demoTokenSession("wb-switch-rust · account-card-redesign", "统一账号卡片视觉和交互", "wb-switch-rust", 6_300_000 * scale, 410_000 * scale, 5_400_000 * scale, 50_000 * scale, Math.round(29 * scale)),
   ];
   const now = Date.now();
-  return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
+  return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
 }
 
 function demoTokenStatistics(days?: number): TokenStatistics {
-  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58)] };
+  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
 /** Read-only demo response provider. It never reads or mutates real user data. */
@@ -415,6 +428,8 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
+    case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
+    case "get_auto_travel_config": return travelConfig();
     case "get_auto_rotate_config": return config;
     case "rotate_status": return rotateStatus;
     case "get_rotate_logs": return { logs: rotateLogs() };

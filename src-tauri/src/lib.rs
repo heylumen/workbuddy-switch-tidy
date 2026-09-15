@@ -30,6 +30,24 @@ fn spawn_background_loops() {
         }
     });
 
+    // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
+    tauri::async_runtime::spawn(async move {
+        let _ = modules::travel::run_travel_cycle().await;
+        loop {
+            tokio::time::sleep(modules::travel::TRAVEL_RETRY_INTERVAL).await;
+            let _ = modules::travel::run_travel_cycle().await;
+        }
+    });
+
+    // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
+    tauri::async_runtime::spawn(async move {
+        let _ = modules::travel::run_travel_claim_cycle().await;
+        loop {
+            tokio::time::sleep(modules::travel::TRAVEL_CLAIM_INTERVAL).await;
+            let _ = modules::travel::run_travel_claim_cycle().await;
+        }
+    });
+
     tauri::async_runtime::spawn(async move {
         let mut last_keepalive_day = String::new();
         let mut last_rotate_at: i64 = 0;
@@ -127,6 +145,9 @@ pub fn run() {
             commands::get_auto_checkin_config,
             commands::save_auto_checkin_config,
             commands::get_checkin_logs,
+            commands::get_travel_status,
+            commands::get_auto_travel_config,
+            commands::save_auto_travel_config,
             commands::refresh_account_token,
             commands::get_auto_rotate_config,
             commands::save_auto_rotate_config,
