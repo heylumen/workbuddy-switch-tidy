@@ -11,12 +11,12 @@ import LimitsPage from "@/pages/LimitsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
-import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
+import { GITHUB_RELEASE_URL, openReleaseUrl } from "@/lib/update";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
 import { useAccountsStore } from "@/stores/accounts";
@@ -24,7 +24,6 @@ import { useAccountsStore } from "@/stores/accounts";
 function UpdateCenter({ running }: { running: boolean | undefined }) {
   const version = useAccountsStore((s) => s.status?.version);
   const [info, setInfo] = useState<UpdateInfo | null>(null);
-  const [dialogOpen, setDialogOpen] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -63,23 +62,18 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
                     type="button"
                     size="icon"
                     className="size-5 rounded-full p-0"
-                    aria-label="更新"
-                    onClick={() => setDialogOpen(true)}
+                    aria-label="打开新版本下载页"
+                    onClick={() => void openReleaseUrl(info?.releaseUrl ?? GITHUB_RELEASE_URL)}
                   >
                     <ArrowUp className="size-3" strokeWidth={2.5} aria-hidden="true" />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="top">更新</TooltipContent>
+                <TooltipContent side="top">打开新版本下载页</TooltipContent>
               </Tooltip>
             )}
           </div>
         </div>
       </section>
-      <UpdateInstallDialog
-        open={dialogOpen}
-        onOpenChange={setDialogOpen}
-        update={info}
-      />
     </>
   );
 }

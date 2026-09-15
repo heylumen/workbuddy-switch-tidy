@@ -21,7 +21,6 @@ import type {
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
 import { cn } from "@/lib/utils";
-import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -649,7 +648,6 @@ function UpdateCard() {
   const version = useAccountsStore((s) => s.status?.version);
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
-  const [installOpen, setInstallOpen] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
   const [githubConfig, setGithubConfig] = useState<GithubConfig>({});
   const [proxyUrl, setProxyUrl] = useState("");
@@ -785,19 +783,9 @@ function UpdateCard() {
                 {info.releaseName && <span className="text-muted-foreground"> · {info.releaseName}</span>}
               </div>
               {info.hasUpdate && (
-                <DemoAction><Button size="sm" onClick={() => setInstallOpen(true)}>
+                <DemoAction><Button size="sm" onClick={() => void openReleaseUrl(info.releaseUrl)}>
                   <ArrowUpCircle />
-                  立即升级
-                </Button></DemoAction>
-              )}
-              {info.releaseUrl && (
-                <DemoAction><Button
-                  variant="link"
-                  size="sm"
-                  className="h-auto p-0"
-                  onClick={() => void openReleaseUrl(info.releaseUrl)}
-                >
-                  打开 GitHub Release
+                  去下载新版本
                 </Button></DemoAction>
               )}
             </AlertDescription>
@@ -811,11 +799,6 @@ function UpdateCard() {
             <AlertDescription>{msg.text}</AlertDescription>
           </Alert>
         )}
-        <UpdateInstallDialog
-          open={installOpen}
-          onOpenChange={setInstallOpen}
-          update={info}
-        />
       </CardContent>
     </SettingsGroup>
   );
