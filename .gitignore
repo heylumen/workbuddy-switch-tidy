@@ -57,4 +57,4 @@ build.bat
 build.err
 check.txt
 probe.ps1
-_publish_*.py
+_pub*.py

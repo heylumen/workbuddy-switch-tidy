@@ -1,7 +1,7 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
+  GithubConfig, LimitEvent, LimitsLedger, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
@@ -402,10 +402,29 @@ function demoTokenStatistics(days?: number): TokenStatistics {
   return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
+function demoLimits(days?: number): LimitsLedger {
+  const now = Date.now();
+  const events: LimitEvent[] = [
+    { occurredAt: atLocalTime(0, 13, 0), resetAt: now + 42 * 60 * 1000, sessionId: "demo-sess-limit-a", accountUid: "demo-user-001", model: "deepseek-v4-flash", active: true },
+    { occurredAt: atLocalTime(0, 11, 20), resetAt: now - 18 * 60 * 1000, sessionId: "demo-sess-limit-b", accountUid: "demo-user-002", model: "kimi-k3-1", active: false },
+    { occurredAt: atLocalTime(1, 16, 5), resetAt: atLocalTime(1, 17, 30), sessionId: "demo-sess-limit-c", accountUid: "demo-user-001", model: "glm-5.2", active: false },
+  ];
+  return {
+    generatedAt: now,
+    rangeDays: days ?? null,
+    events,
+    activeCount: events.filter((event) => event.active).length,
+    filesScanned: 12,
+    parseErrors: 0,
+    coverageStartAt: atLocalTime(6, 9, 0),
+    coverageEndAt: now,
+  };
+}
+
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
-  const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
+  const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "1.0.5" };
   const activeIndex = Math.max(0, demoAccounts.findIndex((account) => account.id === demoActiveCliAccountId));
   const activeAccount = demoAccounts[activeIndex] ?? demoAccounts[0];
   const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
@@ -426,6 +445,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
     case "get_credit_statistics": return buildStatistics();
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
+    case "get_limits": return demoLimits(typeof args?.days === "number" ? args.days : undefined);
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
@@ -434,7 +454,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "rotate_status": return rotateStatus;
     case "get_rotate_logs": return { logs: rotateLogs() };
     case "get_github_config": return githubConfig;
-    case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/changexbc/workbuddy-switch/releases/tag/v0.1.25" };
+    case "check_update": return { ok: true, current: "1.0.5", latest: "1.0.6", latestTag: "v1.0.6", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/heylumen/workbuddy-switch-tidy/releases/tag/v1.0.6" };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
     default: throw new Error(`演示模式缺少只读数据: ${command}`);

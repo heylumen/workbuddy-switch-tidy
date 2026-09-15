@@ -18,7 +18,8 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
-    export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
+    export_import, limits, oauth, process, refresh, rotate, session, switch, token_stats, travel,
+    update,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -87,6 +88,7 @@ pub fn router() -> Router {
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
         .route("/api/token-stats", get(api_token_statistics))
+        .route("/api/limits", get(api_limits))
         .route("/api/checkin", post(api_checkin))
         .route("/api/checkin/all", post(api_checkin_all))
         .route(
@@ -523,6 +525,20 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
         Ok(statistics) => json_ok(statistics),
         Err(error) => json_err(
             format!("扫描 Token 统计失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/limits —— 限额台账：扫描本地 429 日志记录与官方重置时间，可用 ?days=N 限定天数。
+async fn api_limits(RawQuery(query): RawQuery) -> Response {
+    let days = query.as_deref().and_then(|value| {
+        value.split('&').find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
+    });
+    match tokio::task::spawn_blocking(move || limits::get_limits(days)).await {
+        Ok(limits) => json_ok(limits),
+        Err(error) => json_err(
+            format!("扫描限额台账失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }

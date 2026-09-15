@@ -332,6 +332,27 @@ export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?:
 export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
+/** 单条 429 限额事件（来自 ~/.workbuddy/logs/ 解析，账号/模型为反查仅供参考）。 */
+export interface LimitEvent {
+  occurredAt: number;
+  resetAt: number;
+  sessionId?: string | null;
+  accountUid?: string | null;
+  model?: string | null;
+  active: boolean;
+}
+/** 限额台账：扫描本地 429 日志得到的事件列表，含仍在限额中的计数。 */
+export interface LimitsLedger {
+  generatedAt: number;
+  rangeDays?: number | null;
+  events: LimitEvent[];
+  activeCount: number;
+  filesScanned: number;
+  parseErrors: number;
+  coverageStartAt?: number | null;
+  coverageEndAt?: number | null;
+}
+
 export interface CodeBuddyCliStatus {
   configured: boolean;
   authMode?: "settings-env" | "api-key-helper";

@@ -14,6 +14,7 @@ import type {
   CheckinResult,
   CreditExpiry,
   CreditStatistics,
+  LimitsLedger,
   TokenStatistics,
   CopyResult,
   GithubConfig,
@@ -44,7 +45,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_credit_expiry", "get_credit_statistics", "get_token_statistics", "get_auto_checkin_config",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
-  "get_travel_status", "get_auto_travel_config",
+  "get_travel_status", "get_auto_travel_config", "get_limits",
 ]);
 
 export function isDemoMode(): boolean {
@@ -384,6 +385,10 @@ export function getCreditStatistics(refresh = false): Promise<CreditStatistics> 
 
 export function getTokenStatistics(days?: number): Promise<TokenStatistics> {
   return call("get_token_statistics", days ? { days } : undefined);
+}
+
+export function getLimits(days?: number): Promise<LimitsLedger> {
+  return call("get_limits", days ? { days } : undefined);
 }
 
 export function checkin(accountId: string): Promise<CheckinResult> {

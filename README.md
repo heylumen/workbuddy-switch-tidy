@@ -57,6 +57,7 @@ webui 界面与桌面 App 一致。
 | 积分到期查询 | 查询各账号积分资源、剩余量与到期时间；7 天内到期高亮并按到期优先排序 |
 | 积分统计 | 汇总官方请求用量，展示每日趋势、模型分布、账号消耗与请求明细 |
 | Token 统计 | 分别查看 WorkBuddy 与 CodeBuddy CLI 的 Token 总览；输入、输出、缓存读写按 K/M/B 展示，趋势图同时呈现每日 Token 构成与调用次数，并提供构成占比、热力图、项目/模型 Top 10 和会话排行 |
+| 限额台账 | 扫描本地 429 频率限制日志（`~/.workbuddy/logs/`），展示限额历史表与当前仍在限额中的实时倒计时；账号/模型来自会话反查（仅供参考），数据完全来自本机日志、不调用接口 |
 | CodeBuddy CLI | 与 WorkBuddy 复用账号库，默认账号独立；Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置 |
 | CodeBuddy CN IDE | 向国内版桌面客户端注入 Safe Storage 凭证（`state.vscdb`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 相互独立 |
 | 自动轮换 | 后台定时把 CLI 后续启动账号设为积分最紧迫的账号 |
@@ -86,8 +87,9 @@ webui 界面与桌面 App 一致。
 4. **整理重复会话**：点账号卡片右上角的 **⋮ 菜单**，选择「清理重复会话」或「折叠同名会话」（**执行前请关闭 WorkBuddy**）
 5. **CodeBuddy CLI**：账号页一键接入；切换只影响后续会话，当前会话需重新加载或重启 CLI
 6. **查看 Token 统计**：侧栏进入「Token 统计」，选择 WorkBuddy 或 CodeBuddy CLI，查看输入、输出、缓存读写与调用次数
-7. **CodeBuddy IDE**：账号卡片一键切换国内版 CodeBuddy CN IDE；首次使用前请先手动打开并登录一次，以生成 Keychain Safe Storage；切换会关闭并重启 IDE
-8. **更新版本**：应用会自动检查新版本并提示；升级请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载替换
+7. **查看限额台账**：侧栏进入「限额台账」，查看近期 429 频率限制记录、重置时间与当前仍在限额中的倒计时
+8. **CodeBuddy IDE**：账号卡片一键切换国内版 CodeBuddy CN IDE；首次使用前请先手动打开并登录一次，以生成 Keychain Safe Storage；切换会关闭并重启 IDE
+9. **更新版本**：应用会自动检查新版本并提示；升级请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载替换
 
 ---
 
@@ -131,11 +133,37 @@ webui 界面与桌面 App 一致。
 
 按来源展示 Token 总览与每日趋势：输入、输出、缓存读写使用 K/M/B 紧凑单位，趋势图用堆叠柱表示每日 Token 总量与构成、虚线表示调用次数；同时提供 Token 构成占比、活跃热力图、项目/模型 Top 10 与会话排行，帮助快速定位主要消耗来源。
 
+### 限额台账
+
+扫描本地 429 频率限制日志，概览卡展示当前仍在限额中的数量；「限额中」表格实时倒计时显示哪个账号的哪个模型还有多久解锁，「限额历史」保留近期全部触发记录。
+
+<table>
+  <thead>
+    <tr><th>浅色模式</th><th>深色模式</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><img src="docs/images/limits-overview-light.png" alt="限额台账页面（浅色模式，演示数据）" /></td>
+      <td><img src="docs/images/limits-overview-dark.png" alt="限额台账页面（深色模式，演示数据）" /></td>
+    </tr>
+  </tbody>
+</table>
+
+> 限额台账为本 fork 新增功能，以上截图取自演示模式（脱敏演示数据）。
+
 ---
 
 ## 更新日志
 
-### v1.0.4（最新）
+### v1.0.5（最新）
+
+- 新增**限额台账**：扫描本地 WorkBuddy 日志（`~/.workbuddy/logs/`）解析模型 429 频率限制记录与官方重置时间，侧栏新增「限额台账」页面
+  - 限额历史表（触发时间 / 账号 / 模型 / 重置时间 / 状态）与当前仍在限额中的实时倒计时，一眼看到哪个账号的哪个模型现在受限、还有多久解锁
+  - 同一 429 事件在业务日志与 SDK 日志的多份记录自动去重，不重复计入
+  - 账号通过 workbuddy.db 会话归属反查、模型通过会话 jsonl 反查（日志无模型名，仅供参考）
+  - 数据完全来自本机日志，不调用任何接口
+
+### v1.0.4
 
 - 对齐上游 `changexbc/workbuddy-switch` 0.1.35 ～ 0.1.37 全部 8 个提交，既有自定义功能全部保留
 - 新增 **派猫猫旅行** 自动派发与奖励领取：启动即派发一轮，之后周期性补派（含 no-buddy 与瞬时错误重试）与到点领取；账号卡片新增旅行状态标签（无 Buddy / 未旅行 / 旅行中（含剩余时间与预计奖励）/ 已结束），设置页支持自动旅行开关

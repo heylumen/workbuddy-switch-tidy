@@ -140,6 +140,7 @@ pub fn run() {
             commands::get_credit_expiry,
             commands::get_credit_statistics,
             commands::get_token_statistics,
+            commands::get_limits,
             commands::checkin,
             commands::checkin_all,
             commands::get_auto_checkin_config,
