@@ -518,3 +518,28 @@ export interface CodeBuddyCnIdeSwitchResult {
   message?: string;
 }
 
+/**
+ * 单条限额事件（本 fork 的展示模型）。
+ *
+ * 数据来自上游 `get_rate_limits`（按账号聚合的当前受限状态），由 `api.getLimits`
+ * 适配为本结构，以保持「限额台账」独立页的既有展示。
+ */
+export interface LimitEvent {
+  occurredAt: number;
+  resetAt: number;
+  sessionId?: string | null;
+  accountUid?: string | null;
+  model?: string | null;
+  active: boolean;
+}
+/** 限额台账：事件列表 + 仍在限额中的计数（适配层产物）。 */
+export interface LimitsLedger {
+  generatedAt: number;
+  rangeDays?: number | null;
+  events: LimitEvent[];
+  activeCount: number;
+  filesScanned: number;
+  parseErrors: number;
+  coverageStartAt?: number | null;
+  coverageEndAt?: number | null;
+}

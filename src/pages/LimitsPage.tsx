@@ -245,17 +245,20 @@ export default function LimitsPage() {
                 </div>
               </CardContent>
             </Card>
-            <Card className="rounded-2xl bg-card/70 py-0 shadow-none">
-              <CardContent className="flex items-center gap-3 px-5 py-4">
-                <div className="flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                  <Gauge className="size-5" aria-hidden="true" />
-                </div>
-                <div>
-                  <div className="text-xs text-muted-foreground">扫描日志文件数</div>
-                  <div className="text-2xl font-semibold tabular-nums">{ledger.filesScanned}</div>
-                </div>
-              </CardContent>
-            </Card>
+            {/* 上游 get_rate_limits 不返回扫描文件数，恒为 0 时不渲染该卡片，避免显示误导性的「0」 */}
+            {ledger.filesScanned > 0 && (
+              <Card className="rounded-2xl bg-card/70 py-0 shadow-none">
+                <CardContent className="flex items-center gap-3 px-5 py-4">
+                  <div className="flex size-10 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                    <Gauge className="size-5" aria-hidden="true" />
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground">扫描日志文件数</div>
+                    <div className="text-2xl font-semibold tabular-nums">{ledger.filesScanned}</div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
           </section>
 
           {activeEvents.length > 0 && (

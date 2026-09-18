@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  LimitEvent,
+  LimitsLedger,
   AccountMeta,
   AccountRecord,
   AppStatus,
@@ -622,4 +624,42 @@ export function asError(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return JSON.stringify(e ?? "未知错误");
+}
+
+/**
+ * 限额台账（本 fork 适配层）。
+ *
+ * 上游 `getRateLimits()` 返回「按账号聚合的当前受限模型」；本函数把它摊平成
+ * 单条事件列表，保持「限额台账」独立页的既有展示（事件表 + 倒计时 + 统计卡）。
+ *
+ * 注意：上游 payload 不含「扫描文件数 / 解析错误数」，故这两项恒为 0
+ * （页面对 0 值做了隐藏处理）。
+ */
+export async function getLimits(_days?: number | null): Promise<LimitsLedger> {
+  const payload = await getRateLimits();
+  const now = Date.now();
+  const events: LimitEvent[] = [];
+  for (const account of payload.accounts ?? []) {
+    for (const entry of account.limited ?? []) {
+      events.push({
+        occurredAt: entry.firstSeenAt,
+        resetAt: entry.resetAt,
+        sessionId: null,
+        accountUid: account.accountId,
+        model: entry.model,
+        active: entry.resetAt > now,
+      });
+    }
+  }
+  events.sort((x, y) => y.occurredAt - x.occurredAt);
+  return {
+    generatedAt: payload.scannedAt ?? now,
+    rangeDays: payload.windowDays ?? null,
+    events,
+    activeCount: events.filter((e) => e.active).length,
+    filesScanned: 0,
+    parseErrors: 0,
+    coverageStartAt: null,
+    coverageEndAt: null,
+  };
 }

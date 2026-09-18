@@ -1,7 +1,7 @@
 {
   "name": "wb-switch-rust",
   "private": true,
-  "version": "0.1.40",
+  "version": "1.0.6",
   "type": "module",
   "scripts": {
     "dev": "vite",

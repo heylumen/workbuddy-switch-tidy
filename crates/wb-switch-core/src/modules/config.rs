@@ -48,6 +48,14 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // ---------------------------------------------------------------------------
 
 pub fn home_dir() -> PathBuf {
+    // 本 fork 保留：允许用 WORKBUDDY_HOME 重定向数据根（单元测试隔离与便携化运行必需）。
+    // 上游版本直接取 dirs::home_dir()，会导致所有依赖临时数据根的测试无法隔离。
+    if let Ok(dir) = std::env::var("WORKBUDDY_HOME") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 

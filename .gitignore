@@ -57,4 +57,5 @@ build.bat
 build.err
 check.txt
 probe.ps1
-/_*.py
+# 根目录下的下划线临时文件（脚本/提交信息等）一律忽略
+/_*
