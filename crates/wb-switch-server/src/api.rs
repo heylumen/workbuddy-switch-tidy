@@ -124,6 +124,8 @@ pub fn router() -> Router {
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
         .route("/api/travel/status", get(api_travel_status))
+    .route("/api/sessions/dedup", post(api_dedup_sessions))
+    .route("/api/sessions/collapse", post(api_collapse_sessions))
         .route(
             "/api/travel/config",
             get(api_travel_config).post(api_save_travel_config),
@@ -903,4 +905,54 @@ mod tests {
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
     }
+}
+
+/// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
+async fn api_dedup_sessions(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if account_id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let uid = target
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if uid.is_empty() {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = session::dedup_sessions_for_user(&uid);
+    json_ok(result)
+}
+
+/// POST /api/sessions/collapse —— 折叠指定账号下「同名/同目录」会话（软隐藏冗余）。
+async fn api_collapse_sessions(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if account_id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let uid = target
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if uid.is_empty() {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = session::collapse_sessions_for_user(&uid);
+    json_ok(result)
 }

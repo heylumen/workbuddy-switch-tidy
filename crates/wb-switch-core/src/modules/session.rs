@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::modules::auth_file;
+use crate::modules::variant::WbVariant;
 use crate::modules::config::{backup_dir, home_dir, now_ms, now_secs, utc_iso};
 
 /// 打开数据库并设置 busy_timeout（对照 Python `sqlite3.connect(timeout=5)`）。
-fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
+pub(crate) fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     let conn = if read_only {
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?
     } else {
@@ -29,26 +30,55 @@ fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     Some(conn)
 }
 
-pub fn workbuddy_db_path() -> PathBuf {
-    home_dir().join(".workbuddy").join("workbuddy.db")
+pub fn workbuddy_db_path(variant: WbVariant) -> PathBuf {
+    variant.data_root().join("workbuddy.db")
 }
 
-fn edge_sync_db_path() -> PathBuf {
-    home_dir()
-        .join(".workbuddy")
-        .join("edge-sync-mapping-v2.db")
+/// 档位不支持会话复制时的统一错误文案。
+pub const SESSION_COPY_UNSUPPORTED: &str = "该档位暂不支持会话复制";
+
+/// 会话复制能力探测：数据根同时具备 `projects/` 目录与 `workbuddy.db` 的 `sessions` 表才可用。
+///
+/// 为什么必须探测而不是按档位写死：国际版数据根与国内版不同构（本机实测国际版数据根下
+/// 没有 `projects/`、edge-sync 为 v4）。直接套用国内版假设会写出「有 db 记录但没有正文」的
+/// 半成品会话。纯函数，接受根路径参数以便用临时目录做单元测试。
+pub fn session_copy_supported_at(root: &Path) -> bool {
+    if !root.join("projects").is_dir() {
+        return false;
+    }
+    let db = root.join("workbuddy.db");
+    if !db.is_file() {
+        return false;
+    }
+    let Some(conn) = open_db(&db, true) else {
+        return false;
+    };
+    table_exists(&conn, "sessions")
+}
+
+
+fn edge_sync_db_path(variant: WbVariant) -> PathBuf {
+    variant.data_root().join(edge_sync_db_name(variant))
+}
+
+/// 云端映射库文件名：国内版历史为 v2；国际版实测为 v4。
+fn edge_sync_db_name(variant: WbVariant) -> &'static str {
+    match variant {
+        WbVariant::Cn => "edge-sync-mapping-v2.db",
+        WbVariant::Ai => "edge-sync-mapping-v4.db",
+    }
 }
 
 /// 当前认证账号的 uid（认证文件 account.uid）。
-pub fn current_user_uid() -> Option<String> {
-    let auth = auth_file::read_auth_file()?;
+pub fn current_user_uid(variant: WbVariant) -> Option<String> {
+    let auth = auth_file::read_auth_file(variant)?;
     auth.get("account")
         .and_then(|a| a.get("uid"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
-fn table_exists(conn: &Connection, name: &str) -> bool {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
         [name],
@@ -291,7 +321,7 @@ fn find_target_session_by_cwd_title(
 ///
 /// 注意：直接调用会写入 `~/.workbuddy/workbuddy.db`，请在 WorkBuddy 关闭后执行。
 pub fn dedup_sessions_for_user(uid: &str) -> Value {
-    let db = workbuddy_db_path();
+    let db = workbuddy_db_path(WbVariant::Cn);
     if !db.is_file() {
         return json!({ "ok": false, "reason": "workbuddy.db 不存在", "removed": 0 });
     }
@@ -378,7 +408,7 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
     }
 
     if !removed_ids.is_empty() {
-        delete_edge_sync_mappings(&edge_sync_db_path(), &removed_ids);
+        delete_edge_sync_mappings(&edge_sync_db_path(WbVariant::Cn), &removed_ids);
     }
 
     if let Some(reason) = failure {
@@ -403,7 +433,7 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
 ///   即可收起，用于消除切换账号反复复制产生的同名冗余。
 /// 请在 WorkBuddy 关闭后执行。
 pub fn collapse_sessions_for_user(uid: &str) -> Value {
-    let db = workbuddy_db_path();
+    let db = workbuddy_db_path(WbVariant::Cn);
     if !db.is_file() {
         return json!({ "ok": false, "reason": "workbuddy.db 不存在", "removed": 0 });
     }
@@ -487,7 +517,7 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
     }
 
     if !removed_ids.is_empty() {
-        delete_edge_sync_mappings(&edge_sync_db_path(), &removed_ids);
+        delete_edge_sync_mappings(&edge_sync_db_path(WbVariant::Cn), &removed_ids);
     }
 
     if let Some(reason) = failure {
@@ -505,8 +535,8 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
 ///
 /// `title` 为 WorkBuddy 侧栏同款展示名；`isPlayground` 对应侧栏「任务」，
 /// 其余按 `cwd` 最后一段归入「空间」。
-pub fn list_sessions_for_user(uid: &str) -> Value {
-    let db = workbuddy_db_path();
+pub fn list_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
+    let db = workbuddy_db_path(WbVariant::Cn);
     if !db.is_file() {
         return json!([]);
     }
@@ -565,7 +595,7 @@ pub fn list_sessions_for_user(uid: &str) -> Value {
                 "title": session_display_title(title, custom_title),
                 "cwd": cwd,
                 "updatedAt": updated_at.unwrap_or(0),
-                "hasHistory": find_project_jsonl(&cid).is_some(),
+                "hasHistory": find_project_jsonl(WbVariant::Cn, &cid).is_some(),
                 "isPlayground": is_playground.unwrap_or(0) != 0,
             }));
         }
@@ -574,7 +604,7 @@ pub fn list_sessions_for_user(uid: &str) -> Value {
 }
 
 /// 在 `~/.workbuddy/projects/{workspace}/{cid}.jsonl` 定位会话正文。
-fn find_project_jsonl(cid: &str) -> Option<PathBuf> {
+fn find_project_jsonl(variant: WbVariant, cid: &str) -> Option<PathBuf> {
     let projects = home_dir().join(".workbuddy").join("projects");
     if !projects.is_dir() {
         return None;
@@ -596,8 +626,8 @@ fn find_project_jsonl(cid: &str) -> Option<PathBuf> {
 }
 
 /// 备份 workbuddy.db（含 -wal/-shm），返回主库备份路径。对照 `backup_workbuddy_db`。
-fn backup_workbuddy_db(backup_root: &Path) -> Option<PathBuf> {
-    let db = workbuddy_db_path();
+fn backup_workbuddy_db(variant: WbVariant, backup_root: &Path) -> Option<PathBuf> {
+    let db = workbuddy_db_path(WbVariant::Cn);
     if !db.is_file() {
         return None;
     }
@@ -617,11 +647,12 @@ fn backup_workbuddy_db(backup_root: &Path) -> Option<PathBuf> {
 /// 新 id 必须用带连字符的 UUID 格式（`Uuid::new_v4().to_string()`），与官方一致；
 /// 32 位无连字符形式会导致 WorkBuddy 无法识别新会话。
 pub fn copy_session_to_user(
+    variant: WbVariant,
     cid: &str,
     source_uid: &str,
     target_uid: &str,
 ) -> Result<Value, String> {
-    let db = workbuddy_db_path();
+    let db = workbuddy_db_path(WbVariant::Cn);
 
     // 收集源会话元信息（cwd / 展示标题 / 正文），用于 claw 校验与复制前去重。
     // 源会话不存在时直接返回错误，避免后续注册出孤儿云端映射。
@@ -649,7 +680,7 @@ pub fn copy_session_to_user(
             if is_claw_workspace(&cwd) {
                 return Err("Claw 工作区绑定当前账号渠道，不支持复制".into());
             }
-            if let Some(p) = find_project_jsonl(cid) {
+            if let Some(p) = find_project_jsonl(WbVariant::Cn, cid) {
                 if let Ok(text) = std::fs::read_to_string(&p) {
                     source_jsonl_norm = normalize_jsonl(&text, cid);
                     source_has_jsonl = true;
@@ -696,10 +727,10 @@ pub fn copy_session_to_user(
         if source_updated_at > target_ua {
             // 源端更新 → 把目标同名会话同步为源端最新（覆盖正文与元数据，保留目标 id）。
             let mut jsonl_copied = false;
-            if let Some(src_jsonl) = find_project_jsonl(cid) {
+            if let Some(src_jsonl) = find_project_jsonl(WbVariant::Cn, cid) {
                 if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
                     let text = text.replace(cid, &target_cid);
-                    let dst_jsonl = match find_project_jsonl(&target_cid) {
+                    let dst_jsonl = match find_project_jsonl(WbVariant::Cn, &target_cid) {
                         Some(p) => p,
                         None => src_jsonl.with_file_name(format!("{target_cid}.jsonl")),
                     };
@@ -709,7 +740,7 @@ pub fn copy_session_to_user(
                 }
             }
             let backup_root = backup_dir().join("sessions").join(utc_iso());
-            backup_workbuddy_db(&backup_root);
+            backup_workbuddy_db(WbVariant::Cn, &backup_root);
             insert_session_copy(&db, &target_cid, cid, source_uid, target_uid)?;
             return Ok(json!({
                 "id": cid,
@@ -739,7 +770,7 @@ pub fn copy_session_to_user(
 
     // 1) 复制正文 jsonl：{projects}/{ws}/{cid}.jsonl → {projects}/{ws}/{new_cid}.jsonl
     let mut jsonl_copied = false;
-    if let Some(src_jsonl) = find_project_jsonl(cid) {
+    if let Some(src_jsonl) = find_project_jsonl(WbVariant::Cn, cid) {
         let dst_jsonl = src_jsonl.with_file_name(format!("{new_cid}.jsonl"));
         if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
             let text = text.replace(cid, &new_cid); // 替换 sessionId 等旧 id 引用
@@ -751,11 +782,11 @@ pub fn copy_session_to_user(
 
     // 2) 备份 db（复制前），再 INSERT 新 sessions 行
     let backup_root = backup_dir().join("sessions").join(utc_iso());
-    backup_workbuddy_db(&backup_root);
+    backup_workbuddy_db(WbVariant::Cn, &backup_root);
     insert_session_copy(&db, &new_cid, cid, source_uid, target_uid)?;
 
     // 3) 注册云端映射：新会话归属目标账号（msg_channel=convmsg:{target_uid}）
-    let mapping_written = register_edge_sync_mapping(&new_cid, target_uid);
+    let mapping_written = register_edge_sync_mapping(WbVariant::Cn, &new_cid, target_uid);
 
     Ok(json!({
         "id": cid,
@@ -831,8 +862,8 @@ fn insert_session_copy(
 }
 
 /// 把新会话注册进 edge_sync_mapping（云端归属关键）。失败不致命，返回 False。
-fn register_edge_sync_mapping(new_cid: &str, target_uid: &str) -> bool {
-    insert_edge_sync_mapping(&edge_sync_db_path(), new_cid, target_uid)
+fn register_edge_sync_mapping(variant: WbVariant, new_cid: &str, target_uid: &str) -> bool {
+    insert_edge_sync_mapping(&edge_sync_db_path(WbVariant::Cn), new_cid, target_uid)
 }
 
 fn insert_edge_sync_mapping(db_path: &Path, new_cid: &str, target_uid: &str) -> bool {
@@ -863,18 +894,19 @@ fn insert_edge_sync_mapping(db_path: &Path, new_cid: &str, target_uid: &str) -> 
 }
 
 /// 切换前把勾选的会话复制到目标账号（路径 B）。返回复制报告。
-pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> Option<Value> {
+pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> Result<Value, String> {
     let target_uid = target_acc
         .get("uid")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if target_uid.is_empty() {
-        return None;
+        return Err("目标账号缺少 uid".to_string());
     }
-    let source_uid = current_user_uid()?;
+    let source_uid =
+        current_user_uid(WbVariant::Cn).ok_or_else(|| "未找到当前账号".to_string())?;
     if source_uid == target_uid {
-        return None;
+        return Err("源账号与目标账号相同".to_string());
     }
 
     let mut report = json!({
@@ -884,7 +916,7 @@ pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> O
     });
     let mut errors: Vec<Value> = Vec::new();
     for cid in session_ids {
-        match copy_session_to_user(cid, &source_uid, &target_uid) {
+        match copy_session_to_user(WbVariant::Cn, cid, &source_uid, &target_uid) {
             Ok(r) => report["copied"].as_array_mut().unwrap().push(r),
             Err(e) => errors.push(json!({"id": cid, "error": e})),
         }
@@ -892,7 +924,7 @@ pub fn copy_sessions_for_switch(target_acc: &Value, session_ids: &[String]) -> O
     if !errors.is_empty() {
         report["errors"] = json!(errors);
     }
-    Some(report)
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -902,10 +934,10 @@ mod tests {
 
     #[test]
     fn db_paths_point_to_home() {
-        assert!(workbuddy_db_path()
+        assert!(workbuddy_db_path(WbVariant::Cn)
             .to_string_lossy()
             .ends_with(".workbuddy/workbuddy.db"));
-        assert!(edge_sync_db_path()
+        assert!(edge_sync_db_path(WbVariant::Cn)
             .to_string_lossy()
             .ends_with("edge-sync-mapping-v2.db"));
     }
@@ -1307,7 +1339,7 @@ mod e2e_sessions {
         seed_session(home, uid, "a4", "空任务", "", None, None, 1, 1000); // 无正文
         seed_session(home, uid, "acl", "claw绑定", "/ws/Claw", Some("claw内容"), None, 0, 1000);
 
-        let listed = list_sessions_for_user(uid);
+        let listed = list_sessions_for_user(WbVariant::Cn, uid);
         assert_eq!(listed.as_array().map(|a| a.len()).unwrap_or(0), 4, "列举应排除 claw，返回 4 条");
 
         let cfp = content_fps(home, &[uid]);
@@ -1326,7 +1358,7 @@ mod e2e_sessions {
         let (ua, ub) = ("uid-A", "uid-B");
         seed_session(home, ua, "a1", "需求评审", "/ws/项目甲/", Some("甲的需求内容"), None, 0, 1000);
         let before_a = active_count(home, &[ua]);
-        let res = copy_session_to_user("a1", ua, ub).unwrap();
+        let res = copy_session_to_user(WbVariant::Cn, "a1", ua, ub).unwrap();
         assert!(!res["skipped"].as_bool().unwrap() && res["newId"].as_str().unwrap().len() > 0);
         assert_eq!(active_count(home, &[ua]), before_a, "源账号行数不变");
         assert_eq!(active_count(home, &[ub]), 1, "目标新增 1 条");
@@ -1343,9 +1375,9 @@ mod e2e_sessions {
     fn scn_e3(home: &Path) {
         let (ua, ub) = ("uid-A", "uid-B");
         seed_session(home, ua, "a1", "需求评审", "/ws/项目甲/", Some("甲的需求内容"), None, 0, 1000);
-        copy_session_to_user("a1", ua, ub).unwrap();
+        copy_session_to_user(WbVariant::Cn, "a1", ua, ub).unwrap();
         let before_b = active_count(home, &[ub]);
-        let res = copy_session_to_user("a1", ua, ub).unwrap();
+        let res = copy_session_to_user(WbVariant::Cn, "a1", ua, ub).unwrap();
         assert!(res["skipped"].as_bool().unwrap(), "重复复制应跳过");
         assert_eq!(res["newId"].as_str().unwrap(), "", "重复复制 newId 应为空串");
         assert_eq!(active_count(home, &[ub]), before_b, "目标行数不再增加");
@@ -1358,22 +1390,22 @@ mod e2e_sessions {
         let cfp0 = content_fps(home, &[ua, ub]);
         assert_eq!(active_count(home, &[ua]), 2, "初始 A 有 2 行");
 
-        let r1 = copy_session_to_user("a1", ua, ub).unwrap();
-        let r2 = copy_session_to_user("a2", ua, ub).unwrap();
+        let r1 = copy_session_to_user(WbVariant::Cn, "a1", ua, ub).unwrap();
+        let r2 = copy_session_to_user(WbVariant::Cn, "a2", ua, ub).unwrap();
         assert!(r1["newId"].as_str().unwrap().len() > 0 && r2["newId"].as_str().unwrap().len() > 0);
         assert_eq!(active_count(home, &[ub]), 2, "复制后 B 有 2 行");
 
         // B->A 回复制：A 已存在等价会话，应被跳过（防雪球）
         let a1p = r1["newId"].as_str().unwrap().to_string();
         let a2p = r2["newId"].as_str().unwrap().to_string();
-        let r3 = copy_session_to_user(&a1p, ub, ua).unwrap();
-        let r4 = copy_session_to_user(&a2p, ub, ua).unwrap();
+        let r3 = copy_session_to_user(WbVariant::Cn, &a1p, ub, ua).unwrap();
+        let r4 = copy_session_to_user(WbVariant::Cn, &a2p, ub, ua).unwrap();
         assert!(r3["skipped"].as_bool().unwrap() && r4["skipped"].as_bool().unwrap(), "B->A 回复制应被跳过(防雪球)");
         assert_eq!(active_count(home, &[ua]), 2, "跳过回复制后 A 仍仅 2 行");
 
         // A->B 再次复制：B 已有等价会话，亦应跳过
-        let r5 = copy_session_to_user("a1", ua, ub).unwrap();
-        let r6 = copy_session_to_user("a2", ua, ub).unwrap();
+        let r5 = copy_session_to_user(WbVariant::Cn, "a1", ua, ub).unwrap();
+        let r6 = copy_session_to_user(WbVariant::Cn, "a2", ua, ub).unwrap();
         assert!(r5["skipped"].as_bool().unwrap() && r6["skipped"].as_bool().unwrap(), "A->B 二次复制应被跳过");
 
         let cfp1 = content_fps(home, &[ua, ub]);
@@ -1434,7 +1466,7 @@ mod e2e_sessions {
         let (ua, ub) = ("uid-A", "uid-B");
         seed_session(home, ua, "acl", "claw绑定", "/ws/Claw", Some("claw内容"), None, 0, 1000);
         let before_b = active_count(home, &[ub]);
-        let res = copy_session_to_user("acl", ua, ub);
+        let res = copy_session_to_user(WbVariant::Cn, "acl", ua, ub);
         assert!(res.is_err(), "复制 claw 应返回错误");
         assert!(find_jsonl(home, "acl").is_some(), "源 claw 会话仍存活");
         assert_eq!(active_count(home, &[ub]), before_b, "目标未受影响");
@@ -1457,7 +1489,7 @@ mod e2e_sessions {
         seed_session(home, ua, "a1", "需求评审", "/ws/项目甲/", Some("甲的需求内容"), None, 0, 1000);
         let before_a = active_count(home, &[ua]);
         let before_b = active_count(home, &[ub]);
-        let _res = copy_session_to_user("不存在的cid", ua, ub);
+        let _res = copy_session_to_user(WbVariant::Cn, "不存在的cid", ua, ub);
         assert_eq!(active_count(home, &[ub]), before_b, "缺失源复制：B 行数不变");
         assert_eq!(active_count(home, &[ua]), before_a, "缺失源复制：A 行数不变");
         assert!(find_jsonl(home, "不存在的cid").is_none(), "缺失源复制：未产生孤儿 jsonl");
@@ -1467,7 +1499,7 @@ mod e2e_sessions {
         let (ua, ub) = ("uid-A", "uid-B");
         let cwd = "/工作区/项目甲/"; // 尾部带分隔符
         seed_session(home, ua, "z1", "中文标题", cwd, Some("中文会话内容"), None, 0, 1000);
-        let res = copy_session_to_user("z1", ua, ub).unwrap();
+        let res = copy_session_to_user(WbVariant::Cn, "z1", ua, ub).unwrap();
         assert!(res["newId"].as_str().unwrap().len() > 0, "中文路径复制应成功");
         let new_id = res["newId"].as_str().unwrap().to_string();
         let p = find_jsonl(home, &new_id);
@@ -1497,14 +1529,14 @@ mod e2e_sessions {
         assert_invariant(home, expected, "init");
 
         // 确定性交替序列：copy / dedup / list 交错
-        copy_session_to_user("a1", ua, ub).unwrap();
+        copy_session_to_user(WbVariant::Cn, "a1", ua, ub).unwrap();
         expected += 1;
-        copy_session_to_user("a2", ua, ub).unwrap();
+        copy_session_to_user(WbVariant::Cn, "a2", ua, ub).unwrap();
         expected += 1;
         assert_invariant(home, expected, "after-copy-ab");
 
         // B->A 回复制应被跳过（防雪球），不新增
-        let b_rows = list_sessions_for_user(ub);
+        let b_rows = list_sessions_for_user(WbVariant::Cn, ub);
         let b_ids: Vec<String> = b_rows
             .as_array()
             .unwrap()
@@ -1512,7 +1544,7 @@ mod e2e_sessions {
             .map(|v| v["id"].as_str().unwrap().to_string())
             .collect();
         for bid in &b_ids {
-            let r = copy_session_to_user(bid, ub, ua).unwrap();
+            let r = copy_session_to_user(WbVariant::Cn, bid, ub, ua).unwrap();
             assert!(r["skipped"].as_bool().unwrap(), "B->A 回复制应跳过");
         }
         assert_invariant(home, expected, "after-backcopy");
@@ -1522,7 +1554,7 @@ mod e2e_sessions {
         assert_invariant(home, expected, "after-dedup");
 
         // 复制空会话 ae 到 B（应新增一份空会话，不增加指纹）
-        let r = copy_session_to_user("ae", ua, ub).unwrap();
+        let r = copy_session_to_user(WbVariant::Cn, "ae", ua, ub).unwrap();
         assert!(!r["skipped"].as_bool().unwrap(), "空会话复制应成功新增");
         expected += 1;
         assert_invariant(home, expected, "after-copy-empty");
@@ -1531,8 +1563,8 @@ mod e2e_sessions {
         assert_invariant(home, expected, "after-dedup2");
 
         // 仅列举（只读）
-        let _ = list_sessions_for_user(ua);
-        let _ = list_sessions_for_user(ub);
+        let _ = list_sessions_for_user(WbVariant::Cn, ua);
+        let _ = list_sessions_for_user(WbVariant::Cn, ub);
         assert_invariant(home, expected, "final");
 
         assert_eq!(content_fps(home, &[ua, ub]), cfp0, "最终内容指纹 == 初始内容指纹");
@@ -1546,8 +1578,8 @@ mod e2e_sessions {
         assert_eq!(active_count(home, &[ua]), 2, "源账号 2 份同名会话");
 
         // 切换到目标账号：两份都应复制过去，但按 (工作区+标题) upsert 后只留最新一份。
-        copy_session_to_user("s1", ua, ub).unwrap();
-        let r2 = copy_session_to_user("s2", ua, ub).unwrap();
+        copy_session_to_user(WbVariant::Cn, "s1", ua, ub).unwrap();
+        let r2 = copy_session_to_user(WbVariant::Cn, "s2", ua, ub).unwrap();
         assert!(!r2["skipped"].as_bool().unwrap(), "第二份应为同步(updated)而非跳过");
         assert_eq!(active_count(home, &[ub]), 1, "目标账号同名会话只应剩 1 份(无重复)");
         let new_id = r2["newId"].as_str().unwrap().to_string();
@@ -1576,7 +1608,7 @@ mod e2e_sessions {
         // 数据留盘：被折叠的 a1/a2 正文仍存盘，仅软隐藏
         assert!(find_jsonl(home, "a1").is_some(), "a1 正文文件保留(数据不丢)");
         assert!(find_jsonl(home, "a2").is_some(), "a2 正文文件保留(数据不丢)");
-        let kept: Vec<String> = list_sessions_for_user(uid)
+        let kept: Vec<String> = list_sessions_for_user(WbVariant::Cn, uid)
             .as_array()
             .unwrap()
             .iter()
@@ -1603,7 +1635,7 @@ mod e2e_sessions {
         assert_eq!(res["removed"].as_u64().unwrap(), 2, "仅同工作区+同标题的 3 份收起 2 份(s1,s2)");
         assert_eq!(active_count(home, &[uid]), 3, "剩 s3 + 对照组 s4/s5 共 3 行");
 
-        let kept: Vec<String> = list_sessions_for_user(uid)
+        let kept: Vec<String> = list_sessions_for_user(WbVariant::Cn, uid)
             .as_array()
             .unwrap()
             .iter()
