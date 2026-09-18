@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::modules::config::{accounts_file, atomic_write};
+use crate::modules::variant::WbVariant;
 
 fn load_accounts_from_path(path: &Path) -> Vec<Value> {
     if let Ok(text) = std::fs::read_to_string(path) {
@@ -83,6 +84,8 @@ pub fn account_meta(acc: &Value) -> Value {
         "createdAt": acc.get("createdAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": acc.get("needs_relogin_reason"),
+        // 档位随元数据下发，供宿主按档位过滤列表（缺省国内版，历史数据零迁移）。
+        "variant": variant_of(acc).as_str(),
     })
 }
 
@@ -92,6 +95,21 @@ pub fn get_str(v: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 账号档位：显式 `variant` 字段优先，缺失时按 `domain` 后缀兜底，缺省国内版。
+pub fn variant_of(acc: &Value) -> WbVariant {
+    WbVariant::from_account(acc)
+}
+
+/// 合并采集结果时保留已有档位：已入库的档位不得因再次采集而丢失。
+/// 采集结果自带档位时以它为准（记录里的凭据来自该档位）。
+fn inherit_existing_variant(existing: &Value, collected: &mut Value) {
+    if get_str(collected, "variant").is_none() {
+        if let Some(variant) = get_str(existing, "variant") {
+            collected["variant"] = Value::String(variant);
+        }
+    }
 }
 
 /// 返回可用于 UID 缺失场景的真实邮箱。历史展示占位值不参与身份匹配。
@@ -143,6 +161,7 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
         if let Some(created_at) = existing.get("createdAt").cloned() {
             collected["createdAt"] = created_at;
         }
+        inherit_existing_variant(existing, &mut collected);
 
         for index in matching_indexes.into_iter().rev() {
             accounts.remove(index);
@@ -166,19 +185,22 @@ pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
 /// 按 id 覆盖写入账号库（不存在则追加）。对照 server.py `_upsert_account`。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
     let mut accounts = load_accounts();
+    upsert_account_in(&mut accounts, updated);
+    save_accounts(&accounts)
+}
+
+/// 覆盖写入的内存实现：命中已有 id 时保留其档位，避免覆盖写入丢字段。
+fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
     let id = updated.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let mut replaced = false;
     for a in accounts.iter_mut() {
         if a.get("id").and_then(|v| v.as_str()) == Some(id) {
-            *a = updated.clone();
-            replaced = true;
-            break;
+            let mut next = updated.clone();
+            inherit_existing_variant(a, &mut next);
+            *a = next;
+            return;
         }
     }
-    if !replaced {
-        accounts.push(updated.clone());
-    }
-    save_accounts(&accounts)
+    accounts.push(updated.clone());
 }
 
 /// 构造与官方对齐的请求头。对照 server.py `build_auth_headers`。
@@ -233,6 +255,21 @@ mod tests {
         assert_eq!(meta["needsReloginReason"], "刷新失败");
         assert!(meta.get("access_token").is_none(), "不得泄露 token");
         assert!(meta.get("refresh_token").is_none(), "不得泄露 token");
+    }
+
+    #[test]
+    fn account_meta_carries_variant_for_filtering() {
+        // 无字段的历史账号按国内版解释，前端仍能按 variant 过滤。
+        assert_eq!(account_meta(&json!({"id": "a1"}))["variant"], "cn");
+        assert_eq!(
+            account_meta(&json!({"id": "a2", "variant": "ai"}))["variant"],
+            "ai"
+        );
+        // 域名为空的账号同样落回国内版（domain 兜底见 variant 单测）。
+        assert_eq!(
+            account_meta(&json!({"id": "a3", "domain": "", "variant": ""}))["variant"],
+            "cn"
+        );
     }
 
     #[test]
@@ -332,6 +369,71 @@ mod tests {
     }
 
     #[test]
+    fn variant_of_defaults_to_cn_and_reads_domain_fallback() {
+        assert_eq!(variant_of(&json!({"uid": "u-1"})), WbVariant::Cn);
+        assert_eq!(
+            variant_of(&json!({"uid": "u-1", "variant": "ai"})),
+            WbVariant::Ai
+        );
+        assert_eq!(
+            variant_of(&json!({"uid": "u-1", "domain": "www.workbuddy.ai"})),
+            WbVariant::Ai
+        );
+    }
+
+    #[test]
+    fn upsert_keeps_variant_of_recollected_account() {
+        let mut accounts = vec![json!({
+            "id": "a-1",
+            "uid": "uid-1",
+            "variant": "ai",
+            "access_token": "old-token",
+        })];
+        // 不含档位字段的再次采集（如刷新）不得丢掉已入库档位
+        let saved =
+            upsert_collected_account(&mut accounts, account("a-1", Some("uid-1"), "新名称", None));
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(saved["variant"], "ai");
+        assert_eq!(accounts[0]["variant"], "ai");
+    }
+
+    #[test]
+    fn upsert_accepts_caller_supplied_variant_for_new_account() {
+        let mut accounts = vec![];
+        let saved = upsert_collected_account(
+            &mut accounts,
+            json!({"id": "a-ai", "uid": "uid-ai", "variant": "ai", "access_token": "t"}),
+        );
+
+        assert_eq!(saved["variant"], "ai");
+        assert_eq!(variant_of(&accounts[0]), WbVariant::Ai);
+    }
+
+    #[test]
+    fn upsert_account_keeps_existing_variant_when_updated_lacks_it() {
+        let mut accounts =
+            vec![json!({"id": "a-1", "uid": "uid-1", "variant": "ai", "access_token": "old"})];
+
+        let mut refreshed = accounts[0].clone();
+        refreshed["access_token"] = json!("new");
+        refreshed.as_object_mut().unwrap().remove("variant");
+        upsert_account_in(&mut accounts, &refreshed);
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["access_token"], "new");
+        assert_eq!(accounts[0]["variant"], "ai", "覆盖写入不得丢档位");
+
+        // 追加新账号时按调用方给定的档位入库
+        upsert_account_in(
+            &mut accounts,
+            &json!({"id": "a-2", "uid": "uid-2", "variant": "cn", "access_token": "t2"}),
+        );
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[1]["variant"], "cn");
+    }
+
+    #[test]
     fn persisted_same_name_accounts_can_be_found_and_deleted_independently() {
         let test_dir = std::env::temp_dir().join(format!(
             "wb-switch-same-name-{}",
@@ -378,9 +480,9 @@ pub fn delete_account(account_id: &str) -> Result<(), String> {
     delete_account_from_path(&accounts_file(), account_id)
 }
 
-/// 导入本机当前账号（从认证文件读取）。
-pub fn import_local() -> Result<Value, String> {
-    let acc = crate::modules::auth_file::import_from_auth_file()
+/// 导入本机当前账号（从该档位的登录态文件读取）。
+pub fn import_local(variant: WbVariant) -> Result<Value, String> {
+    let acc = crate::modules::auth_file::import_from_auth_file(variant)
         .ok_or("未读取到本地 WorkBuddy 登录信息")?;
     let saved = save_collected_account(acc).map_err(|e| e.to_string())?;
     Ok(account_meta(&saved))

@@ -17,6 +17,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
+import { accountVariant, variantAppName } from "@/lib/variant";
 import type { AccountMeta, Session } from "@/lib/types";
 
 interface Props {
@@ -62,7 +63,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     };
   }, []);
 
-  // 打开时加载当前账号会话
+  // 打开时按目标账号档位加载当前账号会话（会话列表按档位取自各自的登录态）
   useEffect(() => {
     if (open && account) {
       setCopySessions(false);
@@ -71,7 +72,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       setError("");
       setLoadingSessions(true);
       api
-        .listSessions()
+        .listSessions(accountVariant(account))
         .then((res) => {
           setSessions(res.sessions);
           setCurrentUid(res.current);
@@ -114,20 +115,31 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setBusy(true);
     setProgress("正在切换账号…");
     setError("");
+    const requestedCopy = copySessions && selected.size > 0;
     try {
       const res = await api.switchAccount({
         accountId: account.id,
-        copySessionIds: copySessions ? [...selected] : undefined,
+        copySessionIds: requestedCopy ? [...selected] : undefined,
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const parts: string[] = [];
-      if (res.sessionCopy?.copied.length) {
-        parts.push(`已复制 ${res.sessionCopy.copied.length} 个会话`);
+      const copyError = res.sessionCopy?.error;
+      const copiedCount = res.sessionCopy?.copied?.length ?? 0;
+      if (copiedCount > 0) {
+        parts.push(`已复制 ${copiedCount} 个会话`);
       }
       if (res.backup) parts.push(`备份: ${res.backup}`);
       toast.success(`已切换至「${nickname}」`, {
-        description: parts.length ? parts.join("；") : "WorkBuddy 已重启为目标账号。",
+        description: parts.length ? parts.join("；") : `${variantAppName(accountVariant(account))} 已重启为目标账号。`,
       });
+      // 复制失败或被后端跳过时必须显式提示，不能静默当成成功。
+      if (copyError) {
+        toast.error("会话复制失败", { description: copyError });
+      } else if (requestedCopy && !res.sessionCopy) {
+        toast.warning("会话未复制", {
+          description: "后端未返回复制结果：当前档位可能不支持会话复制，账号已切换但未复制会话。",
+        });
+      }
       onOpenChange(false);
       onDone?.();
     } catch (e) {
@@ -148,12 +160,12 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     }
   }
 
-  /** 权限自检：确认完全磁盘访问是否生效。 */
+  /** 权限自检：确认完全磁盘访问是否生效（探针按目标账号档位）。 */
   const [permCheck, setPermCheck] = useState<string | null>(null);
   async function runPermissionCheck() {
     setPermCheck("检测中…");
     try {
-      const res = await api.checkAuthPermission();
+      const res = await api.checkAuthPermission(accountVariant(account));
       setPermCheck(res.ok ? `✓ ${res.message}` : `✗ ${res.error}（${res.dir}）`);
     } catch (e) {
       setPermCheck(`✗ ${api.asError(e)}`);
@@ -167,7 +179,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     let timer: number | undefined;
     const check = async () => {
       try {
-        const res = await api.checkAuthPermission();
+        const res = await api.checkAuthPermission(accountVariant(account));
         if (res.ok) {
           if (!cancelled) {
             setPermCheck("✓ 授权成功，可以重新切换了");
@@ -209,7 +221,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         <DialogHeader className="shrink-0">
           <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
           <DialogDescription>
-            切换会关闭并重启 WorkBuddy，认证文件将写入目标账号。
+            切换会关闭并重启 {variantAppName(accountVariant(account))}，认证文件将写入目标账号。
           </DialogDescription>
         </DialogHeader>
 

@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "1.0.5"
+version = "0.1.40"
 edition = "2021"
 description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -24,3 +24,4 @@ base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+

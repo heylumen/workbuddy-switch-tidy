@@ -80,6 +80,34 @@ pub fn is_silent_startup(args: impl IntoIterator<Item = impl AsRef<str>>) -> boo
         .any(|arg| arg.as_ref() == SILENT_STARTUP_ARG)
 }
 
+/// 第二次启动是否需要把既有实例唤醒到前台。
+///
+/// 静默启动（精确 `--hidden`，自启重复触发）不打扰用户：不显示窗口、不改 Dock 状态。
+pub fn should_activate_on_second_launch(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    !is_silent_startup(args)
+}
+
+/// 单实例插件回调：已有实例时后启动进程已退出，这里处理既有实例的反应。
+///
+/// 参数由插件回传，**含 argv[0]**；精确 `--hidden` 判定与自启路径一致。
+/// 回调运行在 tokio worker 线程，而 `show_main_window` 会经 `apply_dock_visible`
+/// 直接操作 AppKit（`MainThreadMarker::new_unchecked`），必须跳回主线程执行。
+pub fn on_second_instance<R: Runtime>(app: &AppHandle<R>, args: Vec<String>) {
+    if !should_activate_on_second_launch(&args) {
+        return;
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_main_window(&handle));
+}
+
+/// macOS `RunEvent::Reopen`（点击 Dock / Finder 激活已运行应用）时显示主窗口。
+///
+/// 该事件在主线程派发，可直接走 `show_main_window`；窗口策略仍集中在 tray 模块。
+#[cfg(target_os = "macos")]
+pub(crate) fn show_main_window_on_reopen<R: Runtime>(app: &AppHandle<R>) {
+    show_main_window(app);
+}
+
 /// 在事件循环呈现应用前决定首次启动的主窗口可见性。
 ///
 /// `main` 窗口由 `tauri.conf.json` 配置创建为不可见，此处做出第一次
@@ -346,7 +374,7 @@ fn start_checkin_all<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _busy = CheckinBusyGuard { app: app.clone() };
-        let payload = checkin::run_checkin_all().await;
+        let payload = checkin::run_checkin_all(None).await;
         let text = format_checkin_tooltip(&payload);
         if checkin_succeeded(&payload) {
             notify_checkin(&app, &text);
@@ -367,6 +395,29 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
         .show();
 }
 
+/// 投递 core 组装好的自动轮换推迟提示（`rotate::run_rotate_cycle` 返回体里的 `notify`）。
+///
+/// 走系统通知而不是托盘 tooltip：轮换是后台行为，用户此时多半没看着窗口。
+/// 标题与正文都取自 core（文案唯一构造点在 `rotate`），宿主不自造措辞；
+/// 无头 server 不投递，只保留日志与返回字段。
+pub fn notify_rotate_deferred<R: Runtime>(app: &AppHandle<R>, notify: &Value) {
+    let title = notify
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("workbuddy-switch");
+    let Some(body) = notify.get("body").and_then(Value::as_str) else {
+        return;
+    };
+    if body.is_empty() {
+        return;
+    }
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// 是否应弹签到完成通知。
+///
+/// `inactive`（该档位未开放签到活动，如国际版）不是失败：它既不算成功也不重试，
+/// 因此不阻断通知；`error` 仍然算失败。
 fn checkin_succeeded(value: &Value) -> bool {
     let Some(accounts) = value.get("accounts").and_then(Value::as_array) else {
         return false;
@@ -375,7 +426,7 @@ fn checkin_succeeded(value: &Value) -> bool {
         && accounts.iter().all(|account| {
             matches!(
                 account.get("result").and_then(Value::as_str),
-                Some("success" | "already")
+                Some("success" | "already" | "inactive")
             )
         })
 }
@@ -411,6 +462,8 @@ fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>> {
     let open_item = MenuItem::with_id(app, "open-main-window", "打开主界面", true, None::<&str>)?;
     let github_item = MenuItem::with_id(app, "open-github", "打开 GitHub", true, None::<&str>)?;
+    // 档位区分在 core 判定：无签到活动的档位（国际版）不参与「待签到」集合，
+    // 否则这些账号永远不会产生签到日志，托盘会一直显示「可签到」。
     let checked_in = checkin::all_accounts_checked_in_today();
     let (checkin_label, checkin_enabled) = if CHECKIN_BUSY.load(Ordering::Acquire) {
         ("一键签到", false)
@@ -471,20 +524,30 @@ fn format_checkin_tooltip(value: &Value) -> String {
     let mut ok = 0;
     let mut already = 0;
     let mut err = 0;
+    let mut inactive = 0;
     for account in accounts {
         match account.get("result").and_then(Value::as_str) {
             Some("success") => ok += 1,
             Some("already") => already += 1,
             Some("error") => err += 1,
+            Some("inactive") => inactive += 1,
             _ => {}
         }
     }
-    format!("签到完成：成功 {ok}，已签 {already}，失败 {err}")
+    let mut text = format!("签到完成：成功 {ok}，已签 {already}，失败 {err}");
+    // 国际版无签到活动：单列「未开放」，避免被误读成失败或漏报。
+    if inactive > 0 {
+        text.push_str(&format!("，未开放 {inactive}"));
+    }
+    text
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_checkin_tooltip, is_silent_startup, menu_bar_icon, should_keep_tray_alive};
+    use super::{
+        format_checkin_tooltip, is_silent_startup, menu_bar_icon, should_activate_on_second_launch,
+        should_keep_tray_alive,
+    };
     use serde_json::json;
 
     #[test]
@@ -520,6 +583,33 @@ mod tests {
         assert!(!is_silent_startup(["wb-switch-rust", "-hidden"]));
         assert!(!is_silent_startup(["wb-switch-rust", "--hidden-x"]));
         assert!(!is_silent_startup(["wb-switch-rust", "x--hidden"]));
+    }
+
+    #[test]
+    fn second_launch_with_exact_hidden_arg_does_not_activate() {
+        // 插件回传的 args 含 argv[0]，静默判定必须整参相等。
+        assert!(!should_activate_on_second_launch([
+            "wb-switch-rust",
+            "--hidden"
+        ]));
+    }
+
+    #[test]
+    fn second_launch_activates_unless_exact_hidden_arg() {
+        assert!(should_activate_on_second_launch(Vec::<&str>::new()));
+        assert!(should_activate_on_second_launch(["wb-switch-rust"]));
+        assert!(should_activate_on_second_launch([
+            "wb-switch-rust",
+            "--debug"
+        ]));
+        assert!(should_activate_on_second_launch([
+            "wb-switch-rust",
+            "--hidden-x"
+        ]));
+        assert!(should_activate_on_second_launch([
+            "wb-switch-rust",
+            "x--hidden"
+        ]));
     }
 
     #[test]
@@ -565,6 +655,21 @@ mod tests {
         );
     }
 
+    /// 国际版账号签到结果为 inactive：单列「未开放」，不计入失败。
+    #[test]
+    fn tooltip_separates_inactive_variant_results() {
+        let payload = json!({
+            "accounts": [
+                {"result": "success", "variant": "cn"},
+                {"result": "inactive", "inactive": true, "variant": "ai"}
+            ]
+        });
+        assert_eq!(
+            format_checkin_tooltip(&payload),
+            "签到完成：成功 1，已签 0，失败 0，未开放 1"
+        );
+    }
+
     #[test]
     fn checkin_succeeded_requires_all_ok() {
         use super::checkin_succeeded;
@@ -575,6 +680,13 @@ mod tests {
         })));
         assert!(!checkin_succeeded(&json!({
             "accounts": [{"result": "success"}, {"result": "error"}]
+        })));
+        // inactive 不是失败：仍弹通知，但绝不伪造成成功。
+        assert!(checkin_succeeded(&json!({
+            "accounts": [{"result": "success"}, {"result": "inactive"}]
+        })));
+        assert!(!checkin_succeeded(&json!({
+            "accounts": [{"result": "inactive"}, {"result": "error"}]
         })));
     }
 

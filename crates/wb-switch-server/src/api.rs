@@ -17,32 +17,33 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
-    export_import, limits, oauth, process, refresh, rotate, session, switch, token_stats, travel,
-    update,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
+    credit_usage, credits, export_import, limits, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    variant::WbVariant,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
-/// 前端切 tab 频繁触发命令行导致卡顿/闪窗。
+/// 前端切 tab 频繁触发命令行导致卡顿/闪窗。按档位分别缓存。
 #[cfg(target_os = "windows")]
-static RUNNING_CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+static RUNNING_CACHE: Mutex<Option<(Instant, bool, WbVariant)>> = Mutex::new(None);
 
-fn cached_workbuddy_running() -> bool {
+fn cached_workbuddy_running(variant: WbVariant) -> bool {
     #[cfg(target_os = "windows")]
     {
         let mut cache = RUNNING_CACHE.lock().unwrap();
-        if let Some((t, v)) = cache.as_ref() {
-            if t.elapsed() < Duration::from_secs(3) {
+        if let Some((t, v, cached_variant)) = cache.as_ref() {
+            if *cached_variant == variant && t.elapsed() < Duration::from_secs(3) {
                 return *v;
             }
         }
-        let v = process::is_workbuddy_running();
-        *cache = Some((Instant::now(), v));
+        let v = process::is_workbuddy_running(variant);
+        *cache = Some((Instant::now(), v, variant));
         v
     }
     #[cfg(not(target_os = "windows"))]
     {
-        process::is_workbuddy_running()
+        process::is_workbuddy_running(variant)
     }
 }
 
@@ -64,9 +65,21 @@ pub fn router() -> Router {
             post(api_codebuddy_cli_install_helper),
         )
         .route("/api/codebuddy-cli/switch", post(api_codebuddy_cli_switch))
-        .route("/api/codebuddy-cn-ide/status", get(api_codebuddy_cn_ide_status))
-        .route("/api/codebuddy-cn-ide/switch", post(api_codebuddy_cn_ide_switch))
-        .route("/api/codebuddy-cn-ide/detect", post(api_codebuddy_cn_ide_detect))
+        .route(
+            "/api/codebuddy-cn-ide/status",
+            get(api_codebuddy_cn_ide_status),
+        )
+        .route(
+            "/api/codebuddy-cn-ide/switch",
+            post(api_codebuddy_cn_ide_switch),
+        )
+        .route(
+            "/api/codebuddy-cn-ide/detect",
+            post(api_codebuddy_cn_ide_detect),
+        )
+        .route("/api/codebuddy-ide/status", get(api_codebuddy_ide_status))
+        .route("/api/codebuddy-ide/switch", post(api_codebuddy_ide_switch))
+        .route("/api/codebuddy-ide/detect", post(api_codebuddy_ide_detect))
         .route("/api/delete", post(api_delete))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
@@ -82,13 +95,27 @@ pub fn router() -> Router {
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/copy", post(api_copy_sessions))
-        .route("/api/sessions/dedup", post(api_dedup_sessions))
-        .route("/api/sessions/collapse", post(api_collapse_sessions))
         .route("/api/checkin/status", get(api_checkin_status))
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
         .route("/api/token-stats", get(api_token_statistics))
-        .route("/api/limits", get(api_limits))
+        .route("/api/rate-limits", get(api_rate_limits))
+        .route(
+            "/api/rate-limits/hook-status",
+            get(api_rate_limit_hook_status),
+        )
+        .route(
+            "/api/rate-limits/install-hook",
+            post(api_install_rate_limit_hook),
+        )
+        .route(
+            "/api/rate-limits/uninstall-hook",
+            post(api_uninstall_rate_limit_hook),
+        )
+        .route(
+            "/api/rate-limits/config",
+            get(api_rate_limit_config).post(api_save_rate_limit_config),
+        )
         .route("/api/checkin", post(api_checkin))
         .route("/api/checkin/all", post(api_checkin_all))
         .route(
@@ -125,12 +152,27 @@ fn json_err(e: String, code: StatusCode) -> Response {
     (code, Json(json!({ "ok": false, "error": e }))).into_response()
 }
 
+/// 从 query string 解析档位（缺省国内版）。与 Tauri 命令的可选 `variant` 参数同义。
+fn query_variant(query: Option<&str>) -> WbVariant {
+    let raw = query.unwrap_or("").split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (key == "variant").then_some(value)
+    });
+    WbVariant::parse(raw)
+}
+
+/// 从请求体解析档位（缺省国内版）。与 Tauri 命令的可选 `variant` 参数同义。
+fn body_variant(body: &Value) -> WbVariant {
+    WbVariant::parse(body.get("variant").and_then(Value::as_str))
+}
+
 // ---------------------------------------------------------------------------
 // 状态 / 账号
 // ---------------------------------------------------------------------------
 
-async fn api_status() -> Response {
-    let auth = auth_file::read_auth_file();
+async fn api_status(RawQuery(query): RawQuery) -> Response {
+    let variant = query_variant(query.as_deref());
+    let auth = auth_file::read_auth_file(variant);
     let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
         Some(json!({
@@ -140,22 +182,26 @@ async fn api_status() -> Response {
         }))
     });
     json_ok(json!({
-        "running": cached_workbuddy_running(),
-        "authFile": auth_file::auth_file_path().to_string_lossy(),
+        "running": cached_workbuddy_running(variant),
+        "authFile": auth_file::auth_file_path(variant).to_string_lossy(),
         "current": current,
-        "appPath": auth_file::workbuddy_app_path().to_string_lossy(),
+        "appPath": auth_file::workbuddy_app_path(variant).to_string_lossy(),
         "version": update::APP_VERSION,
+        "variant": variant.as_str(),
     }))
 }
 
-async fn api_accounts() -> Response {
+/// GET /api/accounts —— 返回全部档位的账号，`current` 取请求档位的登录态。
+async fn api_accounts(RawQuery(query): RawQuery) -> Response {
+    let variant = query_variant(query.as_deref());
     json_ok(json!({
         "accounts": account::load_accounts()
             .iter()
             .map(account::account_meta)
             .collect::<Vec<_>>(),
-        "current": auth_file::read_auth_file()
+        "current": auth_file::read_auth_file(variant)
             .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
+        "variant": variant.as_str(),
     }))
 }
 
@@ -172,7 +218,9 @@ async fn api_codebuddy_cli_install_helper() -> Response {
 
 async fn api_codebuddy_cli_switch(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    match codebuddy_cli::set_active_account(id) {
+    // 入参 `closeRunningCli` 已废弃：后端一律先关闭正在运行的 CLI 再写状态，忽略该值。
+    // 无头模式不投递系统通知，切号结果（含关闭数量）照常返回给调用方。
+    match codebuddy_cli::switch_active_account(id) {
         Ok(result) => json_ok(result),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
@@ -188,7 +236,10 @@ async fn api_codebuddy_cn_ide_switch(Json(body): Json<Value>) -> Response {
         .or_else(|| body.get("account_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(true);
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     match codebuddy_cn_ide::switch_account(account_id, restart) {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
@@ -202,6 +253,33 @@ async fn api_codebuddy_cn_ide_detect() -> Response {
     }
 }
 
+async fn api_codebuddy_ide_status() -> Response {
+    json_ok(codebuddy_ide::status())
+}
+
+async fn api_codebuddy_ide_switch(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match codebuddy_ide::switch_account(account_id, restart) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_codebuddy_ide_detect() -> Response {
+    match codebuddy_ide::detect_current_account() {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn api_delete(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
     match account::delete_account(id) {
@@ -210,8 +288,15 @@ async fn api_delete(Json(body): Json<Value>) -> Response {
     }
 }
 
-async fn api_import_local() -> Response {
-    match account::import_local() {
+/// POST /api/import-local —— 导入本机当前账号（body 可选 `variant`，缺省国内版）。
+///
+/// body 允许缺失，保持改造前的调用方式可用。
+async fn api_import_local(body: Option<Json<Value>>) -> Response {
+    let variant = body
+        .as_ref()
+        .map(|Json(value)| body_variant(value))
+        .unwrap_or_else(|| WbVariant::parse(None));
+    match account::import_local(variant) {
         Ok(acc) => json_ok(json!({ "ok": true, "account": acc })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
@@ -300,13 +385,19 @@ async fn api_import(Json(body): Json<Value>) -> Response {
 // OAuth 登录
 // ---------------------------------------------------------------------------
 
-async fn api_oauth_start() -> Response {
-    match oauth::oauth_start().await {
+/// POST /api/oauth/start —— 发起扫码登录（body 可选 `variant`，缺省国内版）。
+async fn api_oauth_start(body: Option<Json<Value>>) -> Response {
+    let variant = body
+        .as_ref()
+        .map(|Json(value)| body_variant(value))
+        .unwrap_or_else(|| WbVariant::parse(None));
+    match oauth::oauth_start(variant).await {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
 }
 
+/// POST /api/oauth/status —— 轮询采集结果（档位取发起时记录，无需传参）。
 async fn api_oauth_status(Json(body): Json<Value>) -> Response {
     let login_id = body
         .get("loginId")
@@ -390,13 +481,16 @@ async fn api_switch_progress() -> Response {
 // 会话
 // ---------------------------------------------------------------------------
 
-async fn api_sessions() -> Response {
-    match session::current_user_uid() {
+/// GET /api/sessions —— 当前账号的会话列表（query 可选 `variant`，缺省国内版）。
+async fn api_sessions(RawQuery(query): RawQuery) -> Response {
+    let variant = query_variant(query.as_deref());
+    match session::current_user_uid(variant) {
         Some(uid) => json_ok(json!({
-            "sessions": session::list_sessions_for_user(&uid),
+            "sessions": session::list_sessions_for_user(variant, &uid),
             "current": uid,
+            "variant": variant.as_str(),
         })),
-        None => json_ok(json!({ "sessions": [], "current": null })),
+        None => json_ok(json!({ "sessions": [], "current": null, "variant": variant.as_str() })),
     }
 }
 
@@ -418,69 +512,29 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     let Some(target) = account::find_account(&target_account_id) else {
         return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
-    let source_uid = session::current_user_uid();
-    let result = session::copy_sessions_for_switch(&target, &session_ids);
+    // 档位取目标账号自身（源 uid 也从该档位的登录态读）。
+    let variant = account::variant_of(&target);
+    let source_uid = session::current_user_uid(variant);
+    // 能力不满足时返回明确错误而不是空对象。
+    let copied = match session::copy_sessions_for_switch(&target, &session_ids) {
+        Ok(report) => report,
+        Err(error) => {
+            return json_err(error, StatusCode::BAD_REQUEST);
+        }
+    };
     json_ok(json!({
         "sourceUid": source_uid,
         "targetUid": target.get("uid"),
-        "copied": result,
+        "copied": copied,
+        "variant": variant.as_str(),
     }))
-}
-
-/// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
-async fn api_dedup_sessions(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if account_id.trim().is_empty() {
-        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let Some(target) = account::find_account(&account_id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    let uid = target
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if uid.is_empty() {
-        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let result = session::dedup_sessions_for_user(&uid);
-    json_ok(result)
-}
-
-/// POST /api/sessions/collapse —— 折叠指定账号下「同名/同目录」会话（软隐藏冗余）。
-async fn api_collapse_sessions(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if account_id.trim().is_empty() {
-        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let Some(target) = account::find_account(&account_id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    let uid = target
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if uid.is_empty() {
-        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let result = session::collapse_sessions_for_user(&uid);
-    json_ok(result)
 }
 
 // ---------------------------------------------------------------------------
 // 签到 / 保活
 // ---------------------------------------------------------------------------
 
+/// GET /api/checkin/status —— 全部账号的签到状态（每行带 `variant`，档位取账号自身）。
 async fn api_checkin_status() -> Response {
     let list = account::load_accounts();
     let mut items = Vec::new();
@@ -494,6 +548,7 @@ async fn api_checkin_status() -> Response {
 fn checkin_status_item(account: &Value, mut status: Value) -> Value {
     status["accountId"] = account.get("id").cloned().unwrap_or(Value::Null);
     status["email"] = json!(account::account_display_name(account));
+    status["variant"] = json!(account::variant_of(account).as_str());
     status
 }
 
@@ -516,10 +571,11 @@ async fn api_credit_statistics(RawQuery(query): RawQuery) -> Response {
     json_ok(credit_usage::get_statistics(query_flag_enabled(query.as_deref(), "refresh")).await)
 }
 
-/// GET /api/token-stats —— 本地 Token 用量统计（双来源），可用 ?days=N 限定天数。
 async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
     let days = query.as_deref().and_then(|value| {
-        value.split('&').find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
+        value
+            .split('&')
+            .find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
     });
     match tokio::task::spawn_blocking(move || token_stats::get_statistics(days)).await {
         Ok(statistics) => json_ok(statistics),
@@ -530,17 +586,82 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
     }
 }
 
-/// GET /api/limits —— 限额台账：扫描本地 429 日志记录与官方重置时间，可用 ?days=N 限定天数。
-async fn api_limits(RawQuery(query): RawQuery) -> Response {
-    let days = query.as_deref().and_then(|value| {
-        value.split('&').find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
-    });
-    match tokio::task::spawn_blocking(move || limits::get_limits(days)).await {
-        Ok(limits) => json_ok(limits),
+/// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。
+///
+/// 扫描本机日志文件，放 blocking 线程避免占用运行时线程；无受限模型时返回空数组。
+async fn api_rate_limits() -> Response {
+    match tokio::task::spawn_blocking(limits::get_rate_limits).await {
+        Ok(payload) => json_ok(payload),
         Err(error) => json_err(
-            format!("扫描限额台账失败: {error}"),
+            format!("扫描模型限额失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
+    }
+}
+
+/// hook 状态 + 运行期字段（最近一次 hook 事件时刻）。
+fn rate_limit_hook_status() -> Value {
+    let mut status = rate_limit_hook::hook_status();
+    status["lastEventAt"] = json!(rate_limit_events::last_event_at());
+    status
+}
+
+/// GET /api/rate-limits/hook-status —— hook 安装状态（脚本 + 三处客户端配置逐项结果）。
+async fn api_rate_limit_hook_status() -> Response {
+    match tokio::task::spawn_blocking(rate_limit_hook_status).await {
+        Ok(status) => json_ok(status),
+        Err(error) => json_err(
+            format!("查询限额 hook 状态失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份；同时清除「卸载过」标记）。
+async fn api_install_rate_limit_hook() -> Response {
+    match tokio::task::spawn_blocking(|| {
+        let result = rate_limit_hook::install_hook();
+        // 扫描范围随安装结果变化（只对未注册的来源扫日志），缓存必须作废。
+        limits::invalidate_scan_cache();
+        result.map(|_| rate_limit_hook_status())
+    })
+    .await
+    {
+        Ok(Ok(status)) => json_ok(status),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+///
+/// 卸载即用户拒绝自动接入（`hookOptOut`），与安装逻辑同处 core，两个宿主共用同一语义。
+async fn api_uninstall_rate_limit_hook() -> Response {
+    match tokio::task::spawn_blocking(|| {
+        let result = rate_limit_hook::uninstall_hook();
+        limits::invalidate_scan_cache();
+        result.map(|_| rate_limit_hook_status())
+    })
+    .await
+    {
+        Ok(Ok(status)) => json_ok(status),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_rate_limit_config() -> Response {
+    json_ok(config::load_rate_limit_config())
+}
+
+/// POST /api/rate-limits/config —— 保存限额监听配置。
+///
+/// 与桌面端同语义：`scanIdeLogs` 变化时清扫描缓存（只清缓存、不强制全量）。
+async fn api_save_rate_limit_config(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").unwrap_or(&body);
+    match limits::save_rate_limit_config(submitted) {
+        Ok(()) => json_ok(config::load_rate_limit_config()),
+        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
 
@@ -552,8 +673,14 @@ async fn api_checkin(Json(body): Json<Value>) -> Response {
     json_ok(checkin::checkin_account(&acc).await)
 }
 
-async fn api_checkin_all() -> Response {
-    json_ok(checkin::run_checkin_all().await)
+async fn api_checkin_all(body: Option<Json<Value>>) -> Response {
+    // 缺省（无 body / 无 variant）= 全部档位，保持与桌面端 set 前的行为一致。
+    let variant = body
+        .as_ref()
+        .and_then(|Json(value)| value.get("variant"))
+        .and_then(|value| value.as_str())
+        .map(|raw| WbVariant::parse(Some(raw)));
+    json_ok(checkin::run_checkin_all(variant).await)
 }
 
 async fn api_checkin_config() -> Response {
@@ -568,8 +695,9 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
     }
 }
 
+/// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。
 async fn api_checkin_logs() -> Response {
-    json_ok(json!({ "logs": config::load_checkin_logs() }))
+    json_ok(json!({ "logs": checkin::load_checkin_logs_with_variant() }))
 }
 
 async fn api_travel_status() -> Response {
@@ -710,8 +838,35 @@ async fn static_handler(uri: Uri) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::checkin_status_item;
+    use super::{body_variant, checkin_status_item, query_variant};
     use serde_json::json;
+    use wb_switch_core::modules::variant::WbVariant;
+
+    /// 缺省档位必须与改造前一致（不传 variant 即国内版）。
+    #[test]
+    fn variant_query_defaults_to_cn() {
+        assert_eq!(query_variant(None), WbVariant::Cn);
+        assert_eq!(query_variant(Some("")), WbVariant::Cn);
+        assert_eq!(query_variant(Some("refresh=true")), WbVariant::Cn);
+        assert_eq!(
+            query_variant(Some("refresh=true&variant=cn")),
+            WbVariant::Cn
+        );
+        assert_eq!(query_variant(Some("variant=ai")), WbVariant::Ai);
+        assert_eq!(
+            query_variant(Some("variant=ai&refresh=true")),
+            WbVariant::Ai
+        );
+        assert_eq!(query_variant(Some("variant=unknown")), WbVariant::Cn);
+    }
+
+    #[test]
+    fn variant_body_defaults_to_cn() {
+        assert_eq!(body_variant(&json!({})), WbVariant::Cn);
+        assert_eq!(body_variant(&json!({"variant": null})), WbVariant::Cn);
+        assert_eq!(body_variant(&json!({"variant": "ai"})), WbVariant::Ai);
+        assert_eq!(body_variant(&json!({"accountId": "x"})), WbVariant::Cn);
+    }
 
     #[test]
     fn web_checkin_status_keeps_account_identity() {
@@ -723,6 +878,7 @@ mod tests {
         assert_eq!(item["accountId"], "account-1");
         assert_eq!(item["email"], "user@example.com");
         assert_eq!(item["todayCheckedIn"], true);
+        assert_eq!(item["variant"], "cn");
     }
 
     #[test]
@@ -735,5 +891,16 @@ mod tests {
         assert_eq!(item["accountId"], "account-2");
         assert_eq!(item["ok"], false);
         assert_eq!(item["error"], "status failed");
+    }
+
+    #[test]
+    fn web_checkin_status_row_carries_variant() {
+        let item = checkin_status_item(
+            &json!({"id": "ai-1", "variant": "ai"}),
+            json!({"ok": false, "statusUnsupported": true}),
+        );
+
+        assert_eq!(item["variant"], "ai");
+        assert_eq!(item["statusUnsupported"], true);
     }
 }

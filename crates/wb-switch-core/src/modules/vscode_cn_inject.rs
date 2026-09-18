@@ -1,10 +1,11 @@
-//! CodeBuddy CN IDE Safe Storage 注入（仅 CN）。
+//! CodeBuddy IDE Safe Storage 注入（国内 CN / 国际版共用加解密）。
 //!
-//! 把账号会话 JSON 加密写入 `state.vscdb` 的 ItemTable：
-//! `secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}`
+//! 把账号会话 JSON 加密写入 `state.vscdb` 的 ItemTable。国内与国际密钥不同：
+//! - CN: `planning-genie.new.accessTokencn`，Keychain「CodeBuddy CN Safe Storage」
+//! - Intl: `planning-genie.new.accessToken`，Keychain「CodeBuddy Safe Storage」
 //!
 //! 平台加密模型对齐 Chromium/Electron Safe Storage：
-//! - macOS: Keychain「CodeBuddy CN Safe Storage」→ PBKDF2-SHA1(1003) → AES-128-CBC `v10`
+//! - macOS: Keychain → PBKDF2-SHA1(1003) → AES-128-CBC `v10`
 //! - Windows: Local State `os_crypt.encrypted_key` + DPAPI → AES-256-GCM `v10`
 //! - Linux: secret-tool / peanuts 固定密钥 → AES-128-CBC `v11`/`v10`
 
@@ -49,28 +50,89 @@ const SALT: &[u8] = b"saltysalt";
 
 pub const SECRET_EXTENSION_ID: &str = "tencent-cloud.coding-copilot";
 pub const SECRET_KEY: &str = "planning-genie.new.accessTokencn";
+pub const INTL_SECRET_KEY: &str = "planning-genie.new.accessToken";
+
+/// CodeBuddy 桌面 IDE 档位：国内 CN 与国际版共用加密，密钥/目录不同。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeBuddyIdeFlavor {
+    Cn,
+    Intl,
+}
+
+impl CodeBuddyIdeFlavor {
+    pub fn product_label(self) -> &'static str {
+        match self {
+            Self::Cn => "CodeBuddy CN",
+            Self::Intl => "CodeBuddy",
+        }
+    }
+
+    pub fn data_dir_name(self) -> &'static str {
+        self.product_label()
+    }
+
+    pub fn secret_key(self) -> &'static str {
+        match self {
+            Self::Cn => SECRET_KEY,
+            Self::Intl => INTL_SECRET_KEY,
+        }
+    }
+
+    pub fn keychain_service(self) -> &'static str {
+        match self {
+            Self::Cn => "CodeBuddy CN Safe Storage",
+            Self::Intl => "CodeBuddy Safe Storage",
+        }
+    }
+
+    pub fn linux_secret_apps(self) -> &'static [&'static str] {
+        match self {
+            Self::Cn => &[
+                "CodeBuddy CN",
+                "codebuddy cn",
+                "codebuddy-cn",
+                "codebuddycn",
+            ],
+            Self::Intl => &["CodeBuddy", "codebuddy"],
+        }
+    }
+}
 
 /// ItemTable 完整 key。
 pub fn secret_storage_item_key() -> String {
+    secret_storage_item_key_for(CodeBuddyIdeFlavor::Cn)
+}
+
+pub fn secret_storage_item_key_for(flavor: CodeBuddyIdeFlavor) -> String {
     format!(
         r#"secret://{{"extensionId":"{}","key":"{}"}}"#,
-        SECRET_EXTENSION_ID, SECRET_KEY
+        SECRET_EXTENSION_ID,
+        flavor.secret_key()
     )
 }
 
-pub fn codebuddy_cn_data_dir() -> Option<PathBuf> {
+pub fn codebuddy_ide_data_dir(flavor: CodeBuddyIdeFlavor) -> Option<PathBuf> {
+    let name = flavor.data_dir_name();
     #[cfg(target_os = "macos")]
     {
-        Some(crate::modules::config::home_dir().join("Library/Application Support/CodeBuddy CN"))
+        Some(
+            crate::modules::config::home_dir()
+                .join("Library/Application Support")
+                .join(name),
+        )
     }
     #[cfg(target_os = "windows")]
     {
-        dirs::data_dir().map(|d| d.join("CodeBuddy CN"))
+        dirs::data_dir().map(|d| d.join(name))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        dirs::config_dir().map(|d| d.join("CodeBuddy CN"))
+        dirs::config_dir().map(|d| d.join(name))
     }
+}
+
+pub fn codebuddy_cn_data_dir() -> Option<PathBuf> {
+    codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Cn)
 }
 
 pub fn codebuddy_cn_state_db_path() -> Option<PathBuf> {
@@ -78,9 +140,17 @@ pub fn codebuddy_cn_state_db_path() -> Option<PathBuf> {
 }
 
 pub fn resolve_state_db_path(user_data_dir: Option<&Path>) -> Result<PathBuf, String> {
+    resolve_state_db_path_for(CodeBuddyIdeFlavor::Cn, user_data_dir)
+}
+
+pub fn resolve_state_db_path_for(
+    flavor: CodeBuddyIdeFlavor,
+    user_data_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
     let root = match user_data_dir {
         Some(p) => p.to_path_buf(),
-        None => codebuddy_cn_data_dir().ok_or_else(|| "无法定位 CodeBuddy CN 数据目录".to_string())?,
+        None => codebuddy_ide_data_dir(flavor)
+            .ok_or_else(|| format!("无法定位 {} 数据目录", flavor.product_label()))?,
     };
     let candidates = [
         root.join("User").join("globalStorage").join("state.vscdb"),
@@ -214,17 +284,20 @@ fn run_command_get_trimmed(program: &str, args: &[&str], timeout_secs: u64) -> O
 }
 
 #[cfg(target_os = "macos")]
-fn get_macos_safe_storage_password() -> Result<String, String> {
+fn get_macos_safe_storage_password(flavor: CodeBuddyIdeFlavor) -> Result<String, String> {
     // 只查询一次：解密只依赖 password 本身、与 account 属性无关，
     // 单次查询最多触发一次钥匙串授权弹窗（多候选循环会逐次弹窗）。
+    let service = flavor.keychain_service();
     run_command_get_trimmed(
         "security",
-        &["find-generic-password", "-w", "-s", "CodeBuddy CN Safe Storage"],
+        &["find-generic-password", "-w", "-s", service],
         10,
     )
     .ok_or_else(|| {
-        "无法从 Keychain 读取 CodeBuddy CN Safe Storage 密码。请先手动打开 CodeBuddy CN 并登录一次。"
-            .to_string()
+        format!(
+            "无法从 Keychain 读取 {service} 密码。请先手动打开 {} 并登录一次。",
+            flavor.product_label()
+        )
     })
 }
 
@@ -238,13 +311,8 @@ const LINUX_EMPTY_KEY: [u8; 16] = [
 ];
 
 #[cfg(target_os = "linux")]
-fn get_linux_v11_key() -> Option<[u8; 16]> {
-    for app in [
-        "CodeBuddy CN",
-        "codebuddy cn",
-        "codebuddy-cn",
-        "codebuddycn",
-    ] {
+fn get_linux_v11_key(flavor: CodeBuddyIdeFlavor) -> Option<[u8; 16]> {
+    for app in flavor.linux_secret_apps() {
         if let Some(password) =
             run_command_get_trimmed("secret-tool", &["lookup", "application", app], 10)
         {
@@ -260,7 +328,7 @@ fn get_local_state_path(data_root: &Path) -> Result<PathBuf, String> {
     if path.exists() {
         Ok(path)
     } else {
-        Err(format!("未找到 CodeBuddy CN Local State: {}", path.display()))
+        Err(format!("未找到 Local State: {}", path.display()))
     }
 }
 
@@ -275,16 +343,8 @@ fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
             cbData: 0,
             pbData: std::ptr::null_mut(),
         };
-        CryptUnprotectData(
-            &mut data_in,
-            None,
-            None,
-            None,
-            None,
-            0,
-            &mut data_out,
-        )
-        .map_err(|e| format!("DPAPI CryptUnprotectData failed: {e}"))?;
+        CryptUnprotectData(&mut data_in, None, None, None, None, 0, &mut data_out)
+            .map_err(|e| format!("DPAPI CryptUnprotectData failed: {e}"))?;
         if data_out.pbData.is_null() || data_out.cbData == 0 {
             return Err("DPAPI returned empty data".to_string());
         }
@@ -298,8 +358,8 @@ fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(target_os = "windows")]
 fn get_windows_encryption_key(data_root: &Path) -> Result<Vec<u8>, String> {
     let local_state = get_local_state_path(data_root)?;
-    let text = std::fs::read_to_string(&local_state)
-        .map_err(|e| format!("读取 Local State 失败: {e}"))?;
+    let text =
+        std::fs::read_to_string(&local_state).map_err(|e| format!("读取 Local State 失败: {e}"))?;
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("解析 Local State 失败: {e}"))?;
     let encrypted_key_b64 = json["os_crypt"]["encrypted_key"]
@@ -352,16 +412,21 @@ fn encrypt_windows_gcm_v10(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Stri
     Ok(result)
 }
 
-fn decrypt_secret_payload(encrypted: &[u8], data_root: &Path) -> Result<Vec<u8>, String> {
+fn decrypt_secret_payload(
+    encrypted: &[u8],
+    data_root: &Path,
+    flavor: CodeBuddyIdeFlavor,
+) -> Result<Vec<u8>, String> {
     #[cfg(target_os = "windows")]
     {
+        let _ = flavor;
         let key = get_windows_encryption_key(data_root)?;
         return decrypt_windows_gcm_v10(&key, encrypted);
     }
     #[cfg(target_os = "macos")]
     {
         let _ = data_root;
-        let password = get_macos_safe_storage_password()?;
+        let password = get_macos_safe_storage_password(flavor)?;
         let key = pbkdf2_sha1_key(&password, 1003);
         return decrypt_cbc_prefixed(encrypted, V10_PREFIX, &key);
     }
@@ -370,9 +435,8 @@ fn decrypt_secret_payload(encrypted: &[u8], data_root: &Path) -> Result<Vec<u8>,
         let _ = data_root;
         match detect_prefix(encrypted) {
             Some("v11") => {
-                let key = get_linux_v11_key().ok_or_else(|| {
-                    "无法加载 Linux secret storage key（v11）".to_string()
-                })?;
+                let key = get_linux_v11_key(flavor)
+                    .ok_or_else(|| "无法加载 Linux secret storage key（v11）".to_string())?;
                 match decrypt_cbc_prefixed(encrypted, V11_PREFIX, &key) {
                     Ok(value) => Ok(value),
                     Err(_) => decrypt_cbc_prefixed(encrypted, V11_PREFIX, &LINUX_EMPTY_KEY),
@@ -390,7 +454,7 @@ fn decrypt_secret_payload(encrypted: &[u8], data_root: &Path) -> Result<Vec<u8>,
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        let _ = (encrypted, data_root);
+        let _ = (encrypted, data_root, flavor);
         Err("Unsupported platform".to_string())
     }
 }
@@ -399,17 +463,18 @@ fn encrypt_secret_payload(
     plaintext: &[u8],
     preferred_prefix: Option<&str>,
     data_root: &Path,
+    flavor: CodeBuddyIdeFlavor,
 ) -> Result<Vec<u8>, String> {
     #[cfg(target_os = "windows")]
     {
-        let _ = preferred_prefix;
+        let _ = (preferred_prefix, flavor);
         let key = get_windows_encryption_key(data_root)?;
         return encrypt_windows_gcm_v10(&key, plaintext);
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (preferred_prefix, data_root);
-        let password = get_macos_safe_storage_password()?;
+        let password = get_macos_safe_storage_password(flavor)?;
         let key = pbkdf2_sha1_key(&password, 1003);
         return encrypt_cbc_prefixed(V10_PREFIX, &key, plaintext);
     }
@@ -418,13 +483,13 @@ fn encrypt_secret_payload(
         let _ = data_root;
         let target_prefix = if let Some(prefix) = preferred_prefix {
             prefix
-        } else if get_linux_v11_key().is_some() {
+        } else if get_linux_v11_key(flavor).is_some() {
             "v11"
         } else {
             "v10"
         };
         if target_prefix == "v11" {
-            let key = get_linux_v11_key()
+            let key = get_linux_v11_key(flavor)
                 .ok_or_else(|| "无法加载 Linux secret storage key（v11）".to_string())?;
             return encrypt_cbc_prefixed(V11_PREFIX, &key, plaintext);
         }
@@ -432,19 +497,23 @@ fn encrypt_secret_payload(
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
-        let _ = (plaintext, preferred_prefix, data_root);
+        let _ = (plaintext, preferred_prefix, data_root, flavor);
         Err("Unsupported platform".to_string())
     }
 }
 
-fn decode_secret_storage_value(raw_value: &str, data_root: &Path) -> Result<String, String> {
+fn decode_secret_storage_value(
+    raw_value: &str,
+    data_root: &Path,
+    flavor: CodeBuddyIdeFlavor,
+) -> Result<String, String> {
     let parsed: serde_json::Value = match serde_json::from_str(raw_value) {
         Ok(value) => value,
         Err(_) => return Ok(raw_value.to_string()),
     };
     if parsed.get("data").is_some() {
         let encrypted_bytes = decode_buffer_data(&parsed)?;
-        let decrypted = decrypt_secret_payload(&encrypted_bytes, data_root)?;
+        let decrypted = decrypt_secret_payload(&encrypted_bytes, data_root, flavor)?;
         return String::from_utf8(decrypted)
             .map_err(|e| format!("Decrypted data is not valid UTF-8: {e}"));
     }
@@ -456,14 +525,20 @@ fn decode_secret_storage_value(raw_value: &str, data_root: &Path) -> Result<Stri
 
 /// 读取并解密 CodeBuddy CN 当前登录 secret（明文 JSON 字符串）。
 pub fn read_codebuddy_cn_secret(user_data_dir: Option<&Path>) -> Result<Option<String>, String> {
-    let db_path = resolve_state_db_path(user_data_dir)?;
+    read_codebuddy_ide_secret(CodeBuddyIdeFlavor::Cn, user_data_dir)
+}
+
+pub fn read_codebuddy_ide_secret(
+    flavor: CodeBuddyIdeFlavor,
+    user_data_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let db_path = resolve_state_db_path_for(flavor, user_data_dir)?;
     if !db_path.exists() {
         return Ok(None);
     }
     let data_root = data_root_from_db(&db_path)?.to_path_buf();
-    let conn = Connection::open(&db_path)
-        .map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
-    let key = secret_storage_item_key();
+    let conn = Connection::open(&db_path).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
+    let key = secret_storage_item_key_for(flavor);
     let raw_value: Option<String> = match conn.query_row(
         "SELECT value FROM ItemTable WHERE key = ?1",
         [key.as_str()],
@@ -471,10 +546,15 @@ pub fn read_codebuddy_cn_secret(user_data_dir: Option<&Path>) -> Result<Option<S
     ) {
         Ok(value) => Some(value),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(err) => return Err(format!("查询 CodeBuddy CN secret 失败: {err}")),
+        Err(err) => {
+            return Err(format!(
+                "查询 {} secret 失败: {err}",
+                flavor.product_label()
+            ))
+        }
     };
     match raw_value {
-        Some(value) => decode_secret_storage_value(&value, &data_root).map(Some),
+        Some(value) => decode_secret_storage_value(&value, &data_root, flavor).map(Some),
         None => Ok(None),
     }
 }
@@ -484,11 +564,18 @@ pub fn inject_codebuddy_cn_secret(
     plaintext: &str,
     user_data_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
-    let db_path = resolve_state_db_path(user_data_dir)?;
+    inject_codebuddy_ide_secret(CodeBuddyIdeFlavor::Cn, plaintext, user_data_dir)
+}
+
+pub fn inject_codebuddy_ide_secret(
+    flavor: CodeBuddyIdeFlavor,
+    plaintext: &str,
+    user_data_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let db_path = resolve_state_db_path_for(flavor, user_data_dir)?;
     let data_root = data_root_from_db(&db_path)?.to_path_buf();
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 state.vscdb 父目录失败: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 state.vscdb 父目录失败: {e}"))?;
     }
     let conn = Connection::open(&db_path).map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
     conn.execute(
@@ -497,7 +584,7 @@ pub fn inject_codebuddy_cn_secret(
     )
     .map_err(|e| format!("初始化 ItemTable 失败: {e}"))?;
 
-    let db_key = secret_storage_item_key();
+    let db_key = secret_storage_item_key_for(flavor);
     let existing_prefix: Option<String> = match conn.query_row(
         "SELECT value FROM ItemTable WHERE key = ?",
         [db_key.as_str()],
@@ -517,8 +604,12 @@ pub fn inject_codebuddy_cn_secret(
         Err(_) => None,
     };
 
-    let encrypted =
-        encrypt_secret_payload(plaintext.as_bytes(), existing_prefix.as_deref(), &data_root)?;
+    let encrypted = encrypt_secret_payload(
+        plaintext.as_bytes(),
+        existing_prefix.as_deref(),
+        &data_root,
+        flavor,
+    )?;
     let buffer_str = encode_secret_buffer(encrypted)?;
     conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
@@ -553,6 +644,18 @@ mod tests {
             key,
             r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}"#
         );
+        assert_eq!(
+            secret_storage_item_key_for(CodeBuddyIdeFlavor::Intl),
+            r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessToken"}"#
+        );
+        assert_eq!(
+            CodeBuddyIdeFlavor::Intl.keychain_service(),
+            "CodeBuddy Safe Storage"
+        );
+        assert_ne!(
+            CodeBuddyIdeFlavor::Cn.secret_key(),
+            CodeBuddyIdeFlavor::Intl.secret_key()
+        );
     }
 
     #[test]
@@ -564,6 +667,14 @@ mod tests {
         assert!(
             s.contains("CodeBuddy CN"),
             "data dir should contain CodeBuddy CN: {s}"
+        );
+        let Some(intl) = codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Intl) else {
+            return;
+        };
+        let intl_s = intl.to_string_lossy();
+        assert!(
+            intl_s.contains("CodeBuddy") && !intl_s.contains("CodeBuddy CN"),
+            "intl data dir should be CodeBuddy not CN: {intl_s}"
         );
     }
 
@@ -589,10 +700,8 @@ mod tests {
 
     #[test]
     fn resolve_prefers_existing_candidate() {
-        let dir = std::env::temp_dir().join(format!(
-            "wb-cn-ide-path-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wb-cn-ide-path-test-{}", uuid::Uuid::new_v4()));
         let db = dir.join("User").join("globalStorage").join("state.vscdb");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         std::fs::write(&db, b"").unwrap();

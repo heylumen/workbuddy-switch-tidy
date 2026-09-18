@@ -30,6 +30,38 @@ export function WorkBuddyMark({ size = 32, className }: MarkProps) {
   );
 }
 
+/**
+ * 档位角标：复用官方图标 + 角标区分档位，不新画图形，
+ * 保持与既有 WorkBuddy / CodeBuddy 标记同一套圆角与配色。
+ * 角标文案为 `INTL`（4 字符，比圆形 badge 宽），故按内容撑成胶囊并收紧字号。
+ * WorkBuddy 与 CodeBuddy IDE 的档位标记共用这一份实现。
+ */
+function IntlBadge({ size }: { size: number }) {
+  const badge = Math.max(11, Math.round(size * 0.46));
+  return (
+    <span
+      className="absolute -bottom-0.5 -right-0.5 inline-flex items-center justify-center rounded-full border border-card bg-foreground px-[3px] font-semibold leading-none text-background"
+      style={{ minWidth: badge, height: badge, fontSize: Math.max(6, Math.round(badge * 0.5)) }}
+    >
+      INTL
+    </span>
+  );
+}
+
+/** WorkBuddy 国际版标记。 */
+export function WorkBuddyAiMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn("relative inline-flex shrink-0", className)}
+      style={{ width: size, height: size }}
+    >
+      <WorkBuddyMark size={size} />
+      <IntlBadge size={size} />
+    </span>
+  );
+}
+
 /** 应用自身的透明角色图标；桌面安装图标仍使用 public/icon.png。 */
 export function AppIconMark({ size = 32, className }: MarkProps) {
   return (
@@ -88,6 +120,24 @@ export function CodeBuddyCnIdeMark({ size = 32, className }: MarkProps) {
         alt=""
         className="absolute left-1/2 top-1/2 size-[122%] max-w-none -translate-x-1/2 -translate-y-1/2 object-cover"
       />
+    </span>
+  );
+}
+
+/**
+ * CodeBuddy IDE 国际版标记：同一官方图标 + INTL 角标。
+ * 依据 `variantUsesIntlCodebuddyIde()` —— 国际版档位下 IDE 切的是 CodeBuddy.app，
+ * 与国内版的 CodeBuddy CN 是两个客户端，故用同一套角标区分。
+ */
+export function CodeBuddyAiIdeMark({ size = 32, className }: MarkProps) {
+  return (
+    <span
+      aria-hidden
+      className={cn("relative inline-flex shrink-0", className)}
+      style={{ width: size, height: size }}
+    >
+      <CodeBuddyCnIdeMark size={size} />
+      <IntlBadge size={size} />
     </span>
   );
 }

@@ -1,5 +1,11 @@
 // 与 Rust 后端命令返回结构对齐的类型定义（对照 server.py 各 API 响应）
 
+/**
+ * WorkBuddy 客户端档位：国内版（cn）/ 国际版（ai）。
+ * 后端以字符串返回，历史数据与旧响应可能缺省该字段，读取时统一按国内版处理。
+ */
+export type WbVariant = "cn" | "ai";
+
 export interface AccountMeta {
   id: string;
   uid: string | null;
@@ -12,6 +18,8 @@ export interface AccountMeta {
   createdAt: number | null;
   needsRelogin: boolean;
   needsReloginReason: string | null;
+  /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
+  variant?: WbVariant;
 }
 
 export interface AppStatus {
@@ -24,6 +32,8 @@ export interface AppStatus {
   } | null;
   appPath: string;
   version: string;
+  /** 上述字段所属档位；缺省按国内版处理。 */
+  variant?: WbVariant;
 }
 
 export interface OAuthStartResult {
@@ -91,16 +101,23 @@ export interface CopyResult {
   backup: string;
 }
 
+/** 切换时的会话复制报告；复制失败时后端只回 `error`（切换本身仍继续）。 */
+export interface SessionCopyReport {
+  sourceUid: string;
+  targetUid: string;
+  /** 错误分支不返回该字段：后端只给 `{ error }`。 */
+  copied?: CopyResult[];
+  errors?: { id: string; error: string }[];
+  error?: string;
+}
+
 export interface SwitchResult {
   ok: boolean;
   account: string;
+  /** 目标账号自身档位；缺省按国内版处理。 */
+  variant?: WbVariant;
   backup: string | null;
-  sessionCopy?: {
-    sourceUid: string;
-    targetUid: string;
-    copied: CopyResult[];
-    errors?: { id: string; error: string }[];
-  };
+  sessionCopy?: SessionCopyReport;
 }
 
 export interface CheckinConfig {
@@ -118,11 +135,15 @@ export interface CheckinLog {
   email: string;
   result: string;
   error?: string;
+  /** 该行所属档位；历史日志缺省按国内版处理。 */
+  variant?: WbVariant;
 }
 
 export interface CheckinResult {
   result: string;
   error?: string;
+  /** 国际版签到活动未开放时的业务判定；不写成功日志、不计入失败重试。 */
+  inactive?: boolean;
 }
 
 export interface TravelConfig {
@@ -138,12 +159,79 @@ export interface TravelStatus {
   arriveAt?: number | null;
 }
 
+/** 单个受限模型；`model` 为 null 表示日志里归因不到模型（显示「未知模型」，不猜测）。 */
+export interface RateLimitEntry {
+  model: string | null;
+  /** 官方日志原文给出的恢复时刻（毫秒）。 */
+  resetAt: number;
+  /** 该事件首次出现的时刻（毫秒）。 */
+  firstSeenAt: number;
+  /** 去重前的原始命中行数（调试/排查用）。 */
+  hitCount: number;
+}
+
+/** 一个账号当前受限的全部模型（按 `resetAt` 升序）。 */
+export interface AccountRateLimits {
+  accountId: string;
+  limited: RateLimitEntry[];
+}
+
+/** 模型限额台账：一次返回全部账号的当前受限状态（数据来自本机日志）。 */
+export interface RateLimitsPayload {
+  scannedAt: number;
+  /** 固定 2 天，回显便于调试。 */
+  windowDays: number;
+  /** 只包含至少有一个受限模型的账号。 */
+  accounts: AccountRateLimits[];
+}
+
+/** 一处客户端 hook 配置的安装状态。 */
+export interface RateLimitHookTarget {
+  /** 备份标签（codebuddy / workbuddy / workbuddy-ai）。 */
+  label: string;
+  /** `settings.json` 路径。 */
+  path: string;
+  /** 该客户端数据根目录是否存在（唯一的存在性判据；不存在则不参与安装）。 */
+  exists: boolean;
+  /** 该配置里是否已注册本工具的 Stop / FinalStop。 */
+  installed: boolean;
+}
+
+/**
+ * 限额 hook 安装状态：脚本 + 三处客户端配置逐项结果。
+ *
+ * `installed` = 脚本存在且至少一处配置注册成功；`lastEventAt` 是最近一次由后端
+ * 入账的 hook 限额事件时刻（null = 从未收到）。
+ */
+export interface RateLimitHookStatus {
+  scriptPath: string;
+  scriptExists: boolean;
+  eventsPath: string;
+  installed: boolean;
+  lastEventAt?: number | null;
+  targets: RateLimitHookTarget[];
+}
+
+/** 限额监听开关（`~/.wb-switch/rate_limit_config.json`）。 */
+export interface RateLimitConfig {
+  enabled: boolean;
+  /** 用户点过「卸载 hook」→ 启动时不再自动接入；重新点「接入 hook」清除。 */
+  hookOptOut: boolean;
+  /**
+   * 是否扫描两个 CodeBuddy IDE 的日志（默认 true）。
+   * IDE 的 429 不触发任何 hook 事件，日志是它唯一的数据源；关闭只影响 IDE 两源，
+   * CLI / WorkBuddy 的 hook 实时上报与未接 hook 时的日志兜底不变。
+   */
+  scanIdeLogs: boolean;
+}
+
 export interface AutoRotateConfig {
   enabled: boolean;
   check_interval_minutes: number;
   cooldown_minutes: number;
   min_gap_hours: number;
   min_urgency_hours: number;
+  /** 配置键兼容保留：轮换已改用「会话存活门控」，该值不再参与决策，设置页也不再展示。 */
   active_guard_minutes: number;
   min_remaining_credits: number;
 }
@@ -228,6 +316,8 @@ export interface CreditStatsAccount {
   lastCheckinResult: string | null;
   /** 按账号的逐日观察消耗（缺省兼容旧后端）；官方可用时趋势图优先使用官方 daily */
   daily?: CreditStatsDailyPoint[];
+  /** 档位标记。后端当前不下发，前端容忍性读取；缺省时回退到按 accountId 的映射表 */
+  variant?: WbVariant;
 }
 
 export interface CreditStatsUsageEvent {
@@ -237,6 +327,8 @@ export interface CreditStatsUsageEvent {
   accountId: string;
   accountName: string;
   amount: number;
+  /** 档位标记。后端当前不下发，前端容忍性读取；缺省时回退到按 accountId 的映射表 */
+  variant?: WbVariant;
 }
 
 export interface CreditStatsCheckinEvent {
@@ -247,6 +339,8 @@ export interface CreditStatsCheckinEvent {
   accountName: string;
   result: string;
   error?: string | null;
+  /** 档位标记。后端当前不下发，前端容忍性读取；缺省时回退到按 accountId 的映射表 */
+  variant?: WbVariant;
 }
 
 export type CreditStatsEvent = CreditStatsUsageEvent | CreditStatsCheckinEvent;
@@ -329,29 +423,11 @@ export interface CreditStatistics {
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+/** 一次模型调用的明细行；`total = input + output + cacheWrite`，`uncachedInput = max(0, input - cacheRead)`，`thinking` 是 `output` 中思考过程的 token 数（回复内容 = max(0, output - thinking)），均与聚合口径一致。 */
+export interface TokenStatsRequestRow { timestamp: number; model: string; project: string; sessionId: string; title?: string | null; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; thinking: number; total: number; }
+/** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集。 */
+export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
-
-/** 单条 429 限额事件（来自 ~/.workbuddy/logs/ 解析，账号/模型为反查仅供参考）。 */
-export interface LimitEvent {
-  occurredAt: number;
-  resetAt: number;
-  sessionId?: string | null;
-  accountUid?: string | null;
-  model?: string | null;
-  active: boolean;
-}
-/** 限额台账：扫描本地 429 日志得到的事件列表，含仍在限额中的计数。 */
-export interface LimitsLedger {
-  generatedAt: number;
-  rangeDays?: number | null;
-  events: LimitEvent[];
-  activeCount: number;
-  filesScanned: number;
-  parseErrors: number;
-  coverageStartAt?: number | null;
-  coverageEndAt?: number | null;
-}
 
 export interface CodeBuddyCliStatus {
   configured: boolean;
@@ -366,6 +442,8 @@ export interface CodeBuddyCliStatus {
   activeIndex: number | null;
   activeAccountId: string | null;
   activeAccountName: string | null;
+  /** 当前 CLI 账号所属档位；尚未接入时缺省。 */
+  activeAccountVariant?: WbVariant | null;
   accountCount: number;
   statePath: string;
 }
@@ -380,6 +458,9 @@ export interface CodeBuddyCliSwitchResult {
   activeAccountId?: string;
   source?: string;
   skipped?: boolean;
+  regionChanged?: boolean;
+  cliClosed?: boolean;
+  closedProcessCount?: number;
   message?: string;
   error?: string;
 }

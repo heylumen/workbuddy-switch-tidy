@@ -8,10 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::modules::variant::WbVariant;
+
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
 
+// 以下三个常量是「国内版」档位的取值来源（档位取值统一见 modules/variant.rs）；
+// 新增档位差异不要再新增同类常量。
 pub const WORKBUDDY_API_ENDPOINT: &str = "https://www.codebuddy.cn";
 pub const WORKBUDDY_API_PREFIX: &str = "/v2/plugin";
 pub const WORKBUDDY_PLATFORM: &str = "workbuddy";
@@ -44,13 +48,6 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // ---------------------------------------------------------------------------
 
 pub fn home_dir() -> PathBuf {
-    // 测试钩子：仅在显式设置 WORKBUDDY_HOME 时重定向（集成测试用）。
-    // 生产环境不设置该变量，行为与原先一致，零回归风险。
-    if let Ok(p) = std::env::var("WORKBUDDY_HOME") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -86,6 +83,10 @@ pub fn credit_usage_snapshots_file() -> PathBuf {
     store_dir().join("credit_usage_snapshots.json")
 }
 
+pub fn rate_limit_config_file() -> PathBuf {
+    store_dir().join("rate_limit_config.json")
+}
+
 pub fn official_usage_cache_file() -> PathBuf {
     store_dir().join("official_usage_cache.json")
 }
@@ -102,6 +103,7 @@ pub fn workbuddy_exe_cache_file() -> PathBuf {
     store_dir().join("workbuddy_exe.json")
 }
 
+/// 旧格式（单 `exe` 字段）解析，CodeBuddy CN 应用缓存沿用该格式。
 fn parse_workbuddy_exe_cache_json(text: &str) -> Option<PathBuf> {
     let v: Value = serde_json::from_str(text).ok()?;
     let exe = v.get("exe")?.as_str()?.trim();
@@ -112,26 +114,86 @@ fn parse_workbuddy_exe_cache_json(text: &str) -> Option<PathBuf> {
     }
 }
 
-/// 读取上次成功解析到的 WorkBuddy.exe；损坏或空文件视为无缓存。
-pub fn load_workbuddy_exe_cache() -> Option<PathBuf> {
+/// 按档位读缓存：新格式按档位分键，旧格式单键仅国内版认。
+fn parse_workbuddy_exe_cache_json_for(text: &str, variant: WbVariant) -> Option<PathBuf> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let keyed = v.get(variant.exe_cache_key());
+    let legacy = if variant == WbVariant::Cn {
+        v.get("exe")
+    } else {
+        None
+    };
+    let exe = keyed.or(legacy)?.as_str()?.trim();
+    if exe.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(exe))
+    }
+}
+
+/// 读取上次成功解析到的 WorkBuddy 应用路径（按档位分键）；损坏或空文件视为无缓存。
+pub fn load_workbuddy_exe_cache(variant: WbVariant) -> Option<PathBuf> {
     let f = workbuddy_exe_cache_file();
     if !f.exists() {
         return None;
     }
     let text = std::fs::read_to_string(&f).ok()?;
-    parse_workbuddy_exe_cache_json(&text)
+    parse_workbuddy_exe_cache_json_for(&text, variant)
 }
 
-/// 记住已存在的 WorkBuddy.exe，供下次未运行时启动。
-pub fn save_workbuddy_exe_cache(exe: &Path) -> std::io::Result<()> {
+/// 把某档位的路径并入缓存内容（旧格式单键按国内版迁移，写回新格式）。
+fn upsert_workbuddy_exe_cache_json(text: &str, variant: WbVariant, exe: &Path) -> String {
+    let mut root = serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = root.as_object_mut() {
+        if let Some(Value::String(legacy)) = obj.remove("exe") {
+            if !legacy.trim().is_empty() {
+                obj.entry(WbVariant::Cn.exe_cache_key().to_string())
+                    .or_insert(Value::String(legacy));
+            }
+        }
+        obj.insert(
+            variant.exe_cache_key().to_string(),
+            json!(exe.to_string_lossy()),
+        );
+    }
+    serde_json::to_string_pretty(&root).unwrap_or_default()
+}
+
+/// 记住已存在的 WorkBuddy 应用路径（按档位分键；旧格式单键在写回时升级）。
+pub fn save_workbuddy_exe_cache(variant: WbVariant, exe: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(store_dir())?;
-    let content =
-        serde_json::to_string_pretty(&json!({ "exe": exe.to_string_lossy() })).unwrap_or_default();
-    atomic_write(&workbuddy_exe_cache_file(), &content)
+    let file = workbuddy_exe_cache_file();
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    atomic_write(&file, &upsert_workbuddy_exe_cache_json(&text, variant, exe))
 }
 
-pub fn clear_workbuddy_exe_cache() {
-    let _ = std::fs::remove_file(workbuddy_exe_cache_file());
+/// 清除某档位的缓存项；无其它档位残留则删除文件。
+pub fn clear_workbuddy_exe_cache(variant: WbVariant) {
+    let file = workbuddy_exe_cache_file();
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return;
+    };
+    let Ok(mut root) = serde_json::from_str::<Value>(&text) else {
+        let _ = std::fs::remove_file(&file);
+        return;
+    };
+    let Some(obj) = root.as_object_mut() else {
+        let _ = std::fs::remove_file(&file);
+        return;
+    };
+    obj.remove(variant.exe_cache_key());
+    if variant == WbVariant::Cn {
+        obj.remove("exe");
+    }
+    if obj.is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    let content = serde_json::to_string_pretty(&root).unwrap_or_default();
+    let _ = atomic_write(&file, &content);
 }
 
 pub fn codebuddy_cn_app_cache_file() -> PathBuf {
@@ -161,6 +223,34 @@ pub fn save_codebuddy_cn_app_cache(path: &Path) -> std::io::Result<()> {
 
 pub fn clear_codebuddy_cn_app_cache() {
     let _ = std::fs::remove_file(codebuddy_cn_app_cache_file());
+}
+
+pub fn codebuddy_ide_app_cache_file() -> PathBuf {
+    store_dir().join("codebuddy_ide_app.json")
+}
+
+fn parse_codebuddy_ide_app_cache_json(text: &str) -> Option<PathBuf> {
+    parse_workbuddy_exe_cache_json(text)
+}
+
+pub fn load_codebuddy_ide_app_cache() -> Option<PathBuf> {
+    let f = codebuddy_ide_app_cache_file();
+    if !f.exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&f).ok()?;
+    parse_codebuddy_ide_app_cache_json(&text)
+}
+
+pub fn save_codebuddy_ide_app_cache(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(store_dir())?;
+    let content =
+        serde_json::to_string_pretty(&json!({ "exe": path.to_string_lossy() })).unwrap_or_default();
+    atomic_write(&codebuddy_ide_app_cache_file(), &content)
+}
+
+pub fn clear_codebuddy_ide_app_cache() {
+    let _ = std::fs::remove_file(codebuddy_ide_app_cache_file());
 }
 
 // ---------------------------------------------------------------------------
@@ -430,6 +520,66 @@ pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// 限额监听配置（hook 通路 + IDE 日志扫描的总开关）
+// ---------------------------------------------------------------------------
+
+/// 默认限额监听配置：默认开启（与改造前「账号页自动显示限额」的行为一致）。
+///
+/// `hookOptOut` = 用户点过「卸载 hook」→ 不再自动接入；默认 `false`（默认接入）。
+/// `scanIdeLogs` = 是否扫描两个 CodeBuddy IDE 的日志；默认 `true`（IDE 的 429 不触发事件，
+/// 日志是它唯一的数据源）。关闭只影响 IDE 两源，CLI / WorkBuddy 的 hook 通路与兜底扫描不变。
+pub fn default_rate_limit_config() -> Value {
+    json!({ "enabled": true, "hookOptOut": false, "scanIdeLogs": true })
+}
+
+/// 读取指定的限额监听配置文件（缺失/损坏时合并默认值）。
+///
+/// 与 `load_rate_limit_config` 分离只为注入路径：单测不得触碰真实 `~/.wb-switch`。
+pub fn load_rate_limit_config_at(path: &Path) -> Value {
+    let mut cfg = default_rate_limit_config();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+            for key in ["enabled", "hookOptOut", "scanIdeLogs"] {
+                if let Some(value) = map.get(key).and_then(Value::as_bool) {
+                    cfg[key] = json!(value);
+                }
+            }
+        }
+    }
+    cfg
+}
+
+/// 读取限额监听配置（缺失/损坏时合并默认值）。
+pub fn load_rate_limit_config() -> Value {
+    load_rate_limit_config_at(&rate_limit_config_file())
+}
+
+/// 保存限额监听配置到指定路径（只保留已知字段）。
+pub fn save_rate_limit_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
+    let mut merged = default_rate_limit_config();
+    for key in ["enabled", "hookOptOut", "scanIdeLogs"] {
+        if let Some(value) = cfg.get(key).and_then(Value::as_bool) {
+            merged[key] = json!(value);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(path, &content)
+}
+
+/// 只改写 `hookOptOut`（保留 `enabled` 等既有字段），返回写入后的完整配置。
+///
+/// 用户点「卸载 hook」置 `true`、「接入 hook」置 `false`；两处都不改动别的开关状态。
+pub fn set_rate_limit_hook_opt_out_at(path: &Path, opt_out: bool) -> std::io::Result<Value> {
+    let mut cfg = load_rate_limit_config_at(path);
+    cfg["hookOptOut"] = json!(opt_out);
+    save_rate_limit_config_at(path, &cfg)?;
+    Ok(load_rate_limit_config_at(path))
+}
+
+// ---------------------------------------------------------------------------
 // 自动轮换配置 / 日志（CodeBuddy CLI 账号轮换）
 // ---------------------------------------------------------------------------
 
@@ -513,6 +663,80 @@ pub fn add_rotate_log(entry: &Value) {
     let mut logs = load_rotate_logs();
     logs.push(entry.clone());
     let _ = save_rotate_logs(&logs);
+}
+
+// ---------------------------------------------------------------------------
+// 轮换推迟提示预算（`~/.wb-switch/auto_rotate_notify.json`）
+// ---------------------------------------------------------------------------
+
+/// 提示预算文件名（`store_dir()/auto_rotate_notify.json`）。
+const ROTATE_NOTIFY_FILE_NAME: &str = "auto_rotate_notify.json";
+
+/// 同一自然日内最多提示几次；超出只写轮换日志，不再打扰用户。
+pub const ROTATE_NOTIFY_DAILY_LIMIT: u32 = 5;
+
+static ROTATE_NOTIFY_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn auto_rotate_notify_file() -> PathBuf {
+    store_dir().join(ROTATE_NOTIFY_FILE_NAME)
+}
+
+/// 本地日期（`YYYY-MM-DD`）：提示预算的跨日重置口径（与签到日志同一套本地时间）。
+fn local_date(at_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(at_ms)
+        .single()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// 读当日已用次数：文件缺失 / 损坏 / 日期不是今天（跨日）一律按 0 计。
+fn rotate_notify_count_at(path: &Path, today: &str) -> u32 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return 0;
+    };
+    if value.get("date").and_then(Value::as_str) != Some(today) {
+        return 0;
+    }
+    value
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
+}
+
+/// 领取一次「轮换推迟提示」配额：`true` = 可以投递（并且已经计数）。
+///
+/// 同自然日上限 [`ROTATE_NOTIFY_DAILY_LIMIT`]，跨日按本地日期清零；读取失败/损坏视为 0，
+/// 不阻塞轮换。预算文件写不进去时不投递——宁可少一条通知，也不要每轮都弹。
+pub fn try_consume_rotate_notify(at_ms: i64) -> bool {
+    let _guard = ROTATE_NOTIFY_LOCK.lock().unwrap();
+    let path = auto_rotate_notify_file();
+    try_consume_rotate_notify_at(&path, &local_date(at_ms))
+}
+
+fn try_consume_rotate_notify_at(path: &Path, today: &str) -> bool {
+    if today.is_empty() {
+        return false;
+    }
+    let used = rotate_notify_count_at(path, today);
+    if used >= ROTATE_NOTIFY_DAILY_LIMIT {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let content = serde_json::to_string_pretty(&json!({
+        "date": today,
+        "count": used + 1,
+    }))
+    .unwrap_or_default();
+    atomic_write(path, &content).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +831,24 @@ pub fn norm_ts(v: Option<&Value>) -> Option<i64> {
 // HTTP 客户端（对照 Python http_request）
 // ---------------------------------------------------------------------------
 
+/// 响应是否为「该路径不存在」（HTTP 404）。
+///
+/// billing 路径候选回落**只允许由 404 触发**：401/403 是鉴权问题、10085 是网关
+/// 客户端指纹拦截、`code=-1` 是传输错误，把它们误当成路径问题会掩盖真实原因，
+/// 也会白白重试一遍并把错误码盖成 404（见 design D4）。
+pub fn is_route_missing(response: &Value) -> bool {
+    fn parse_code(value: &Value) -> Option<i64> {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    }
+    response
+        .get("code")
+        .and_then(parse_code)
+        .or_else(|| response.get("data")?.get("code").and_then(parse_code))
+        == Some(404)
+}
+
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn http_client_builder() -> reqwest::ClientBuilder {
@@ -646,22 +888,9 @@ pub async fn http_request_with_proxy(
     headers: Option<&HashMap<String, String>>,
     proxy: Option<&str>,
 ) -> Value {
-    http_request_with_proxy_timeout(url, method, body, headers, proxy, 30).await
-}
-
-/// 同 [`http_request_with_proxy`]，但可指定超时秒数（检查更新等需要快速降级的场景用短超时）。
-pub async fn http_request_with_proxy_timeout(
-    url: &str,
-    method: &str,
-    body: Option<Value>,
-    headers: Option<&HashMap<String, String>>,
-    proxy: Option<&str>,
-    timeout_secs: u64,
-) -> Value {
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => match http_client_builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
             .proxy(match reqwest::Proxy::all(proxy) {
                 Ok(proxy) => proxy,
                 Err(e) => return json!({"code": -1, "message": format!("代理地址无效: {e}")}),
@@ -683,9 +912,6 @@ pub async fn http_request_with_proxy_timeout(
     if let Some(b) = body {
         req = req.json(&b);
     }
-    // 显式超时（per-request），覆盖共享客户端的默认 30s——
-    // 否则无代理路径走共享 `http_client()` 时自定义超时不生效。
-    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -718,28 +944,13 @@ pub async fn http_request_raw(
     proxy: Option<&str>,
     follow_redirects: bool,
 ) -> (u16, HashMap<String, String>, String) {
-    http_request_raw_timeout(url, method, body, headers, proxy, follow_redirects, 30).await
-}
-
-/// 同 [`http_request_raw`]，但可指定超时秒数（检查更新等需要快速降级的场景用短超时）。
-pub async fn http_request_raw_timeout(
-    url: &str,
-    method: &str,
-    body: Option<Value>,
-    headers: Option<&HashMap<String, String>>,
-    proxy: Option<&str>,
-    follow_redirects: bool,
-    timeout_secs: u64,
-) -> (u16, HashMap<String, String>, String) {
     let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
     let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
         Some(proxy) => {
-            let mut builder = http_client_builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .proxy(match reqwest::Proxy::all(proxy) {
-                    Ok(proxy) => proxy,
-                    Err(e) => return (0, HashMap::new(), format!("代理地址无效: {e}")),
-                });
+            let mut builder = http_client_builder().proxy(match reqwest::Proxy::all(proxy) {
+                Ok(proxy) => proxy,
+                Err(e) => return (0, HashMap::new(), format!("代理地址无效: {e}")),
+            });
             if !follow_redirects {
                 builder = builder.redirect(reqwest::redirect::Policy::none());
             }
@@ -753,7 +964,6 @@ pub async fn http_request_raw_timeout(
                 http_client().clone()
             } else {
                 match http_client_builder()
-                    .timeout(std::time::Duration::from_secs(timeout_secs))
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                 {
@@ -773,8 +983,6 @@ pub async fn http_request_raw_timeout(
     if let Some(b) = body {
         req = req.json(&b);
     }
-    // 显式超时（per-request），覆盖共享客户端的默认 30s。
-    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
     match req.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
@@ -1011,11 +1219,91 @@ mod tests {
     }
 
     #[test]
+    fn workbuddy_exe_cache_reads_new_format_per_variant() {
+        let text = r#"{
+  "cn": "C:\\Programs\\WorkBuddy\\WorkBuddy.exe",
+  "ai": "C:\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe"
+}"#;
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(text, WbVariant::Cn)
+                .unwrap()
+                .to_string_lossy(),
+            r"C:\Programs\WorkBuddy\WorkBuddy.exe"
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(text, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            r"C:\Programs\WorkBuddyAI\WorkBuddyAI.exe"
+        );
+    }
+
+    #[test]
+    fn workbuddy_exe_cache_reads_legacy_single_key_as_cn_only() {
+        let text = r#"{ "exe": "C:\\Programs\\WorkBuddy\\WorkBuddy.exe" }"#;
+        assert!(parse_workbuddy_exe_cache_json_for(text, WbVariant::Cn).is_some());
+        assert!(parse_workbuddy_exe_cache_json_for(text, WbVariant::Ai).is_none());
+        assert!(parse_workbuddy_exe_cache_json_for(r#"{ "exe": "  " }"#, WbVariant::Cn).is_none());
+        assert!(parse_workbuddy_exe_cache_json_for("not-json", WbVariant::Cn).is_none());
+    }
+
+    #[test]
+    fn workbuddy_exe_cache_write_upgrades_legacy_and_keeps_both_keys() {
+        // 旧格式写入国际版 → 升级为新格式，且国内版旧值迁到 cn 键
+        let migrated = upsert_workbuddy_exe_cache_json(
+            r#"{ "exe": "/Applications/WorkBuddy.app" }"#,
+            WbVariant::Ai,
+            Path::new("/Applications/WorkBuddy AI.app"),
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&migrated, WbVariant::Cn)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/WorkBuddy.app"
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&migrated, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/WorkBuddy AI.app"
+        );
+        assert!(!migrated.contains("\"exe\""), "写回新格式: {migrated}");
+
+        // 再写国内版：两档位互不覆盖
+        let both = upsert_workbuddy_exe_cache_json(
+            &migrated,
+            WbVariant::Cn,
+            Path::new("/Applications/CodeBuddy.app"),
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&both, WbVariant::Cn)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/CodeBuddy.app"
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&both, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/WorkBuddy AI.app"
+        );
+
+        // 损坏内容不从零继承，直接重建
+        let recovered =
+            upsert_workbuddy_exe_cache_json("not-json", WbVariant::Ai, Path::new("/x/a"));
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&recovered, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            "/x/a"
+        );
+    }
+
+    #[test]
     fn parse_codebuddy_cn_app_cache_json_reads_exe() {
-        let path = parse_codebuddy_cn_app_cache_json(
-            r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#,
-        )
-        .expect("valid cache");
+        let path =
+            parse_codebuddy_cn_app_cache_json(r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#)
+                .expect("valid cache");
         assert_eq!(path.to_string_lossy(), "/Applications/CodeBuddy CN.app");
     }
 
@@ -1028,12 +1316,252 @@ mod tests {
 
     #[test]
     fn codebuddy_cn_app_cache_file_is_not_workbuddy_exe_cache() {
-        assert_ne!(
-            codebuddy_cn_app_cache_file(),
-            workbuddy_exe_cache_file()
-        );
+        assert_ne!(codebuddy_cn_app_cache_file(), workbuddy_exe_cache_file());
         assert!(codebuddy_cn_app_cache_file()
             .file_name()
             .is_some_and(|n| n == "codebuddy_cn_app.json"));
+        assert_ne!(
+            codebuddy_ide_app_cache_file(),
+            codebuddy_cn_app_cache_file()
+        );
+        assert!(codebuddy_ide_app_cache_file()
+            .file_name()
+            .is_some_and(|n| n == "codebuddy_ide_app.json"));
+    }
+
+    #[test]
+    fn default_http_user_agent_matches_official_chrome_desktop() {
+        assert_eq!(
+            DEFAULT_HTTP_USER_AGENT,
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+        );
+        let _ = http_client_builder();
+    }
+
+    #[test]
+    fn route_missing_is_404_only() {
+        assert!(is_route_missing(
+            &json!({"code": 404, "message": "not found"})
+        ));
+        assert!(is_route_missing(&json!({"code": "404"})));
+        assert!(is_route_missing(&json!({"data": {"code": 404}})));
+        // 非 404 一律不得当作路径问题回落。
+        assert!(!is_route_missing(
+            &json!({"code": 401, "message": "unauthorized"})
+        ));
+        assert!(!is_route_missing(&json!({"code": 403})));
+        assert!(!is_route_missing(
+            &json!({"code": 10085, "msg": "请求不合法"})
+        ));
+        assert!(!is_route_missing(
+            &json!({"code": -1, "message": "error sending request"})
+        ));
+        assert!(!is_route_missing(&json!({"code": 0, "data": {}})));
+        assert!(!is_route_missing(&Value::Null));
+    }
+
+    /// 限额监听配置：默认开启、显式 false 生效、损坏/缺字段回默认，且只写已知字段。
+    #[test]
+    fn rate_limit_config_defaults_to_enabled_and_keeps_only_known_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-rate-limit-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rate_limit_config.json");
+
+        // 文件缺失 → 默认开启、未卸载过、IDE 日志扫描开启。
+        let defaults = load_rate_limit_config_at(&path);
+        assert_eq!(defaults.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            defaults.get("hookOptOut").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            defaults.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式关闭 → 生效。
+        save_rate_limit_config_at(
+            &path,
+            &json!({"enabled": false, "scanIdeLogs": false, "extra": 1}),
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            saved.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false),
+            "scanIdeLogs 显式 false 必须落盘"
+        );
+        assert!(saved.get("extra").is_none(), "只保留已知字段: {saved}");
+        assert_eq!(
+            saved.as_object().unwrap().len(),
+            3,
+            "只有 enabled + hookOptOut + scanIdeLogs"
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("scanIdeLogs")
+                .and_then(Value::as_bool),
+            Some(false),
+            "读回仍是显式 false（不被默认值冲掉）"
+        );
+
+        // 显式 true 与显式 false 都如实往返（默认值不覆盖显式值）。
+        save_rate_limit_config_at(&path, &json!({"scanIdeLogs": true})).unwrap();
+        let round_trip = load_rate_limit_config_at(&path);
+        assert_eq!(
+            round_trip.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 损坏内容 / 类型不符 → 回默认，不报错。
+        std::fs::write(&path, "not-json").unwrap();
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("scanIdeLogs")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        std::fs::write(&path, json!({"enabled": "no"}).to_string()).unwrap();
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(rate_limit_config_file().ends_with("rate_limit_config.json"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `hookOptOut` 与 `enabled` 并列：只保留已知字段，且单字段改写不动另一个开关。
+    #[test]
+    fn rate_limit_hook_opt_out_survives_known_field_merge() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-rate-limit-opt-out-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rate_limit_config.json");
+
+        // 只保留已知字段：多余键不落盘。
+        save_rate_limit_config_at(
+            &path,
+            &json!({"enabled": false, "hookOptOut": true, "scanIdeLogs": false, "unknown": "x"}),
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("hookOptOut").and_then(Value::as_bool), Some(true));
+        assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert!(saved.get("unknown").is_none(), "只保留已知字段: {saved}");
+
+        // 单字段改写：置 true / 置 false 都不动 `enabled` 与 `scanIdeLogs`。
+        let after_opt_out = set_rate_limit_hook_opt_out_at(&path, true).unwrap();
+        assert_eq!(
+            after_opt_out.get("hookOptOut").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            after_opt_out.get("enabled").and_then(Value::as_bool),
+            Some(false),
+            "改写 hookOptOut 不得重置限额监听开关"
+        );
+        assert_eq!(
+            after_opt_out.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false),
+            "改写 hookOptOut 不得重置 IDE 日志扫描开关"
+        );
+        let cleared = set_rate_limit_hook_opt_out_at(&path, false).unwrap();
+        assert_eq!(
+            cleared.get("hookOptOut").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(cleared.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            cleared.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false)
+        );
+        // 配置缺失时也能写入（首次卸载 / 首次接入）。
+        let fresh = dir.join("fresh.json");
+        assert_eq!(
+            set_rate_limit_hook_opt_out_at(&fresh, true)
+                .unwrap()
+                .get("hookOptOut")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&fresh)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 轮换推迟提示预算：同日第 1..5 次放行、第 6 次拒绝；跨日重置；损坏回退 0。
+    #[test]
+    fn rotate_notify_budget_caps_per_local_day_and_resets_on_a_new_day() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-rotate-notify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ROTATE_NOTIFY_FILE_NAME);
+        let today = "2026-09-18";
+
+        // 文件不存在 → 从 0 开始，前 5 次都放行。
+        for expected_count in 1..=ROTATE_NOTIFY_DAILY_LIMIT {
+            assert!(
+                try_consume_rotate_notify_at(&path, today),
+                "第 {expected_count} 次应放行"
+            );
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["count"], json!(expected_count));
+            assert_eq!(saved["date"], json!(today));
+        }
+        // 第 6 次：拒绝，且预算文件不再被改写（仍停在 5）。
+        assert!(!try_consume_rotate_notify_at(&path, today));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["count"], json!(ROTATE_NOTIFY_DAILY_LIMIT));
+
+        // 跨日：日期变化即清零，重新放行。
+        assert!(try_consume_rotate_notify_at(&path, "2026-09-19"));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["date"], json!("2026-09-19"));
+        assert_eq!(saved["count"], json!(1));
+
+        // 损坏 / 字段缺失 / 类型不符 → 按 0 计（不阻塞轮换）。
+        for broken in [
+            "not-json",
+            "{}",
+            r#"{"date":"2026-09-20","count":"many"}"#,
+            "[]",
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(
+                try_consume_rotate_notify_at(&path, today),
+                "损坏内容应按 0 计: {broken}"
+            );
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["count"], json!(1), "损坏后从 1 重新起算: {broken}");
+            assert_eq!(saved["date"], json!(today));
+        }
+
+        // 空日期视为不可用（不写坏文件）。
+        std::fs::remove_file(&path).unwrap();
+        assert!(!try_consume_rotate_notify_at(&path, ""));
+        assert!(!path.exists());
+        assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

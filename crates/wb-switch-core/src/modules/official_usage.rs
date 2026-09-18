@@ -11,12 +11,26 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use crate::modules::account::{account_display_name, get_str};
+use crate::modules::account::{account_display_name, get_str, variant_of};
 use crate::modules::config::{atomic_write, official_usage_cache_file, store_dir};
 use crate::modules::credits::authenticated_post;
+use crate::modules::variant::WbVariant;
 
 pub const OFFICIAL_USAGE_URL: &str =
     "https://www.workbuddy.cn/billing/meter/get-user-request-usage";
+/// 国际版同构接口（实测存在），形态与 `credits` 的国际版 billing 路径一致，无 `/v2` 前缀。
+pub const AI_OFFICIAL_USAGE_URL: &str =
+    "https://www.workbuddy.ai/billing/meter/get-user-request-usage";
+
+/// 按账号档位选择官方用量接口 URL，这是唯一的档位分派点。
+/// 绝不跨档位请求：国际版 token 不打国内域，国内版 token 也不打国际域
+/// （会污染统计并触发网关一致性校验失败）。
+fn official_usage_url_for(account: &Value) -> &'static str {
+    match variant_of(account) {
+        WbVariant::Cn => OFFICIAL_USAGE_URL,
+        WbVariant::Ai => AI_OFFICIAL_USAGE_URL,
+    }
+}
 pub const OFFICIAL_USAGE_PAGE_SIZE: usize = 3_000;
 pub const OFFICIAL_USAGE_DETAIL_LIMIT: usize = 100;
 const OFFICIAL_USAGE_MAX_PAGES: usize = 100;
@@ -413,6 +427,7 @@ async fn fetch_account_usage(
     range_start: NaiveDate,
     range_end: NaiveDate,
 ) -> Result<AccountFetch, String> {
+    let url = official_usage_url_for(account);
     let start_time = format!("{range_start} 00:00:00");
     let end_time = format!("{range_end} 23:59:59");
     let mut page_number = 1;
@@ -424,7 +439,7 @@ async fn fetch_account_usage(
     loop {
         let response = authenticated_post(
             account,
-            OFFICIAL_USAGE_URL,
+            url,
             json!({
                 "startTime": start_time,
                 "endTime": end_time,
@@ -837,13 +852,12 @@ mod tests {
         assert_eq!(today_usage, 1.5);
         assert_eq!(week_usage, 3.5);
         // 月初时“昨天”可能属于上月（甚至跨年），此时本月仅包含今天这条。
-        let expected_month_usage = if yesterday.year() == today.year()
-            && yesterday.month() == today.month()
-        {
-            3.5
-        } else {
-            1.5
-        };
+        let expected_month_usage =
+            if yesterday.year() == today.year() && yesterday.month() == today.month() {
+                3.5
+            } else {
+                1.5
+            };
         assert_eq!(month_usage, expected_month_usage);
         assert_eq!(daily[&today], 1.5);
         assert_eq!(daily[&yesterday], 2.0);
@@ -945,5 +959,26 @@ mod tests {
         assert!(parse_official_usage_cache("not-json").is_none());
         assert!(parse_official_usage_cache("{}").is_none());
         assert!(parse_official_usage_cache(r#"{"payload":{"status":"nope"}}"#).is_none());
+    }
+
+    /// 档位分派：两档各走自己的域，绝不跨档位。
+    #[test]
+    fn official_usage_url_follows_account_variant() {
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-1"})),
+            OFFICIAL_USAGE_URL
+        );
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-1", "variant": "cn"})),
+            OFFICIAL_USAGE_URL
+        );
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-2", "variant": "ai"})),
+            AI_OFFICIAL_USAGE_URL
+        );
+        assert_eq!(
+            official_usage_url_for(&json!({"uid": "u-3", "domain": "www.workbuddy.ai"})),
+            AI_OFFICIAL_USAGE_URL
+        );
     }
 }

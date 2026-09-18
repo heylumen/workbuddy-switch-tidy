@@ -5,7 +5,7 @@ WorkBuddy（腾讯 AI 编程助手）账号切换工具。两种形态：
 - **桌面 App**：下载 `.app` 双击运行（Tauri，推荐日常使用）
 - **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
 
-多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
+多账号共享登录态，一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
 
 ## 快速开始
 
