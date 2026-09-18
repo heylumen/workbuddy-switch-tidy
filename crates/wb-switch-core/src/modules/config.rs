@@ -47,9 +47,28 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // 路径
 // ---------------------------------------------------------------------------
 
+/// 测试专用的 **线程局部** 数据根覆盖。
+///
+/// 为什么不用环境变量：Rust 的测试在同一进程内多线程并行，
+/// 是进程级的，会污染其他模块的测试夹具（实测导致上游 token_stats 三条用例失败）。
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// 测试中设置/清除线程局部数据根（仅影响当前线程）。
+#[cfg(test)]
+pub fn set_test_home(path: Option<PathBuf>) {
+    TEST_HOME.with(|cell| *cell.borrow_mut() = path);
+}
+
 pub fn home_dir() -> PathBuf {
-    // 本 fork 保留：允许用 WORKBUDDY_HOME 重定向数据根（单元测试隔离与便携化运行必需）。
-    // 上游版本直接取 dirs::home_dir()，会导致所有依赖临时数据根的测试无法隔离。
+    // 1) 测试线程的显式覆盖（隔离性最好，不影响并行测试）
+    #[cfg(test)]
+    if let Some(dir) = TEST_HOME.with(|cell| cell.borrow().clone()) {
+        return dir;
+    }
+    // 2) 本 fork 保留：WORKBUDDY_HOME 进程级重定向（便携化运行 / 手工调试用）
     if let Ok(dir) = std::env::var("WORKBUDDY_HOME") {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {

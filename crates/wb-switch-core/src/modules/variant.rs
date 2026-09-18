@@ -365,17 +365,17 @@ mod tests {
         let home = Path::new("/home/tester");
         let cn = WbVariant::Cn.auth_file_path_at(home, HostOs::Macos);
         assert_eq!(
-            cn.to_string_lossy(),
+            cn.to_string_lossy().replace('\\', "/"),
             "/home/tester/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
         );
         let cn_win = WbVariant::Cn.auth_file_path_at(home, HostOs::Windows);
         assert_eq!(
-            cn_win.to_string_lossy(),
+            cn_win.to_string_lossy().replace('\\', "/"),
             "/home/tester/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
         );
         let cn_linux = WbVariant::Cn.auth_file_path_at(home, HostOs::Linux);
         assert_eq!(
-            cn_linux.to_string_lossy(),
+            cn_linux.to_string_lossy().replace('\\', "/"),
             "/home/tester/.local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
         );
 
@@ -462,11 +462,11 @@ mod tests {
             "com.workbuddy.workbuddy-ai"
         );
         assert_eq!(
-            WbVariant::Cn.macos_default_app_path().to_string_lossy(),
+            WbVariant::Cn.macos_default_app_path().to_string_lossy().replace('\\', "/"),
             "/Applications/WorkBuddy.app"
         );
         assert_eq!(
-            WbVariant::Ai.macos_default_app_path().to_string_lossy(),
+            WbVariant::Ai.macos_default_app_path().to_string_lossy().replace('\\', "/"),
             "/Applications/WorkBuddy AI.app"
         );
     }

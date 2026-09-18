@@ -749,7 +749,8 @@ pub async fn dedup_sessions(account_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
         let target = account::find_account(&account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
-        let uid = target
+        let variant = account::variant_of(&target);
+let uid = target
             .get("uid")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -757,7 +758,7 @@ pub async fn dedup_sessions(account_id: String) -> Result<Value, String> {
         if uid.is_empty() {
             return Err("账号缺少 uid".to_string());
         }
-        Ok(session::dedup_sessions_for_user(&uid))
+        Ok(session::dedup_sessions_for_user(variant, &uid))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -772,7 +773,8 @@ pub async fn collapse_sessions(account_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
         let target = account::find_account(&account_id)
             .ok_or_else(|| "账号不存在".to_string())?;
-        let uid = target
+        let variant = account::variant_of(&target);
+let uid = target
             .get("uid")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -780,7 +782,7 @@ pub async fn collapse_sessions(account_id: String) -> Result<Value, String> {
         if uid.is_empty() {
             return Err("账号缺少 uid".to_string());
         }
-        Ok(session::collapse_sessions_for_user(&uid))
+        Ok(session::collapse_sessions_for_user(variant, &uid))
     })
     .await
     .map_err(|e| e.to_string())?

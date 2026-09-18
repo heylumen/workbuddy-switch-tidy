@@ -320,8 +320,8 @@ fn find_target_session_by_cwd_title(
 /// （`deleted_at` 置值），并清理其孤儿 jsonl 与云端映射，避免残留。
 ///
 /// 注意：直接调用会写入 `~/.workbuddy/workbuddy.db`，请在 WorkBuddy 关闭后执行。
-pub fn dedup_sessions_for_user(uid: &str) -> Value {
-    let db = workbuddy_db_path(WbVariant::Cn);
+pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
+    let db = workbuddy_db_path(variant);
     if !db.is_file() {
         return json!({ "ok": false, "reason": "workbuddy.db 不存在", "removed": 0 });
     }
@@ -408,7 +408,7 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
     }
 
     if !removed_ids.is_empty() {
-        delete_edge_sync_mappings(&edge_sync_db_path(WbVariant::Cn), &removed_ids);
+        delete_edge_sync_mappings(&edge_sync_db_path(variant), &removed_ids);
     }
 
     if let Some(reason) = failure {
@@ -432,8 +432,8 @@ pub fn dedup_sessions_for_user(uid: &str) -> Value {
 /// - 本函数（折叠同名会话）：仅软隐藏，正文留盘可恢复 → 放宽为「同工作区 + 同标题」
 ///   即可收起，用于消除切换账号反复复制产生的同名冗余。
 /// 请在 WorkBuddy 关闭后执行。
-pub fn collapse_sessions_for_user(uid: &str) -> Value {
-    let db = workbuddy_db_path(WbVariant::Cn);
+pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
+    let db = workbuddy_db_path(variant);
     if !db.is_file() {
         return json!({ "ok": false, "reason": "workbuddy.db 不存在", "removed": 0 });
     }
@@ -517,7 +517,7 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
     }
 
     if !removed_ids.is_empty() {
-        delete_edge_sync_mappings(&edge_sync_db_path(WbVariant::Cn), &removed_ids);
+        delete_edge_sync_mappings(&edge_sync_db_path(variant), &removed_ids);
     }
 
     if let Some(reason) = failure {
@@ -536,7 +536,7 @@ pub fn collapse_sessions_for_user(uid: &str) -> Value {
 /// `title` 为 WorkBuddy 侧栏同款展示名；`isPlayground` 对应侧栏「任务」，
 /// 其余按 `cwd` 最后一段归入「空间」。
 pub fn list_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
-    let db = workbuddy_db_path(WbVariant::Cn);
+    let db = workbuddy_db_path(variant);
     if !db.is_file() {
         return json!([]);
     }
@@ -595,7 +595,7 @@ pub fn list_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
                 "title": session_display_title(title, custom_title),
                 "cwd": cwd,
                 "updatedAt": updated_at.unwrap_or(0),
-                "hasHistory": find_project_jsonl(WbVariant::Cn, &cid).is_some(),
+                "hasHistory": find_project_jsonl(variant, &cid).is_some(),
                 "isPlayground": is_playground.unwrap_or(0) != 0,
             }));
         }
@@ -605,7 +605,7 @@ pub fn list_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
 
 /// 在 `~/.workbuddy/projects/{workspace}/{cid}.jsonl` 定位会话正文。
 fn find_project_jsonl(variant: WbVariant, cid: &str) -> Option<PathBuf> {
-    let projects = home_dir().join(".workbuddy").join("projects");
+    let projects = variant.data_root().join("projects");
     if !projects.is_dir() {
         return None;
     }
@@ -627,7 +627,7 @@ fn find_project_jsonl(variant: WbVariant, cid: &str) -> Option<PathBuf> {
 
 /// 备份 workbuddy.db（含 -wal/-shm），返回主库备份路径。对照 `backup_workbuddy_db`。
 fn backup_workbuddy_db(variant: WbVariant, backup_root: &Path) -> Option<PathBuf> {
-    let db = workbuddy_db_path(WbVariant::Cn);
+    let db = workbuddy_db_path(variant);
     if !db.is_file() {
         return None;
     }
@@ -652,7 +652,7 @@ pub fn copy_session_to_user(
     source_uid: &str,
     target_uid: &str,
 ) -> Result<Value, String> {
-    let db = workbuddy_db_path(WbVariant::Cn);
+    let db = workbuddy_db_path(variant);
 
     // 收集源会话元信息（cwd / 展示标题 / 正文），用于 claw 校验与复制前去重。
     // 源会话不存在时直接返回错误，避免后续注册出孤儿云端映射。
@@ -680,7 +680,7 @@ pub fn copy_session_to_user(
             if is_claw_workspace(&cwd) {
                 return Err("Claw 工作区绑定当前账号渠道，不支持复制".into());
             }
-            if let Some(p) = find_project_jsonl(WbVariant::Cn, cid) {
+            if let Some(p) = find_project_jsonl(variant, cid) {
                 if let Ok(text) = std::fs::read_to_string(&p) {
                     source_jsonl_norm = normalize_jsonl(&text, cid);
                     source_has_jsonl = true;
@@ -727,10 +727,10 @@ pub fn copy_session_to_user(
         if source_updated_at > target_ua {
             // 源端更新 → 把目标同名会话同步为源端最新（覆盖正文与元数据，保留目标 id）。
             let mut jsonl_copied = false;
-            if let Some(src_jsonl) = find_project_jsonl(WbVariant::Cn, cid) {
+            if let Some(src_jsonl) = find_project_jsonl(variant, cid) {
                 if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
                     let text = text.replace(cid, &target_cid);
-                    let dst_jsonl = match find_project_jsonl(WbVariant::Cn, &target_cid) {
+                    let dst_jsonl = match find_project_jsonl(variant, &target_cid) {
                         Some(p) => p,
                         None => src_jsonl.with_file_name(format!("{target_cid}.jsonl")),
                     };
@@ -740,7 +740,7 @@ pub fn copy_session_to_user(
                 }
             }
             let backup_root = backup_dir().join("sessions").join(utc_iso());
-            backup_workbuddy_db(WbVariant::Cn, &backup_root);
+            backup_workbuddy_db(variant, &backup_root);
             insert_session_copy(&db, &target_cid, cid, source_uid, target_uid)?;
             return Ok(json!({
                 "id": cid,
@@ -770,7 +770,7 @@ pub fn copy_session_to_user(
 
     // 1) 复制正文 jsonl：{projects}/{ws}/{cid}.jsonl → {projects}/{ws}/{new_cid}.jsonl
     let mut jsonl_copied = false;
-    if let Some(src_jsonl) = find_project_jsonl(WbVariant::Cn, cid) {
+    if let Some(src_jsonl) = find_project_jsonl(variant, cid) {
         let dst_jsonl = src_jsonl.with_file_name(format!("{new_cid}.jsonl"));
         if let Ok(text) = std::fs::read_to_string(&src_jsonl) {
             let text = text.replace(cid, &new_cid); // 替换 sessionId 等旧 id 引用
@@ -782,11 +782,11 @@ pub fn copy_session_to_user(
 
     // 2) 备份 db（复制前），再 INSERT 新 sessions 行
     let backup_root = backup_dir().join("sessions").join(utc_iso());
-    backup_workbuddy_db(WbVariant::Cn, &backup_root);
+    backup_workbuddy_db(variant, &backup_root);
     insert_session_copy(&db, &new_cid, cid, source_uid, target_uid)?;
 
     // 3) 注册云端映射：新会话归属目标账号（msg_channel=convmsg:{target_uid}）
-    let mapping_written = register_edge_sync_mapping(WbVariant::Cn, &new_cid, target_uid);
+    let mapping_written = register_edge_sync_mapping(variant, &new_cid, target_uid);
 
     Ok(json!({
         "id": cid,
@@ -863,7 +863,7 @@ fn insert_session_copy(
 
 /// 把新会话注册进 edge_sync_mapping（云端归属关键）。失败不致命，返回 False。
 fn register_edge_sync_mapping(variant: WbVariant, new_cid: &str, target_uid: &str) -> bool {
-    insert_edge_sync_mapping(&edge_sync_db_path(WbVariant::Cn), new_cid, target_uid)
+    insert_edge_sync_mapping(&edge_sync_db_path(variant), new_cid, target_uid)
 }
 
 fn insert_edge_sync_mapping(db_path: &Path, new_cid: &str, target_uid: &str) -> bool {
@@ -1137,7 +1137,7 @@ mod e2e_sessions {
     /// 建库 + 设置 WORKBUDDY_HOME（必须在持有 LOCK 时调用）。
     fn setup() -> PathBuf {
         let home = temp_home();
-        std::env::set_var("WORKBUDDY_HOME", &home);
+        crate::modules::config::set_test_home(Some(home.clone()));
         let wb = home.join(".workbuddy");
         std::fs::create_dir_all(wb.join("projects")).unwrap();
         let conn = rusqlite::Connection::open(wb.join("workbuddy.db")).unwrap();
@@ -1424,7 +1424,7 @@ mod e2e_sessions {
         let cfp0 = content_fps(home, &[uid]);
         assert_eq!(cfp0.len(), 2, "去重前内容指纹为 2 份");
 
-        let res = dedup_sessions_for_user(uid);
+        let res = dedup_sessions_for_user(WbVariant::Cn, uid);
         assert_eq!(res["removed"].as_u64().unwrap(), 2, "去重应移除 2 份重复");
         assert_eq!(active_count(home, &[uid]), 2, "去重后回到 2 行");
         let cfp1 = content_fps(home, &[uid]);
@@ -1445,7 +1445,7 @@ mod e2e_sessions {
         seed_session(home, uid, "x1", "无标题", "/ws/项目甲/", Some("内容一：关于方案A"), None, 0, 1000);
         seed_session(home, uid, "x2", "无标题", "/ws/项目甲/", Some("内容二：关于方案B"), None, 0, 1000);
         assert_eq!(active_count(home, &[uid]), 2, "去重前 2 条同名会话");
-        let res = dedup_sessions_for_user(uid);
+        let res = dedup_sessions_for_user(WbVariant::Cn, uid);
         assert_eq!(res["removed"].as_u64().unwrap(), 0, "同名不同内容者不应误删");
         assert_eq!(active_count(home, &[uid]), 2, "两者均应存活");
         assert_eq!(content_fps(home, &[uid]).len(), 2, "内容指纹仍为 2 份");
@@ -1457,7 +1457,7 @@ mod e2e_sessions {
         seed_session(home, uid, "e2", "空任务", "", None, None, 1, 1000);
         seed_session(home, uid, "e3", "空任务", "", None, None, 1, 1000);
         assert_eq!(active_count(home, &[uid]), 3, "去重前 3 个空会话");
-        let res = dedup_sessions_for_user(uid);
+        let res = dedup_sessions_for_user(WbVariant::Cn, uid);
         assert_eq!(res["removed"].as_u64().unwrap(), 0, "空会话各自唯一键，不应合并");
         assert_eq!(active_count(home, &[uid]), 3, "三者均应存活");
     }
@@ -1473,12 +1473,12 @@ mod e2e_sessions {
     }
 
     fn scn_e9(home: &Path) {
-        let res = dedup_sessions_for_user("uid-EMPTY");
+        let res = dedup_sessions_for_user(WbVariant::Cn, "uid-EMPTY");
         assert!(res["ok"].as_bool().unwrap() && res["removed"].as_u64().unwrap() == 0, "空账号去重应 ok 且 removed==0");
         // 缺失 db：临时 home 无 .workbuddy
         let missing = temp_home();
         std::env::set_var("WORKBUDDY_HOME", &missing);
-        let res2 = dedup_sessions_for_user("uid-X");
+        let res2 = dedup_sessions_for_user(WbVariant::Cn, "uid-X");
         assert!(!res2["ok"].as_bool().unwrap() && res2["removed"].as_u64().unwrap() == 0, "缺失 db 应优雅返回 ok:false");
         // 还原到本测试 home（后续断言不再依赖，但保持整洁）
         std::env::set_var("WORKBUDDY_HOME", home);
@@ -1506,7 +1506,7 @@ mod e2e_sessions {
         let expected_dir = projects(home).join("项目甲");
         assert_eq!(p.map(|p| p.parent().map(|x| x.to_path_buf())), Some(Some(expected_dir)),
                    "新 jsonl 应落于正确子目录(尾部分隔符已归一)");
-        let res2 = dedup_sessions_for_user(ub);
+        let res2 = dedup_sessions_for_user(WbVariant::Cn, ub);
         assert_eq!(res2["removed"].as_u64().unwrap(), 0, "中文路径去重 removed==0");
     }
 
@@ -1549,8 +1549,8 @@ mod e2e_sessions {
         }
         assert_invariant(home, expected, "after-backcopy");
 
-        dedup_sessions_for_user(ua);
-        dedup_sessions_for_user(ub);
+        dedup_sessions_for_user(WbVariant::Cn, ua);
+        dedup_sessions_for_user(WbVariant::Cn, ub);
         assert_invariant(home, expected, "after-dedup");
 
         // 复制空会话 ae 到 B（应新增一份空会话，不增加指纹）
@@ -1559,7 +1559,7 @@ mod e2e_sessions {
         expected += 1;
         assert_invariant(home, expected, "after-copy-empty");
 
-        dedup_sessions_for_user(ub);
+        dedup_sessions_for_user(WbVariant::Cn, ub);
         assert_invariant(home, expected, "after-dedup2");
 
         // 仅列举（只读）
@@ -1601,7 +1601,7 @@ mod e2e_sessions {
         seed_session(home, uid, "a3", "需求评审", "/ws/项目甲/", Some("甲-v3"), None, 0, 3000); // 不同内容，最新
         assert_eq!(active_count(home, &[uid]), 3, "折叠前 3 份同名会话");
 
-        let res = collapse_sessions_for_user(uid);
+        let res = collapse_sessions_for_user(WbVariant::Cn, uid);
         assert_eq!(res["removed"].as_u64().unwrap(), 2, "同工作区+同标题 3 份收起 2 份，保留最新 a3");
         assert_eq!(active_count(home, &[uid]), 1, "折叠后剩 1 行");
 
@@ -1631,7 +1631,7 @@ mod e2e_sessions {
         seed_session(home, uid, "s5", "牛牛文档工具", "/ws/牛牛-2/", Some("另一空间"), None, 0, 1500);
         assert_eq!(active_count(home, &[uid]), 5, "同空间同名 3 份 + 对照组 2 份");
 
-        let res = collapse_sessions_for_user(uid);
+        let res = collapse_sessions_for_user(WbVariant::Cn, uid);
         assert_eq!(res["removed"].as_u64().unwrap(), 2, "仅同工作区+同标题的 3 份收起 2 份(s1,s2)");
         assert_eq!(active_count(home, &[uid]), 3, "剩 s3 + 对照组 s4/s5 共 3 行");
 

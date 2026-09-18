@@ -928,7 +928,8 @@ async fn api_dedup_sessions(Json(body): Json<Value>) -> Response {
     if uid.is_empty() {
         return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
     }
-    let result = session::dedup_sessions_for_user(&uid);
+    let variant = account::variant_of(&target);
+    let result = session::dedup_sessions_for_user(variant, &uid);
     json_ok(result)
 }
 
@@ -953,6 +954,7 @@ async fn api_collapse_sessions(Json(body): Json<Value>) -> Response {
     if uid.is_empty() {
         return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
     }
-    let result = session::collapse_sessions_for_user(&uid);
+    let variant = account::variant_of(&target);
+    let result = session::collapse_sessions_for_user(variant, &uid);
     json_ok(result)
 }
