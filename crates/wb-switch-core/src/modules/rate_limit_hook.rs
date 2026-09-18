@@ -366,7 +366,9 @@ pub fn uninstall_hook() -> Result<Value, String> {
 /// 幂等、非阻塞、失败静默（下次启动重试）；返回是否改动了注册状态（调用方据此作废扫描缓存）。
 pub fn auto_install_on_startup() -> bool {
     let cfg = config::load_rate_limit_config();
-    let enabled = cfg.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    // 本 fork 决策：默认 **不自动接入**（opt-in）。上游默认 true 会在升级后首次启动即写入
+    // 各客户端的 settings.json；按"零风险、改前确认"原则，需用户在界面显式开启。
+    let enabled = cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false);
     let opt_out = cfg
         .get("hookOptOut")
         .and_then(Value::as_bool)
