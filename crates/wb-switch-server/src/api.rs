@@ -175,13 +175,13 @@ fn body_variant(body: &Value) -> WbVariant {
 async fn api_status(RawQuery(query): RawQuery) -> Response {
     let variant = query_variant(query.as_deref());
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().and_then(|a| {
+    let current = auth.as_ref().map(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
+        json!({
             "uid": acct.get("uid"),
             "nickname": acct.get("nickname"),
             "email": acct.get("email"),
-        }))
+        })
     });
     json_ok(json!({
         "running": cached_workbuddy_running(variant),
@@ -838,6 +838,58 @@ async fn static_handler(uri: Uri) -> Response {
     }
 }
 
+/// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
+async fn api_dedup_sessions(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if account_id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let uid = target
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if uid.is_empty() {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = account::variant_of(&target);
+    let result = session::dedup_sessions_for_user(variant, &uid);
+    json_ok(result)
+}
+
+/// POST /api/sessions/collapse —— 折叠指定账号下「同名/同目录」会话（软隐藏冗余）。
+async fn api_collapse_sessions(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if account_id.trim().is_empty() {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let uid = target
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if uid.is_empty() {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let variant = account::variant_of(&target);
+    let result = session::collapse_sessions_for_user(variant, &uid);
+    json_ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{body_variant, checkin_status_item, query_variant};
@@ -905,56 +957,4 @@ mod tests {
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
     }
-}
-
-/// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
-async fn api_dedup_sessions(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if account_id.trim().is_empty() {
-        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let Some(target) = account::find_account(&account_id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    let uid = target
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if uid.is_empty() {
-        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let variant = account::variant_of(&target);
-    let result = session::dedup_sessions_for_user(variant, &uid);
-    json_ok(result)
-}
-
-/// POST /api/sessions/collapse —— 折叠指定账号下「同名/同目录」会话（软隐藏冗余）。
-async fn api_collapse_sessions(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if account_id.trim().is_empty() {
-        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let Some(target) = account::find_account(&account_id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    let uid = target
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if uid.is_empty() {
-        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let variant = account::variant_of(&target);
-    let result = session::collapse_sessions_for_user(variant, &uid);
-    json_ok(result)
 }

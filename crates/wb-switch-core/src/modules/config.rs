@@ -1026,6 +1026,134 @@ pub async fn http_request_raw(
     }
 }
 
+
+
+// ==== 以下两个带 timeout 的包装由本 fork 保留（上游仅有不带 timeout 的版本）====
+
+pub async fn http_request_with_proxy_timeout(
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+    proxy: Option<&str>,
+    timeout_secs: u64,
+) -> Value {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(proxy) => match http_client_builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .proxy(match reqwest::Proxy::all(proxy) {
+                Ok(proxy) => proxy,
+                Err(e) => return json!({"code": -1, "message": format!("代理地址无效: {e}")}),
+            })
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => return json!({"code": -1, "message": format!("代理客户端创建失败: {e}")}),
+        },
+        None => http_client().clone(),
+    };
+    let mut req = client.request(method, url);
+    req = req.header("Content-Type", "application/json");
+    if let Some(h) = headers {
+        for (k, v) in h {
+            req = req.header(k, v);
+        }
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    // 显式超时（per-request），覆盖共享客户端的默认 30s——
+    // 否则无代理路径走共享 `http_client()` 时自定义超时不生效。
+    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                serde_json::from_str(&text).unwrap_or(Value::Null)
+            } else {
+                serde_json::from_str(&text).unwrap_or_else(|_| {
+                    json!({
+                        "code": status.as_u16(),
+                        "message": text.chars().take(500).collect::<String>(),
+                    })
+                })
+            }
+        }
+        Err(e) => json!({"code": -1, "message": e.to_string()}),
+    }
+}
+
+pub async fn http_request_raw_timeout(
+    url: &str,
+    method: &str,
+    body: Option<Value>,
+    headers: Option<&HashMap<String, String>>,
+    proxy: Option<&str>,
+    follow_redirects: bool,
+    timeout_secs: u64,
+) -> (u16, HashMap<String, String>, String) {
+    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+    let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(proxy) => {
+            let mut builder = http_client_builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs))
+                .proxy(match reqwest::Proxy::all(proxy) {
+                    Ok(proxy) => proxy,
+                    Err(e) => return (0, HashMap::new(), format!("代理地址无效: {e}")),
+                });
+            if !follow_redirects {
+                builder = builder.redirect(reqwest::redirect::Policy::none());
+            }
+            match builder.build() {
+                Ok(client) => client,
+                Err(e) => return (0, HashMap::new(), format!("代理客户端创建失败: {e}")),
+            }
+        }
+        None => {
+            if follow_redirects {
+                http_client().clone()
+            } else {
+                match http_client_builder()
+                    .timeout(std::time::Duration::from_secs(timeout_secs))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                {
+                    Ok(client) => client,
+                    Err(e) => return (0, HashMap::new(), format!("客户端创建失败: {e}")),
+                }
+            }
+        }
+    };
+    let mut req = client.request(method, url);
+    req = req.header("Content-Type", "application/json");
+    if let Some(h) = headers {
+        for (k, v) in h {
+            req = req.header(k, v);
+        }
+    }
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    // 显式超时（per-request），覆盖共享客户端的默认 30s。
+    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let mut resp_headers = HashMap::new();
+            for (k, v) in resp.headers() {
+                if let Ok(vs) = v.to_str() {
+                    resp_headers.insert(k.as_str().to_string(), vs.to_string());
+                }
+            }
+            let text = resp.text().await.unwrap_or_default();
+            (status, resp_headers, text)
+        }
+        Err(e) => (0, HashMap::new(), e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1590,131 +1718,5 @@ mod tests {
         assert!(!path.exists());
         assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
         std::fs::remove_dir_all(&dir).ok();
-    }
-}
-
-// ==== 以下两个带 timeout 的包装由本 fork 保留（上游仅有不带 timeout 的版本）====
-
-pub async fn http_request_with_proxy_timeout(
-    url: &str,
-    method: &str,
-    body: Option<Value>,
-    headers: Option<&HashMap<String, String>>,
-    proxy: Option<&str>,
-    timeout_secs: u64,
-) -> Value {
-    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-    let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(proxy) => match http_client_builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .proxy(match reqwest::Proxy::all(proxy) {
-                Ok(proxy) => proxy,
-                Err(e) => return json!({"code": -1, "message": format!("代理地址无效: {e}")}),
-            })
-            .build()
-        {
-            Ok(client) => client,
-            Err(e) => return json!({"code": -1, "message": format!("代理客户端创建失败: {e}")}),
-        },
-        None => http_client().clone(),
-    };
-    let mut req = client.request(method, url);
-    req = req.header("Content-Type", "application/json");
-    if let Some(h) = headers {
-        for (k, v) in h {
-            req = req.header(k, v);
-        }
-    }
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    // 显式超时（per-request），覆盖共享客户端的默认 30s——
-    // 否则无代理路径走共享 `http_client()` 时自定义超时不生效。
-    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            if status.is_success() {
-                serde_json::from_str(&text).unwrap_or(Value::Null)
-            } else {
-                serde_json::from_str(&text).unwrap_or_else(|_| {
-                    json!({
-                        "code": status.as_u16(),
-                        "message": text.chars().take(500).collect::<String>(),
-                    })
-                })
-            }
-        }
-        Err(e) => json!({"code": -1, "message": e.to_string()}),
-    }
-}
-
-pub async fn http_request_raw_timeout(
-    url: &str,
-    method: &str,
-    body: Option<Value>,
-    headers: Option<&HashMap<String, String>>,
-    proxy: Option<&str>,
-    follow_redirects: bool,
-    timeout_secs: u64,
-) -> (u16, HashMap<String, String>, String) {
-    let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-    let client = match proxy.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(proxy) => {
-            let mut builder = http_client_builder()
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .proxy(match reqwest::Proxy::all(proxy) {
-                    Ok(proxy) => proxy,
-                    Err(e) => return (0, HashMap::new(), format!("代理地址无效: {e}")),
-                });
-            if !follow_redirects {
-                builder = builder.redirect(reqwest::redirect::Policy::none());
-            }
-            match builder.build() {
-                Ok(client) => client,
-                Err(e) => return (0, HashMap::new(), format!("代理客户端创建失败: {e}")),
-            }
-        }
-        None => {
-            if follow_redirects {
-                http_client().clone()
-            } else {
-                match http_client_builder()
-                    .timeout(std::time::Duration::from_secs(timeout_secs))
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                {
-                    Ok(client) => client,
-                    Err(e) => return (0, HashMap::new(), format!("客户端创建失败: {e}")),
-                }
-            }
-        }
-    };
-    let mut req = client.request(method, url);
-    req = req.header("Content-Type", "application/json");
-    if let Some(h) = headers {
-        for (k, v) in h {
-            req = req.header(k, v);
-        }
-    }
-    if let Some(b) = body {
-        req = req.json(&b);
-    }
-    // 显式超时（per-request），覆盖共享客户端的默认 30s。
-    req = req.timeout(std::time::Duration::from_secs(timeout_secs));
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            let mut resp_headers = HashMap::new();
-            for (k, v) in resp.headers() {
-                if let Ok(vs) = v.to_str() {
-                    resp_headers.insert(k.as_str().to_string(), vs.to_string());
-                }
-            }
-            let text = resp.text().await.unwrap_or_default();
-            (status, resp_headers, text)
-        }
-        Err(e) => (0, HashMap::new(), e.to_string()),
     }
 }

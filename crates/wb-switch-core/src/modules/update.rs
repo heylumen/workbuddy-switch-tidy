@@ -41,12 +41,14 @@ const JSDELIVR_HOSTS: &[&str] = &[
 
 /// 检查更新单次请求超时（秒）。逐源降级策略下，单源超时不应拖累整体流程。
 const UPDATE_TIMEOUT_SECS: u64 = 6;
-/// 传输级失败（连不上/超时）时每个候选 URL 的最大尝试次数（含首次）。
-const TRANSPORT_ATTEMPTS: usize = 2;
 
 /// 成功结果缓存有效期（6 小时）。自动轮询（30 分钟）命中缓存，不发网络请求；
 /// 设置页手动检查传 force=true 绕过缓存强制刷新。
-const CACHE_TTL_SECS: i64 = 6 * 60 * 60;
+const CACHE_TTL_SECS: i64 = 10 * 60;
+/// force（手动点「检查更新」）时的最短间隔：避免连点重复发起网络请求。
+const FORCE_MIN_INTERVAL_SECS: i64 = 60;
+/// 一次检查的**总预算**：超过即返回失败并提示，绝不无限等待（并发竞速下通常 1s 内完成）。
+const TOTAL_BUDGET_SECS: u64 = 6;
 
 /// 进程级内存缓存，只缓存 ok=true 的结果；失败不写缓存。
 struct CachedCheck {
@@ -235,47 +237,65 @@ async fn fetch_manifest_version(
     let mut headers = HashMap::new();
     headers.insert("Accept".to_string(), "application/json".to_string());
     headers.insert("User-Agent".to_string(), "wb-switch".to_string());
-    let mut last_err = "更新清单不可用".to_string();
-    for github_url in
-        updater_manifest_urls(owner, repo, std::env::consts::OS, std::env::consts::ARCH)
-    {
-        for url in candidate_urls(&github_url, mirrors) {
-            for attempt in 0..TRANSPORT_ATTEMPTS {
-                let resp = http_request_with_proxy_timeout(
-                    &url,
-                    "GET",
-                    None,
-                    Some(&headers),
-                    proxy,
-                    UPDATE_TIMEOUT_SECS,
-                )
-                .await;
-                let version = resp
-                    .get("version")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !version.is_empty() {
-                    return Ok((resp, url));
-                }
-                let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-                let message = resp
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("更新清单解析失败")
-                    .to_string();
-                if code >= 0 {
-                    // 端点可达但无该资产（如 404）：换下一个候选，不做传输重试。
-                    last_err = format!("HTTP {code}: {message}");
-                    break;
-                }
-                // 传输级失败（code=-1）：间隔 200ms 后重试，仍失败则换下一个候选。
-                last_err = message;
-                if attempt + 1 < TRANSPORT_ATTEMPTS {
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                }
+    // 并发竞速：所有候选（manifests × 直连/镜像）同时发起，**谁先拿到有效 version 用谁**。
+    // 串行实现的最坏耗时 ≈ Σ(每候选超时 × 重试)，实测被墙时可达数十秒；竞速的总耗时 ≈ 最快的那个候选。
+    let urls: Vec<String> = updater_manifest_urls(
+        owner,
+        repo,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
+    .iter()
+    .flat_map(|u| candidate_urls(u, mirrors))
+    .collect();
+
+    let mut set = tokio::task::JoinSet::new();
+    for url in urls {
+        let headers = headers.clone();
+        let proxy = proxy.map(str::to_string);
+        set.spawn(async move {
+            let resp = http_request_with_proxy_timeout(
+                &url,
+                "GET",
+                None,
+                Some(&headers),
+                proxy.as_deref(),
+                UPDATE_TIMEOUT_SECS,
+            )
+            .await;
+            let version = resp
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !version.is_empty() {
+                return Ok((resp, url));
             }
+            let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            let message = resp
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("更新清单解析失败")
+                .to_string();
+            // 端点可达但无该资产（如 404）与传输级失败，在这里都不重试：竞速下重试没有收益，
+            // 由外层总预算与其它候选负责兜底。
+            Err(if code >= 0 {
+                format!("HTTP {code}: {message}")
+            } else {
+                message
+            })
+        });
+    }
+    let mut last_err = "更新清单不可用".to_string();
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(hit)) => {
+                set.abort_all();
+                return Ok(hit);
+            }
+            Ok(Err(e)) => last_err = e,
+            Err(e) => last_err = format!("任务异常: {e}"),
         }
     }
     Err(last_err)
@@ -376,11 +396,12 @@ async fn fetch_jsdelivr_version(
 /// `force=true` 绕过缓存强制刷新（设置页手动检查）；否则 6 小时内成功结果直接返回，
 /// 不发网络请求。三个更新源按优先级逐级降级；全部失败时返回明确的降级提示。
 pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
-    if !force {
-        if let Some(cached) = CACHE.lock().unwrap().as_ref() {
-            if now_secs() - cached.checked_at < CACHE_TTL_SECS {
-                return cached.value.clone();
-            }
+    // 缓存策略：非 force 走 10 分钟 TTL；force 时若 60 秒内刚查过也直接复用，避免连点重复请求。
+    if let Some(cached) = CACHE.lock().unwrap().as_ref() {
+        let age = now_secs() - cached.checked_at;
+        let ttl = if force { FORCE_MIN_INTERVAL_SECS } else { CACHE_TTL_SECS };
+        if age < ttl {
+            return cached.value.clone();
         }
     }
 
@@ -406,6 +427,11 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
     let current = APP_VERSION.to_string();
     let mut failures: Vec<String> = Vec::new();
 
+    // 三层（manifest / release 跳转 / jsDelivr）整体受 TOTAL_BUDGET_SECS 约束：
+    // 到点即返回降级结果，绝不无限等待。
+    let budgeted = tokio::time::timeout(
+        std::time::Duration::from_secs(TOTAL_BUDGET_SECS),
+        async {
     // 层 1：updater manifest（GitHub 直连 + 国内镜像加速，资产下载不计 API 配额）。
     match fetch_manifest_version(&owner, &repo, proxy, &mirrors).await {
         Ok((manifest, via)) => {
@@ -473,6 +499,22 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
             check_jsdelivr_fallback(&owner, &repo, proxy, &current, &release_url, &mut failures)
                 .await
         }
+    }
+        },
+    )
+    .await;
+
+    match budgeted {
+        Ok(value) => value,
+        Err(_) => json!({
+            "ok": false,
+            "current": current,
+            "latest": Value::Null,
+            "hasUpdate": false,
+            "reason": format!("检查更新超时（总预算 {TOTAL_BUDGET_SECS}s）：网络或代理不可用，请稍后重试"),
+            "failures": failures,
+            "checkedAt": now_secs(),
+        }),
     }
 }
 

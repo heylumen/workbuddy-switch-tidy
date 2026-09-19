@@ -230,6 +230,24 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
     headers
 }
 
+
+
+/// 删除账号（按 id）。
+pub fn delete_account(account_id: &str) -> Result<(), String> {
+    delete_account_from_path(&accounts_file(), account_id)
+}
+
+/// 导入本机当前账号（从该档位的登录态文件读取）。
+pub fn import_local(variant: WbVariant) -> Result<Value, String> {
+    let acc = crate::modules::auth_file::import_from_auth_file(variant)
+        .ok_or("未读取到本地 WorkBuddy 登录信息")?;
+    let saved = save_collected_account(acc).map_err(|e| e.to_string())?;
+    Ok(account_meta(&saved))
+}
+
+// 手动添加账号（token 方式）已随 UI 入口「手动添加」一并下线；
+// `identity_email` 中的 "手动添加" 占位过滤保留，用于兼容历史手动添加的旧账号。
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,19 +492,3 @@ mod tests {
         std::fs::remove_dir_all(&test_dir).expect("temporary account store should clean up");
     }
 }
-
-/// 删除账号（按 id）。
-pub fn delete_account(account_id: &str) -> Result<(), String> {
-    delete_account_from_path(&accounts_file(), account_id)
-}
-
-/// 导入本机当前账号（从该档位的登录态文件读取）。
-pub fn import_local(variant: WbVariant) -> Result<Value, String> {
-    let acc = crate::modules::auth_file::import_from_auth_file(variant)
-        .ok_or("未读取到本地 WorkBuddy 登录信息")?;
-    let saved = save_collected_account(acc).map_err(|e| e.to_string())?;
-    Ok(account_meta(&saved))
-}
-
-// 手动添加账号（token 方式）已随 UI 入口「手动添加」一并下线；
-// `identity_email` 中的 "手动添加" 占位过滤保留，用于兼容历史手动添加的旧账号。

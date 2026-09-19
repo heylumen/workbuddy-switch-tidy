@@ -335,7 +335,7 @@ fn get_local_state_path(data_root: &Path) -> Result<PathBuf, String> {
 #[cfg(target_os = "windows")]
 fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
     unsafe {
-        let mut data_in = CRYPT_INTEGER_BLOB {
+        let data_in = CRYPT_INTEGER_BLOB {
             cbData: encrypted.len() as u32,
             pbData: encrypted.as_ptr() as *mut u8,
         };
@@ -343,7 +343,7 @@ fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
             cbData: 0,
             pbData: std::ptr::null_mut(),
         };
-        CryptUnprotectData(&mut data_in, None, None, None, None, 0, &mut data_out)
+        CryptUnprotectData(&data_in, None, None, None, None, 0, &mut data_out)
             .map_err(|e| format!("DPAPI CryptUnprotectData failed: {e}"))?;
         if data_out.pbData.is_null() || data_out.cbData == 0 {
             return Err("DPAPI returned empty data".to_string());

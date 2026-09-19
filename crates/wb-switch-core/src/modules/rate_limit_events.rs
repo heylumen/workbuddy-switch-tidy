@@ -410,13 +410,52 @@ fn complete_lines(bytes: &[u8]) -> (Vec<String>, u64) {
         return (Vec::new(), 0);
     };
     let consumed = (last_newline + 1) as u64;
-    let text = String::from_utf8_lossy(&bytes[..last_newline]);
+    let mut text = String::from_utf8_lossy(&bytes[..last_newline]).into_owned();
+    // Windows PowerShell 5.1 的 `Add-Content -Encoding UTF8` **创建文件时**会写 BOM：
+    // 首行带 `\u{feff}` 前缀，serde_json 解析必失败 ⇒ hook 装好后的**第一个**限额事件
+    // 会被静默丢弃（2026-09-18 本机实证）。只在文本开头剥一次，开销可忽略。
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
     let lines = text
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect();
     (lines, consumed)
+}
+
+/// transcript 里最后一条 `providerData.model`（实际服务模型）。
+///
+/// hook payload 的 `model` 是**会话 UI 选定模型**，与真正被限的服务模型可能不同
+/// （2026-09-18 实证：UI 选 glm-5.3-flash，实际被限 hy4-preview-f，台账出现双 chip）。
+/// 与日志通路「触发前同会话最近一次实际请求模型」同一语义：流式读 transcript，
+/// 取最后一条带 `providerData.model` 的行；文件不可读 / 无模型行 → None（回落 payload）。
+/// 消费发生在事件当轮（秒级），transcript 尚不会包含 429 之后的新轮次，无需时间戳截断。
+fn transcript_model(transcript_path: &str) -> Option<String> {
+    let file = std::fs::File::open(transcript_path).ok()?;
+    let mut last = None;
+    for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
+        let Ok(line) = line else { continue };
+        // 子串预筛：transcript 可达数十 MB，避免逐行做完整 JSON 解析。
+        if !line.contains("\"providerData\"") || !line.contains("\"model\"") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(model) = value
+            .get("providerData")
+            .and_then(|provider| provider.get("model"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        else {
+            continue;
+        };
+        last = Some(model.to_string());
+    }
+    last
 }
 
 /// 把一批行入账到状态；返回是否新增了条目。
@@ -432,11 +471,13 @@ fn ingest_lines(ctx: &IngestContext, state: &mut State, lines: &[String], now: i
         let Some(account_id) = attribute(&event, source, ctx, now) else {
             continue;
         };
+        // 模型归因：transcript 的实际服务模型优先，payload 的 UI 选定模型只做兜底。
+        let model = transcript_model(&event.transcript_path).or(event.model.clone());
         merge_entry(
             &mut state.events,
             StoredEntry {
                 account_id,
-                model: event.model.clone(),
+                model,
                 reset_at: event.reset_at,
                 first_seen_at: now,
                 hit_count: 1,
@@ -853,6 +894,88 @@ mod tests {
         let (lines, consumed) = complete_lines(b"\n\n{\"a\":1}\n");
         assert_eq!(lines, vec!["{\"a\":1}"]);
         assert_eq!(consumed, 10);
+    }
+
+    /// 事件文件首行带 UTF-8 BOM（Windows PowerShell 5.1 `Add-Content -Encoding UTF8`
+    /// 建文件时的实测行为）不得吞掉第一个限额事件。
+    #[test]
+    fn utf8_bom_on_the_first_line_does_not_kill_the_first_event() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-bom";
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(
+            fixture.events(),
+            format!("\u{feff}{}\n", stop_payload(session, "hy3", &fixture.cli_transcript(session))),
+        )
+        .expect("带 BOM 的事件文件");
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(state.events.len(), 1, "BOM 前缀不得让首行解析失败");
+    }
+
+    /// 模型归因：transcript 的实际服务模型（`providerData.model`）优先于 payload 的
+    /// UI 选定模型（2026-09-18 实证：UI 选 glm-5.3-flash，实际被限 hy4-preview-f）。
+    #[test]
+    fn transcript_serving_model_wins_over_the_payload_ui_model() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-model";
+        let transcript = fixture.cli_transcript(session);
+        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n{}\n",
+                json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }),
+                json!({ "type": "reasoning", "providerData": { "model": "glm-5.3-flash", "reasoning": "x" } }),
+                // 最后一条实际服务模型是 hy4-preview-f（中途换过模型也要取最新的）。
+                json!({ "type": "function_call", "providerData": { "model": "hy4-preview-f" } })
+            ),
+        )
+        .expect("写 transcript");
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(fixture.events(), format!("{}\n", stop_payload(session, "glm-5.3-flash", &transcript)))
+            .expect("事件文件");
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].model.as_deref(),
+            Some("hy4-preview-f"),
+            "必须取 transcript 的实际服务模型，不是 payload 的 UI 模型"
+        );
+    }
+
+    /// transcript 不可读 / 无模型行 → 回落 payload 的模型，不入成「未知」。
+    #[test]
+    fn payload_model_is_the_fallback_when_transcript_has_no_model_rows() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-fallback";
+        // transcript 存在但没有 providerData.model 行。
+        let transcript = fixture.cli_transcript(session);
+        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
+        std::fs::write(&transcript, json!({ "type": "message", "role": "user" }).to_string())
+            .expect("写 transcript");
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(fixture.events(), format!("{}\n", stop_payload(session, "hy3", &transcript))).expect("事件文件");
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].model.as_deref(), Some("hy3"));
     }
 
     #[test]

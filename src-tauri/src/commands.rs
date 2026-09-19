@@ -39,13 +39,13 @@ pub async fn get_status(variant: Option<String>) -> Result<AppStatus, String> {
 
 fn build_app_status(variant: WbVariant) -> AppStatus {
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().and_then(|a| {
+    let current = auth.as_ref().map(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
+        json!({
             "uid": acct.get("uid"),
             "nickname": acct.get("nickname"),
             "email": acct.get("email"),
-        }))
+        })
     });
     AppStatus {
         running: process::is_workbuddy_running(variant),
@@ -670,10 +670,10 @@ pub fn get_launch_at_login_enabled(_app: tauri::AppHandle) -> Result<bool, Strin
     #[cfg(desktop)]
     {
         use tauri_plugin_autostart::ManagerExt;
-        return _app
+        _app
             .autolaunch()
             .is_enabled()
-            .map_err(|e| format!("查询开机自启状态失败：{e}"));
+            .map_err(|e| format!("查询开机自启状态失败：{e}"))
     }
     #[cfg(not(desktop))]
     {

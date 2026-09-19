@@ -100,13 +100,13 @@ fn variant_arg(args: &[String]) -> WbVariant {
 
 fn print_status(variant: WbVariant) {
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().and_then(|a| {
+    let current = auth.as_ref().map(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
+        json!({
             "uid": acct.get("uid"),
             "nickname": acct.get("nickname"),
             "email": acct.get("email"),
-        }))
+        })
     });
     let running = process::is_workbuddy_running(variant);
     println!("workbuddy-switch v{}", update::APP_VERSION);
@@ -134,7 +134,13 @@ async fn main() {
         "version" | "--version" | "-V" => {
             println!("workbuddy-switch {}", env!("CARGO_PKG_VERSION"));
         }
-        "serve" | _ => serve(&args).await,
+        "serve" => serve(&args).await,
+        // 未知子命令：给出用法提示而不是静默启动服务（避免误输入时以为命令已生效）
+        other => {
+            eprintln!("未知子命令: {other}");
+            eprintln!("用法: workbuddy-switch [serve|status|version] [--port <port>]");
+            std::process::exit(2);
+        }
     }
 }
 
