@@ -411,8 +411,7 @@ fn delete_edge_sync_mappings(db_path: &Path, cids: &[String]) {
 /// 做内容比对；若双方都无正文（空会话），退化为「同 cwd + 同展示标题」判定，
 /// 仅在目标也无正文时才跳过，避免误跳正常会话。
 ///
-/// 读取失败（如 WorkBuddy 占用锁）时返回 `false`，即「不跳过」，保持与原行为一致。
-#[allow(dead_code)] // 复制路径的事后查重已被上游幂等复制取代（保留以备回归）
+/// 读取失败（如 WorkBuddy 占用锁）时返回 `None`，即「不跳过」，保持包容行为。
 fn target_has_equivalent_session(
     db: &Path,
     _source_cid: &str,
@@ -422,18 +421,18 @@ fn target_has_equivalent_session(
     source_title: &str,
     source_jsonl_norm: &str,
     source_has_jsonl: bool,
-) -> bool {
+) -> Option<String> {
     let Some(conn) = open_db(db, true) else {
-        return false;
+        return None;
     };
     if !table_exists(&conn, "sessions") {
-        return false;
+        return None;
     }
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, cwd, title, custom_title FROM sessions \
          WHERE user_id = ?1 AND deleted_at IS NULL",
     ) else {
-        return false;
+        return None;
     };
     let Ok(rows) = stmt.query_map([target_uid], |row| {
         Ok((
@@ -443,7 +442,7 @@ fn target_has_equivalent_session(
             row.get::<_, Option<String>>(3)?,
         ))
     }) else {
-        return false;
+        return None;
     };
 
     let index = index_project_jsonls();
@@ -462,17 +461,71 @@ fn target_has_equivalent_session(
             if let Some(p) = index.get(&cid) {
                 if let Ok(text) = std::fs::read_to_string(p) {
                     if normalize_jsonl(&text, &cid) == source_jsonl_norm {
-                        return true;
+                        return Some(cid.clone());
                     }
                 }
             }
         } else if !source_has_jsonl && !target_has_jsonl {
             if session_display_title(title, custom_title) == source_title {
-                return true;
+                return Some(cid.clone());
             }
         }
     }
-    false
+    None
+}
+
+/// 目标账号是否已存在与源会话「逐字等价」的会话；有则返回其 id。
+///
+/// 本 fork 的内容级去重：上游的「已关联则跳过」依赖关联组表，若某会话没有关联记录
+/// （旧版本复制留下的副本、关联表缺失等），上游会再次新建副本导致重复行累积。
+/// 这里按「同 cwd + 同标题 + 正文抹平各自 id 后一致」再判一次，命中即跳过新增。
+///
+/// 仅对 WorkBuddy 命名空间生效（`paths.data_root` 非空）；VS Code 命名空间返回 None。
+fn equivalent_target_session_id(
+    context: &CopyContext,
+    cid: &str,
+    source_path: &Path,
+) -> Option<String> {
+    if context.paths.data_root.as_os_str().is_empty() {
+        return None;
+    }
+    let db = context.paths.data_root.join("workbuddy.db");
+    let conn = open_db(&db, true)?;
+    if !table_exists(&conn, "sessions") {
+        return None;
+    }
+    let has_custom = column_exists(&conn, "sessions", "custom_title");
+    let sql = if has_custom {
+        "SELECT cwd, title, custom_title FROM sessions WHERE id = ?1"
+    } else {
+        "SELECT cwd, title, NULL FROM sessions WHERE id = ?1"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
+    let (cwd, title, custom_title) = stmt
+        .query_row([cid], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .ok()?;
+    let source_cwd = cwd.unwrap_or_default();
+    let source_title = session_display_title(title, custom_title);
+    let (source_norm, source_has) = match std::fs::read_to_string(source_path) {
+        Ok(text) => (normalize_jsonl(&text, cid), true),
+        Err(_) => (String::new(), false),
+    };
+    target_has_equivalent_session(
+        &db,
+        cid,
+        context.source_uid,
+        context.target_uid,
+        &source_cwd,
+        &source_title,
+        &source_norm,
+        source_has,
+    )
 }
 
 /// 目标账号中是否存在与 (归一化 cwd, 展示标题) 相同的未删除会话。
@@ -1378,6 +1431,17 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         return Ok(CopyOutcome::AlreadyLinked {
             session_id,
             group_id: resolution.group_id.unwrap_or_default(),
+        });
+    }
+
+    // 本 fork 的内容级去重（design：从源头杜绝重复行累积）。
+    // 上游的「已关联则跳过」只覆盖有关联组记录的复制；目标账号若已存在「同 cwd + 同标题 +
+    // 正文一致」的会话（旧版本遗留副本、关联表缺失等），这里同样跳过新增，返回 AlreadyLinked，
+    // 由调用方计入 alreadyLinked（既不报错，也不产生第二个副本）。
+    if let Some(existing_id) = equivalent_target_session_id(context, cid, &source_path) {
+        return Ok(CopyOutcome::AlreadyLinked {
+            session_id: existing_id,
+            group_id: resolution.group_id.clone().unwrap_or_default(),
         });
     }
 
