@@ -1,51 +1,52 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
-import { ArrowUp, MessagesSquare, Settings, Sparkles, Timer, User } from "lucide-react";
+import { ArrowUp, Loader2, MessagesSquare, Settings, Sparkles, Timer, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
-import type { UpdateInfo } from "@/lib/types";
 import AccountsPage from "@/pages/AccountsPage";
 import CreditStatsPage from "@/pages/CreditStatsPage";
 import LimitsPage from "@/pages/LimitsPage";
 import TokenStatsPage from "@/pages/TokenStatsPage";
 import SettingsPage from "@/pages/SettingsPage";
 import { StatusDot, AppIconMark } from "@/components/product-marks";
+import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Toaster } from "@/components/ui/sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { demoModeEnabled, pagesDemoHostingEnabled } from "@/lib/demo-mode";
-import { GITHUB_RELEASE_URL, openReleaseUrl } from "@/lib/update";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
+import { useRotateDeferredNotice } from "@/lib/use-rotate-deferred-notice";
+import { useUpdateState } from "@/lib/use-update-state";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
 import { useAccountsStore } from "@/stores/accounts";
 
 function UpdateCenter({ running }: { running: boolean | undefined }) {
   const version = useAccountsStore((s) => s.status?.version);
-  const [info, setInfo] = useState<UpdateInfo | null>(null);
+  const snapshot = useUpdateState();
+  const [dialogOpen, setDialogOpen] = useState(false);
 
-  useEffect(() => {
-    let disposed = false;
-
-    async function checkForUpdate() {
-      try {
-        const result = await api.checkUpdate();
-        if (!disposed) setInfo(result.ok ? result : null);
-      } catch {
-        // 左下角只展示可操作的升级状态，网络错误不打扰正常使用。
-      }
-    }
-
-    void checkForUpdate();
-    const timer = window.setInterval(() => void checkForUpdate(), 30 * 60 * 1000);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  const hasUpdate = Boolean(info?.ok && info.hasUpdate && info.latest);
+  // 阶段由 Rust 更新服务经 `update-state` 推送（托盘同源），前端不再轮询检查。
+  // 已知目标版本时，检查中 / 失败也要保留入口，与托盘「升级到 vX / 点击重试」对齐。
+  const hasKnownTarget = Boolean(snapshot.latest);
+  const hasUpdate =
+    snapshot.phase === "available" ||
+    snapshot.phase === "downloading" ||
+    snapshot.phase === "readyToRestart" ||
+    (hasKnownTarget && (snapshot.phase === "error" || snapshot.phase === "checking"));
+  const updateHint =
+    snapshot.phase === "downloading"
+      ? snapshot.percent === null
+        ? "正在下载更新…"
+        : `正在下载更新 ${snapshot.percent}%`
+      : snapshot.phase === "readyToRestart"
+        ? "重启以完成升级"
+        : snapshot.phase === "error"
+          ? "更新失败，点击重试"
+          : snapshot.phase === "checking"
+            ? "正在检查…"
+            : "更新";
 
   return (
     <>
@@ -62,18 +63,23 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
                     type="button"
                     size="icon"
                     className="size-5 rounded-full p-0"
-                    aria-label="打开新版本下载页"
-                    onClick={() => void openReleaseUrl(info?.releaseUrl ?? GITHUB_RELEASE_URL)}
+                    aria-label={updateHint}
+                    onClick={() => setDialogOpen(true)}
                   >
-                    <ArrowUp className="size-3" strokeWidth={2.5} aria-hidden="true" />
+                    {snapshot.phase === "downloading" || snapshot.phase === "checking" ? (
+                      <Loader2 className="size-3 animate-spin" strokeWidth={2.5} aria-hidden="true" />
+                    ) : (
+                      <ArrowUp className="size-3" strokeWidth={2.5} aria-hidden="true" />
+                    )}
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="top">打开新版本下载页</TooltipContent>
+                <TooltipContent side="top">{updateHint}</TooltipContent>
               </Tooltip>
             )}
           </div>
         </div>
       </section>
+      <UpdateInstallDialog open={dialogOpen} onOpenChange={setDialogOpen} />
     </>
   );
 }
@@ -84,6 +90,7 @@ function Layout() {
     api.isDesktop() && typeof navigator !== "undefined" && navigator.userAgent.includes("Macintosh");
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
+  useRotateDeferredNotice();
 
   return (
     <div className="flex h-screen min-h-0 overflow-hidden bg-background">
@@ -135,21 +142,7 @@ function Layout() {
             <User className="size-4" />
             账号管理
           </NavLink>
-          <NavLink
-            to="/token-stats"
-            className={({ isActive }) =>
-              cn(
-                "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-sidebar-ring/50",
-                isActive
-                  ? "bg-foreground/[0.06] font-medium text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )
-            }
-          >
-            <MessagesSquare className="size-4" />
-            Token 统计
-          </NavLink>
-          <NavLink
+  <NavLink
             to="/limits"
             className={({ isActive }) =>
               cn(
@@ -163,6 +156,7 @@ function Layout() {
             <Timer className="size-4" />
             限额台账
           </NavLink>
+          <NavLink to="/token-stats" className={({ isActive }) => cn("flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm outline-none transition-colors", isActive ? "bg-foreground/[0.06] font-medium text-foreground" : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground")}><MessagesSquare className="size-4" />Token 统计</NavLink>
           <NavLink
             to="/credit-stats"
             className={({ isActive }) =>
@@ -216,8 +210,8 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
             <Route path="/credit-stats" element={<CreditStatsPage />} />
-            <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/limits" element={<LimitsPage />} />
+            <Route path="/token-stats" element={<TokenStatsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>

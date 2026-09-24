@@ -2,18 +2,21 @@
 """生成托盘图标素材（raw RGBA），供 Windows / Linux 托盘使用。
 
 为什么需要预生成：
-    Windows / Linux 没有 macOS 的「模板图标」语义，托盘必须使用**彩色 + 透明底**素材；
+    Windows / Linux 没有 macOS 的「模板图标」语义，托盘必须自带配色素材；
     而 Tauri 侧为不引入 PNG 解码依赖（`image-png` feature），改为直接嵌入 raw RGBA，
     因此需要把源图标预解码并下采样成固定尺寸的 `.rgba` 文件随仓库提交。
 
 用法：
-    python scripts/gen-tray-icon.py                      # 默认 512→64
-    python scripts/gen-tray-icon.py --size 32            # 生成 32×32
-    python scripts/gen-tray-icon.py --src public/icon-transparent.png --out src-tauri/icons/tray-icon-color.rgba
+    python scripts/gen-tray-icon.py                      # 彩色素材（默认 32×32）
+    python scripts/gen-tray-icon.py --size 64            # 指定尺寸
+    python scripts/gen-tray-icon.py --mono black         # 单色黑猫（浅色任务栏用）
+    python scripts/gen-tray-icon.py --mono white         # 单色白猫（深色任务栏用）
 
 要点：
-    * 源图必须**含透明通道**（透明底）。满幅不透明方图会在深色任务栏上显示为白底方块。
+    * 彩色源图必须**含透明通道**（透明底）。满幅不透明方图会在深色任务栏下显示为白底方块。
     * 下采样使用**预乘 alpha 的面积平均**，避免出现白边 / 黑边。
+    * 单色素材取自 `icons/tray-icon-template.png`（与 macOS 模板同一份猫形），
+      只对 alpha 做面积平均、RGB 固定为黑白，不携带任何彩色边缘。
 """
 import argparse
 import struct
@@ -21,6 +24,12 @@ import zlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+
+# 单色素材的墨色：黑猫用在浅色任务栏，白猫用在深色任务栏。
+MONO_RGB = {"black": (17, 17, 19), "white": (255, 255, 255)}
+MONO_TEMPLATE = "src-tauri/icons/tray-icon-template.png"
+COLOR_SRC = "public/icon-transparent.png"
+COLOR_OUT = "src-tauri/icons/tray-icon-color.rgba"
 
 
 def decode_png(path: Path):
@@ -115,16 +124,44 @@ def downscale_premultiplied(w, h, px, size):
     return bytes(out)
 
 
+def downscale_mono(w, h, px, size, rgb):
+    """单色素材：只对 alpha 做面积平均，RGB 固定为给定墨色。"""
+    out = bytearray(size * size * 4)
+    bx, by = w / size, h / size
+    for ty in range(size):
+        for tx in range(size):
+            x0, x1 = int(tx * bx), max(int(tx * bx) + 1, int((tx + 1) * bx))
+            y0, y1 = int(ty * by), max(int(ty * by) + 1, int((ty + 1) * by))
+            sa = 0.0
+            cnt = 0
+            for y in range(y0, min(y1, h)):
+                for x in range(x0, min(x1, w)):
+                    sa += px[(y * w + x) * 4 + 3] / 255.0
+                    cnt += 1
+            j = (ty * size + tx) * 4
+            out[j], out[j + 1], out[j + 2] = rgb
+            out[j + 3] = int(sa / cnt * 255) if cnt else 0
+    return bytes(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description="生成托盘 raw RGBA 素材")
-    ap.add_argument("--src", default="public/icon-transparent.png", help="源图标（必须含透明通道）")
-    ap.add_argument("--out", default="src-tauri/icons/tray-icon-color.rgba", help="输出 .rgba")
+    ap.add_argument("--mono", choices=sorted(MONO_RGB), help="生成单色素材（源图默认取 tray-icon-template.png）")
+    ap.add_argument("--src", default=None, help="源图标（彩色必须含透明通道）")
+    ap.add_argument("--out", default=None, help="输出 .rgba")
     ap.add_argument("--size", type=int, default=32, help="输出边长（默认 32；Windows 托盘实际最大 32，过大的源会被系统二次缩放而发虚）")
     args = ap.parse_args()
 
-    src, out = REPO / args.src, REPO / args.out
+    src_name = args.src or (MONO_TEMPLATE if args.mono else COLOR_SRC)
+    out_name = args.out or (
+        f"src-tauri/icons/tray-icon-mono-{args.mono}.rgba" if args.mono else COLOR_OUT
+    )
+    src, out = REPO / src_name, REPO / out_name
     w, h, px = decode_png(src)
-    rgba = downscale_premultiplied(w, h, px, args.size)
+    if args.mono:
+        rgba = downscale_mono(w, h, px, args.size, MONO_RGB[args.mono])
+    else:
+        rgba = downscale_premultiplied(w, h, px, args.size)
     n = len(rgba) // 4
     transparent = sum(1 for i in range(n) if rgba[i * 4 + 3] == 0)
     opaque = sum(1 for i in range(n) if rgba[i * 4 + 3] == 255)
@@ -133,7 +170,11 @@ def main():
     if opaque == 0:
         raise SystemExit("源图没有不透明像素：图标会完全不可见")
     out.write_bytes(rgba)
-    print(f"已生成 {out.relative_to(REPO)}：{args.size}×{args.size}，{len(rgba):,} B"
+    try:
+        shown = out.relative_to(REPO)
+    except ValueError:  # --out 指向仓库外
+        shown = out
+    print(f"已生成 {shown}：{args.size}×{args.size}，{len(rgba):,} B"
           f"（透明 {transparent} / 不透明 {opaque} 像素）")
 
 

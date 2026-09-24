@@ -2007,10 +2007,17 @@ mod tests {
 
     #[test]
     fn extracts_node_path_without_accepting_shell_noise() {
-        let output = b"welcome to the shell\n/Users/test/.nvm/versions/node/v22/bin/node\n";
+        // 判据是「绝对路径 + 文件名为 node」，而绝对路径的形态按平台不同
+        // （Windows 需盘符或 UNC 前缀），fixture 必须按平台给。
+        let node = if cfg!(windows) {
+            r"C:\Users\test\node-v22\node"
+        } else {
+            "/Users/test/.nvm/versions/node/v22/bin/node"
+        };
+        let output = format!("welcome to the shell\n{node}\n");
         assert_eq!(
-            node_path_from_shell_output(output),
-            Some(PathBuf::from("/Users/test/.nvm/versions/node/v22/bin/node"))
+            node_path_from_shell_output(output.as_bytes()),
+            Some(PathBuf::from(node))
         );
         assert_eq!(node_path_from_shell_output(b"node\nwelcome\n"), None);
     }

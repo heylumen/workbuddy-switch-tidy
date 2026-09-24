@@ -32,7 +32,6 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
@@ -91,10 +90,11 @@ const IDE_AUTH_MARKER: &str = "[PulseServiceLifecycle] Auth session changed:";
 /// 与 `[AcpAgent:<conv32>] … modelId=<m>` 共用同一个字段名（见 `ide_model_id`）。
 const IDE_MODEL_FIELD: &str = "modelId=";
 
-/// IDE 模型字段上的未知哨兵值：`auto` 是「会话尚未选定模型」（`[AcpAgent:…] Model cache
-/// synced … source=new-session` 会出现），`undefined` / `null` 是 JS 侧字段缺失的写法。
-/// 都按未知处理——卡片绝不能显示 `auto` / `undefined`。
-const IDE_MODEL_UNKNOWN: [&str; 3] = ["auto", "undefined", "null"];
+/// 模型字段上的未知哨兵值（见 `known_model`）：`auto` 是「会话尚未选定模型」
+/// （IDE 的 `[AcpAgent:…] Model cache synced … source=new-session`、SDK 的 `method:sendPrompt`
+/// 都会出现），`undefined` / `null` 是 JS 侧字段缺失的写法。
+/// 都按未知处理——卡片绝不能显示 `auto` / `undefined`，也不能让它们覆盖已知值。
+const MODEL_UNKNOWN: [&str; 3] = ["auto", "undefined", "null"];
 
 /// IDE 模型兜底行标记：`[handleAuthError] modelId=<m>, …`（只在调用失败时出现）。
 const IDE_AUTH_ERROR_MARKER: &str = "[handleAuthError]";
@@ -145,6 +145,20 @@ const RESOLVED_MODEL_MARKER: &str = "resolved model=";
 /// 上游只认业务日志的 `requestId → model` 与 `resolved model=`，SDK 侧两样都没有 ⇒ 事件被标「未知模型」。
 /// 本机实测（2026-09-18 15:40:22）：那条「未知模型」实为 `hy4-preview-f`。
 const SDK_SEND_PROMPT_MARKER: &str = "method:sendPrompt";
+
+/// SDK 会话日志的目录形态：`logs/<日期>/sdk/conversations/<会话 UUID>.log`。
+const SDK_LOG_DIR: &str = "sdk";
+const SDK_CONVERSATIONS_DIR: &str = "conversations";
+
+/// 回显行（工具输出 / 命令回显）的**外层载体**标记。
+///
+/// - `SandboxShell`：外层 logger 标签（`[SandboxShell] …`）；
+/// - `ProcessOutput` / `sandbox attempt output`：标签之后正文开头的载体名。
+///
+/// 正文里出现 `stdout(` / `stderr(` / `content=` 不算（见 `is_transport_line`）。
+const TRANSPORT_TAG: &str = "SandboxShell";
+const TRANSPORT_OUTPUT_MARKER: &str = "ProcessOutput";
+const SANDBOX_OUTPUT_MARKER: &str = "sandbox attempt output";
 
 /// 业务日志行首时间格式（本地时间）：`9/17/2026, 12:20:31 AM.232`。
 const BUSINESS_TS_FORMAT: &str = "%m/%d/%Y, %I:%M:%S %p%.3f";
@@ -356,9 +370,12 @@ fn scan_text_scoped(
                     }
                 }
                 // SDK 会话日志的模型线索（行内无会话 id ⇒ 用文件名）；顺序扫描 ⇒ 取到事件前的最近一次。
+                // 未知值（空 / `auto` / `undefined` / `null`）不写映射：既不能显示成模型名，
+                // 也不能覆盖此前已知的值（2026-09-20 审查反例：SDK 的 auto 被显示为模型名）。
                 if let Some(session) = file_session {
                     if line.contains(SDK_SEND_PROMPT_MARKER) {
-                        if let Some(model) = json_field(line, "modelId") {
+                        if let Some(model) = json_field(line, "modelId").filter(|m| known_model(m))
+                        {
                             session_models.insert(session.to_string(), model.to_string());
                         }
                     }
@@ -421,10 +438,13 @@ fn scan_text_scoped(
                 ide_attribution(line, &conversation_models, auth_error_model.as_deref())
             }
         };
-        // WorkBuddy 限额行必须有事件身份（行尾 `(requestId/sessionId)` 或 `sessionId=`）：
-        // 会话日志会把任意文本原样回显进文件（诊断命令、工具输出），无身份的行只能落到
+        // WorkBuddy 两档位的限额行必须有事件身份（行尾 `(requestId/sessionId)` 或 `sessionId=`）：
+        // 它们的会话日志会把任意文本原样回显进文件（诊断命令、工具输出），无身份的行只能落到
         // 分类器兜底上 —— 账号/模型都会错归（2026-09-18 glm 假 chip 实证）。宁可少显示。
-        if format == LogFormat::WorkBuddy && session_id.is_none() {
+        //
+        // 只对 WorkBuddy 两档位成立：CLI 与它们共用同一格式，但归因走日志内鉴权 uid /
+        // 轮换状态文件，缺 `session_id` 不代表事件不可靠 —— 不能统一短路（2026-09-20 审查）。
+        if format == LogFormat::WorkBuddy && auth == AuthMarker::None && session_id.is_none() {
             continue;
         }
         hits.push(Hit {
@@ -438,17 +458,43 @@ fn scan_text_scoped(
     hits
 }
 
-/// 会话日志里的「传输行」：WorkBuddy 会把工具输出 / 命令回显整段塞进
-/// `[SandboxShell] ProcessOutput … content=`（及 Sandbox 系列的 stdout/stderr 摘要），
-/// 其中可能带着**别处日志的原文**——包括 429 行与其 requestId。按原样解析会把回显
-/// 当成真事件（截断行还会错落归因到回显会话的模型上，2026-09-18 实证 glm 假 chip、
-/// hitCount 虚高）。真实限额行（`[Interruption]` / `[Error: 429` 等）不含这些载体标记。
+/// 回显行：WorkBuddy 会把工具输出 / 命令回显整段塞进 `[SandboxShell] ProcessOutput …
+/// | content=…`（及 Sandbox 系列的 stdout/stderr 摘要），其中可能带着**别处日志的原文**
+/// ——包括 429 行与其 requestId。按原样解析会把回显当成真事件（截断行还会错落归因到回显
+/// 会话的模型上，2026-09-18 实证 glm 假 chip、hitCount 虚高）。
+///
+/// ⚠️ 只认**外层载体**：行首方括号标签段里的 `SandboxShell`，或标签之后正文开头的
+/// `ProcessOutput` / `sandbox attempt output`。不按整行判定 —— 真实 429 正文
+/// （IDE 的 `Agent execution failed` 带完整请求体）里出现 `stdout(` / `stderr(` /
+/// `content=` 是常事，整行匹配会把真事件一起误删（2026-09-20 审查反例）。
 fn is_transport_line(line: &str) -> bool {
-    line.contains("ProcessOutput")
-        || line.contains(" | content=")
-        || line.contains("stdout(")
-        || line.contains("stderr(")
-        || line.contains("sandbox attempt output")
+    let (tags, body) = split_logger_tags(line);
+    tags.contains(TRANSPORT_TAG)
+        || body.starts_with(TRANSPORT_OUTPUT_MARKER)
+        || body.starts_with(SANDBOX_OUTPUT_MARKER)
+}
+
+/// 把一行拆成「外层 logger 标签段」与「正文」。
+///
+/// 标签段 = 行首连续的 `[…]`（业务日志的 `[时间] [级别] [pid=…] [Tag]`）；正文可能原样
+/// 引用别的日志行，两者必须分开看，否则正文里的载体字样会被误判成传输行。
+fn split_logger_tags(line: &str) -> (&str, &str) {
+    let bytes = line.as_bytes();
+    let mut cursor = 0;
+    loop {
+        let mut index = cursor;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes.get(index) != Some(&b'[') {
+            break;
+        }
+        let Some(close) = line[index..].find(']') else {
+            break;
+        };
+        cursor = index + close + 1;
+    }
+    (&line[..cursor], line[cursor..].trim_start())
 }
 
 /// WorkBuddy 格式（含 CLI）的事件 id 与模型归因。
@@ -507,9 +553,19 @@ fn ide_attribution(
     (session_id, model)
 }
 
-/// `sdk/conversations/<会话UUID>.log` 的文件名就是会话 id；业务日志是
-/// `<工作区>__<hash>.log`，**不得**当会话 id 用（否则会把工作区名写进会话模型映射）。
+/// `logs/<日期>/sdk/conversations/<会话 UUID>.log` 的文件名就是会话 id。
+///
+/// 路径形态必须匹配（祖父目录 `sdk`、父目录 `conversations`）：业务日志是
+/// `<工作区>__<hash>.log`，但别的目录下也可能出现 UUID 文件名 —— 只按文件名认领会把它们
+/// 当成会话 id，把模型线索写进错误的会话（2026-09-20 审查：限定 SDK conversations 形态）。
 fn session_from_file_name(path: &Path) -> Option<String> {
+    let conversations = path.parent()?;
+    if conversations.file_name()?.to_str()? != SDK_CONVERSATIONS_DIR {
+        return None;
+    }
+    if conversations.parent()?.file_name()?.to_str()? != SDK_LOG_DIR {
+        return None;
+    }
     let stem = path.file_stem()?.to_str()?;
     let looks_like_uuid = stem.len() == 36
         && stem.matches('-').count() == 4
@@ -814,10 +870,18 @@ fn field_model<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-/// 取 IDE 行的 `modelId=` 字段（哨兵值见 `IDE_MODEL_UNKNOWN`）。
+/// 取 IDE 行的 `modelId=` 字段（哨兵值见 `MODEL_UNKNOWN`）。
 fn ide_model_id(line: &str) -> Option<&str> {
-    let value = field_model(line, IDE_MODEL_FIELD)?;
-    (!IDE_MODEL_UNKNOWN.contains(&value)).then_some(value)
+    field_model(line, IDE_MODEL_FIELD).filter(|value| known_model(value))
+}
+
+/// 模型值是否可用：非空且不是未知哨兵。
+///
+/// IDE 的 `modelId=` 与 SDK `method:sendPrompt` 的 `"modelId"` 共用同一套判据 ——
+/// `auto` / `undefined` / `null` / 空值都不得作为模型名展示，也不得覆盖已知值。
+fn known_model(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !MODEL_UNKNOWN.contains(&value)
 }
 
 /// 鉴权行给出的账号 uid（顺序扫描时维护「事件前最近一次」）。
@@ -951,10 +1015,10 @@ fn ide_conversation_id(line: &str) -> Option<&str> {
         .or_else(|| json_field(line, "conversationId").filter(|value| is_ide_session_id(value)))
 }
 
-/// 报错行内的 JSON 模型字段 `"model":"<value>"`（哨兵值同 `IDE_MODEL_UNKNOWN`）。
+/// 报错行内的 JSON 模型字段 `"model":"<value>"`（哨兵值同 `MODEL_UNKNOWN`）。
 fn ide_json_model(line: &str) -> Option<String> {
     let value = json_field(line, "model")?;
-    (!IDE_MODEL_UNKNOWN.contains(&value)).then(|| value.to_string())
+    known_model(value).then(|| value.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,11 +1290,10 @@ struct ScanScope(u8);
 impl ScanScope {
     /// 一个来源都不扫。
     const NONE: Self = Self(0);
-    /// 全量五源。装 / 卸 hook 的强制全量在 `scanIdeLogs` 开启时用这个；关闭时改走 `HOOK_SOURCES`。
+    /// 全量五源。生产路径的范围一律由 `scan_scope` 按来源算出（可能正好是它），
+    /// 这里保留给缓存超集语义的测试用。
+    #[cfg(test)]
     const ALL: Self = Self(0b1_1111);
-    /// 只含「hook 通路来源」（CLI + WorkBuddy 两档位）：`scanIdeLogs` 关闭时强制全量的上限
-    /// —— 两个 IDE 是独立开关，任何路径下都不该被带回来。
-    const HOOK_SOURCES: Self = Self(0b0_0111);
 
     fn insert(&mut self, source: ScanSource) {
         self.0 |= 1 << source.bit();
@@ -1338,35 +1401,13 @@ impl ScanCache {
 
 static SCAN_CACHE: Mutex<Option<ScanCache>> = Mutex::new(None);
 
-/// 置位后下一次扫描按**全量**走一遍（只由装 / 卸 hook 置位）。
-static FORCE_FULL_SCAN: AtomicBool = AtomicBool::new(false);
-
-/// 补扫基线（进程级常驻）：对「hook 通路来源」补扫一次日志，结果保留整个进程生命周期。
+/// 扫描缓存作废：下一次 `get_rate_limits()` 按**当前来源 scope** 重算。
 ///
-/// 背景：装 hook **之前**发生的限额只存在于日志里（2026-09-18 实测：15:46 的 429 在 17:00 装 hook 后消失），
-/// 而 `scan_scope` 会把「已注册 hook」的来源排除，交给事件通路 —— 事件通路无法回溯历史。
-///
-/// ⚠️ 必须**常驻**：`cached_scan` 的缓存只有 5 分钟（`SCAN_MIN_INTERVAL_MS`），过期后会按当时范围重扫；
-/// 若把补扫结果只留在缓存里，5 分钟后就会被「不含 hook 来源」的空扫描结果覆盖 ⇒ 卡片上的限额又消失。
-static BACKFILL_BASE: std::sync::Mutex<Option<Vec<Resolved>>> = std::sync::Mutex::new(None);
-
-/// 只清缓存，不置「强制全量」：**开关类**范围变更（`scanIdeLogs`）用。
-///
-/// 下一次 `get_rate_limits()` 按当前 scope 重扫——关掉 IDE 扫描后，缓存里的 IDE 旧条目随之消失，
-/// 也不会再用旧缓存把两个 IDE 扫一遍。
-fn clear_scan_cache() {
-    *SCAN_CACHE.lock().unwrap() = None;
-}
-
-/// 装 / 卸 hook 后调用：扫描范围变了，缓存作废，下一次扫描强制全量走一遍。
-///
-/// 全量一次是为了装 hook 的瞬间不丢已经显示出来的 CLI / WorkBuddy 限额（之后按 hook 通路实时更新）。
-/// `scanIdeLogs = false` 时全量上限是 `HOOK_SOURCES`，不会把两个 IDE 带回来。
-/// 与 `clear_scan_cache` 的分工：这里额外置 `FORCE_FULL_SCAN`，开关类变更不得走这条
-/// （否则刚关掉的 IDE 又会按旧范围扫一次）。
+/// 装 / 卸 hook 与 `scanIdeLogs` 这类范围变更共用这一条：安装使范围收窄
+/// （该来源改走事件通路）、卸载使范围扩大（回到日志扫描），两种变化都由「按当前 scope
+/// 重算」覆盖，不需要为任何一方强制全来源扫描 —— 也不为接入 hook 之前的历史补扫。
 pub fn invalidate_scan_cache() {
-    FORCE_FULL_SCAN.store(true, Ordering::SeqCst);
-    clear_scan_cache();
+    *SCAN_CACHE.lock().unwrap() = None;
 }
 
 /// 取一次扫描结果（命中缓存则不重扫）。
@@ -1471,43 +1512,18 @@ pub fn get_rate_limits() -> Value {
     // CLI / WorkBuddy 的逐来源判定（hook 未接上则回退日志）不受影响。
     let scan_ide_logs = scan_ide_logs_enabled();
     // 逐来源判定：不存在的客户端不参与扫描；已注册 hook 的来源交给事件通路。
-    // 装 / 卸 hook 的瞬间强制全量一次。关闭开关时不得把「强制全量」标志消费掉：
-    // 否则重新开启后会直接按当前范围扫，装 hook 前已经显示的 CLI / WorkBuddy 限额会丢。
-    let full_scan_once = if enabled {
-        FORCE_FULL_SCAN.swap(false, Ordering::SeqCst)
-    } else {
-        FORCE_FULL_SCAN.load(Ordering::SeqCst)
-    };
-    let scope = if full_scan_once {
-        // 强制全量也不能把已被开关关掉的 IDE 带回来。
-        if scan_ide_logs {
-            ScanScope::ALL
-        } else {
-            ScanScope::HOOK_SOURCES
-        }
-    } else {
-        scan_scope(&ScanRoots::real(), scan_ide_logs)
-    };
+    // 装 / 卸 hook 只作废缓存（`invalidate_scan_cache`），下一次按当前范围重算 ——
+    // 安装使范围收窄、卸载使范围扩大，都不需要强制全来源，也不补扫接入前的历史。
+    let scope = scan_scope(&ScanRoots::real(), scan_ide_logs);
     let (scanned_at, mut resolved) = cached_scan(scope, now, enabled);
-    // 「hook 通路来源」补扫一次并常驻（历史限额只在日志里）；之后的增量交给事件通路。
-    if enabled {
-        let mut slot = BACKFILL_BASE.lock().unwrap();
-        if slot.is_none() {
-            *slot = Some(scan_sources(ScanScope(ScanScope::HOOK_SOURCES.0)));
-        }
-        if let Some(base) = slot.as_ref() {
-            resolved.extend(base.iter().cloned());
-        }
-    }
     resolved.extend(crate::modules::rate_limit_events::hook_entries(now));
     build_payload(resolved, if scanned_at > 0 { scanned_at } else { now })
 }
 
 /// 保存限额监听配置，并同步日志扫描范围。
 ///
-/// `scanIdeLogs` 变化 → **只清缓存**（`clear_scan_cache`，不置 `FORCE_FULL_SCAN`）：
-/// 下一次 `get_rate_limits()` 按新 scope 重扫，关掉后不会再用旧缓存扫一次 IDE。
-/// 装 / 卸 hook 仍走 `invalidate_scan_cache()`（清缓存 + 强制全量），语义不同不能混用。
+/// `scanIdeLogs` 变化 → 作废扫描缓存（`invalidate_scan_cache`）：下一次 `get_rate_limits()`
+/// 按新 scope 重扫，关掉后不会再用旧缓存扫一次 IDE。
 pub fn save_rate_limit_config(cfg: &Value) -> std::io::Result<()> {
     save_rate_limit_config_at(&crate::modules::config::rate_limit_config_file(), cfg)
 }
@@ -1518,7 +1534,7 @@ pub(crate) fn save_rate_limit_config_at(path: &Path, cfg: &Value) -> std::io::Re
     crate::modules::config::save_rate_limit_config_at(path, cfg)?;
     let after = crate::modules::config::load_rate_limit_config_at(path);
     if scan_ide_logs_of(&before) != scan_ide_logs_of(&after) {
-        clear_scan_cache();
+        invalidate_scan_cache();
     }
     Ok(())
 }
@@ -1543,9 +1559,6 @@ mod tests {
         format!("[{timestamp}] [Error] [pid=1] {body}")
     }
 
-    /// 业务日志有两种行首时间戳：12 小时制（`9/17/2026, 12:20:31 AM.232`）与
-    /// 24 小时制（`2026/9/18 15:46:30.242`，2026-09-18 本机实测）。只认前者时，
-    /// 后者会被整行跳过 —— 现象是台账始终为空。
     /// SDK 会话日志：模型线索来自 `method:sendPrompt`，会话 id 来自文件名。
     ///
     /// 回归：修复前这类事件被标成「未知模型」（归因只认业务日志的 requestId / resolved model）。
@@ -1572,6 +1585,78 @@ mod tests {
         assert_eq!(without[0].model, None);
     }
 
+    /// SDK 文件会话身份必须落在 `logs/<日期>/sdk/conversations/<UUID>.log` 形态上：
+    /// 别的目录下的 UUID 文件名（以及 SDK 目录里的非 UUID 名）都不得当会话 id 用。
+    #[test]
+    fn sdk_file_session_identity_requires_the_conversations_path() {
+        let uuid = "b3df1149-8a3f-4d73-b7a4-c71c46e15762";
+        let conversations = Path::new("/u/.codebuddy/logs/2026-09-18/sdk/conversations");
+        assert_eq!(
+            session_from_file_name(&conversations.join(format!("{uuid}.log"))).as_deref(),
+            Some(uuid),
+            "SDK conversations 下的 UUID 文件名就是会话 id"
+        );
+        for path in [
+            // 业务日志（日期目录下）。
+            PathBuf::from(format!("/u/.codebuddy/logs/2026-09-18/{uuid}.log")),
+            // 少了 `conversations` 一层。
+            PathBuf::from(format!("/u/.codebuddy/logs/2026-09-18/sdk/{uuid}.log")),
+            // SDK 目录里但不是会话 UUID 的文件名。
+            conversations.join("workspace__abc123.log"),
+            conversations.join("not-a-uuid.log"),
+            // 没有上级目录的裸文件名。
+            PathBuf::from(format!("{uuid}.log")),
+        ] {
+            assert_eq!(
+                session_from_file_name(&path),
+                None,
+                "{path:?} 不得当会话 id"
+            );
+        }
+    }
+
+    /// 回归 2026-09-20 审查反例 (a)：SDK 的 `modelId` 为 `auto`（未选定模型）时
+    /// 不得把 `auto` 显示成模型名，也不得覆盖此前已知的模型。
+    #[test]
+    fn sdk_auto_is_not_a_model_name() {
+        let session = "b3df1149-8a3f-4d73-b7a4-c71c46e15762";
+        let quota = format!(
+            "2026-09-18T07:40:22.997Z runtime.applyStopReason {{\"preview\":\"{}\"}}",
+            cn_quota_with(session, CN_REQUEST, "2026-09-19 13:49:50")
+        );
+        let sdk_line = |model: &str| {
+            format!(
+                "2026-09-18T07:37:17.657Z method:sendPrompt {{\"instanceId\":\"ci-3\",\"modelId\":\"{model}\"}}"
+            )
+        };
+        let scan = |text: &str| {
+            dedupe(scan_text_scoped(
+                text,
+                LogFormat::WorkBuddy,
+                AuthMarker::None,
+                Some(session),
+            ))
+        };
+
+        // ① 只有 auto 线索：未知模型，不得字面展示 `auto`。
+        let only_auto = scan(&[sdk_line("auto"), quota.clone()].join("\n"));
+        assert_eq!(only_auto.len(), 1);
+        assert_eq!(only_auto[0].model, None, "auto 是未知哨兵，不是模型名");
+
+        // ② auto 出现在已知模型之后：不覆盖，仍然是顺序扫描取到的最近一次**已知**模型。
+        let after_known =
+            scan(&[sdk_line("hy4-preview-f"), sdk_line("auto"), quota.clone()].join("\n"));
+        assert_eq!(after_known.len(), 1);
+        assert_eq!(
+            after_known[0].model.as_deref(),
+            Some("hy4-preview-f"),
+            "未知值不得覆盖已知的模型线索"
+        );
+    }
+
+    /// 业务日志有两种行首时间戳：12 小时制（`9/17/2026, 12:20:31 AM.232`）与
+    /// 24 小时制（`2026/9/18 15:46:30.242`，2026-09-18 本机实测）。只认前者时，
+    /// 后者会被整行跳过 —— 现象是台账始终为空。
     #[test]
     fn accepts_both_business_timestamp_styles() {
         for ts in ["9/17/2026, 12:20:31 AM.232", "2026/9/18 15:46:30.242"] {
@@ -1597,8 +1682,9 @@ mod tests {
         assert!(events.is_empty(), "无身份的限额文案行不得入账");
     }
 
-    /// 传输行（Sandbox 回显 / 工具输出载体）里即使嵌着 429 原文，也不得当成真事件，
-    /// 更不得污染 requestId → model 的归因映射（2026-09-18 glm 假 chip 实证）。
+    /// 传输行（`[SandboxShell]` 回显 / `ProcessOutput` 载体）里即使嵌着 429 原文，
+    /// 也不得当成真事件，更不得污染 requestId → model 的归因映射（2026-09-18 glm 假 chip 实证）。
+    /// 判据只看**外层载体**（见 `is_transport_line`），不看正文里的 `stdout(` / `content=`。
     #[test]
     fn transport_lines_are_neither_events_nor_model_context() {
         let other_session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -1631,6 +1717,75 @@ mod tests {
             events[0].model.as_deref(),
             Some("hy4-preview-f"),
             "归因必须来自真实 Sending request 行，而不是回显"
+        );
+    }
+
+    /// 回归 2026-09-20 审查反例：真实限额行的**正文**里出现 `stdout(` / `stderr(` /
+    /// `content=` 时不得被当成传输行整行丢掉（IDE 的 `Agent execution failed` 带完整请求体，
+    /// CLI / WorkBuddy 的错误行也会回显工具输出；误删会直接丢真事件）。
+    #[test]
+    fn real_quota_lines_mentioning_stdout_are_not_dropped() {
+        let workbuddy = business_line(
+            "2026/9/18 15:46:30.242",
+            &format!(
+                "[Error] [Interruption] httpStatus=429, tool echo truncated: stdout(…) stderr(…) content=truncated {}",
+                cn_quota()
+            ),
+        );
+        let events = dedupe(workbuddy_hits(&workbuddy));
+        assert_eq!(
+            events.len(),
+            1,
+            "正文里的 stdout(/content= 不得让真事件消失"
+        );
+        assert_eq!(events[0].reset_at, CN_RESET_AT);
+
+        // IDE 的报错行（带完整请求体）同样如此。
+        let ide = ide_line(
+            "2026-09-17 10:28:26.741",
+            &format!(
+                "[AgentReporter] [{IDE_TRACE}] Agent execution failed: {{\"statusCode\":429,\"requestBodyValues\":{{\"model\":\"{IDE_MODEL}\"}},\"responseHeaders\":{{\"x-request-id\":\"{IDE_REQUEST}\"}},\"toolOutput\":\"stdout(truncated) stderr(truncated) content=truncated\",\"message\":\"429 {IDE_QUOTA}\"}}"
+            ),
+        );
+        let events = dedupe(scan_text(
+            &ide,
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        ));
+        assert_eq!(events.len(), 1, "IDE 正文里的 stdout( 不得让真事件消失");
+        assert_eq!(events[0].reset_at, CN_RESET_AT);
+        assert_eq!(events[0].model.as_deref(), Some(IDE_MODEL));
+    }
+
+    /// 回归 2026-09-20 审查：无 `session_id` 不得**统一短路** —— CLI 与 WorkBuddy 共用
+    /// WorkBuddy 格式，但 CLI 还有日志内 uid / 状态文件归因链，缺事件身份的真实限额仍要入账；
+    /// 纯 WorkBuddy 两档位没有别的线索，仍按原判据丢弃（见上一条测试）。
+    #[test]
+    fn cli_quota_lines_without_event_identity_are_kept() {
+        // 行内既没有行尾 `(requestId/sessionId)`，也没有 `sessionId=`。
+        let text = [
+            cli_auth_line("9/15/2026, 2:07:59 PM.057", UID_A),
+            business_line(
+                "9/15/2026, 2:08:10 PM.000",
+                "429 您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置，您也可以切换其他模型继续使用。",
+            ),
+        ]
+        .join("\n");
+
+        let cli = dedupe(scan_text(
+            &text,
+            LogFormat::WorkBuddy,
+            AuthMarker::AuthDoInitProbe,
+        ));
+        assert_eq!(cli.len(), 1, "CLI 缺 session_id 不得被丢弃");
+        assert_eq!(cli[0].session_id, None);
+        assert_eq!(cli[0].reset_at, CN_RESET_AT);
+        assert_eq!(cli[0].uid.as_deref(), Some(UID_A), "uid 归因链照常工作");
+
+        // 同一份文本按 WorkBuddy 两档位解析（无 uid 线索）→ 按原判据丢弃。
+        assert!(
+            dedupe(workbuddy_hits(&text)).is_empty(),
+            "WorkBuddy 两档位无事件身份仍要丢弃"
         );
     }
 
@@ -1986,6 +2141,42 @@ mod tests {
         let events = dedupe(workbuddy_hits(&text));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id.as_deref(), Some(CN_SESSION));
+    }
+
+    /// 分类器兜底只在 `CLASSIFIER_FALLBACK_MS`（2 秒）窗内有效：回显行与分类器行相隔
+    /// 分钟级，不得借道旧分类器会话入账（2026-09-18 glm 假 chip 实证；R6「超过时间窗
+    /// 不沿用旧会话」）。
+    #[test]
+    fn classifier_fallback_does_not_outlive_its_time_window() {
+        const BARE_QUOTA: &str = "429 您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置，您也可以切换其他模型继续使用。";
+        let classifier = business_line(
+            "9/17/2026, 12:20:31 AM.467",
+            &format!(
+                "[ACP Agent] refusal classified: sessionId={CN_SESSION}, rpcCode=-32003, httpStatus=429, bizCode=6004, category=quota"
+            ),
+        );
+
+        // 紧邻（1 ms）：兜底生效，会话来自分类器行。
+        let near = [
+            classifier.clone(),
+            business_line("9/17/2026, 12:20:31 AM.468", BARE_QUOTA),
+        ]
+        .join("\n");
+        let events = dedupe(workbuddy_hits(&near));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session_id.as_deref(), Some(CN_SESSION));
+
+        // 超窗（约 5 秒后）：不得沿用旧分类器会话 —— 该行既无事件身份又借不到兜底，
+        // 按「宁可少显示」丢弃。
+        let far = [
+            classifier,
+            business_line("9/17/2026, 12:20:36.500", BARE_QUOTA),
+        ]
+        .join("\n");
+        assert!(
+            dedupe(workbuddy_hits(&far)).is_empty(),
+            "超过时间窗的裸文案行不得沿用旧会话"
+        );
     }
 
     #[test]
@@ -2426,7 +2617,7 @@ mod tests {
     /// `modelId=auto` / `undefined` / `null`（会话尚未选定模型或字段缺失）按未知处理。
     #[test]
     fn ide_unknown_model_sentinels_are_treated_as_unknown() {
-        for sentinel in IDE_MODEL_UNKNOWN {
+        for sentinel in MODEL_UNKNOWN {
             let text = [
                 ide_model_selection_line(IDE_CONV, sentinel),
                 ide_quota_line("2026-09-17 10:28:26.751", IDE_CONV),
@@ -2810,12 +3001,23 @@ mod tests {
         }
     }
 
-    /// 已注册本工具 hook 的 `settings.json` 内容（marker = 脚本绝对路径）。
+    /// 注册命令里的脚本路径 marker（与 `HookLayout::marker` 同构：单引号包裹的绝对路径）。
+    fn quoted_marker(dir: &Path) -> String {
+        format!(
+            "'{}'",
+            dir.join(".wb-switch").join("hook.sh").to_string_lossy()
+        )
+    }
+
+    /// 已注册本工具 hook 的 `settings.json` 内容。
+    ///
+    /// `marker` 是注册命令里脚本路径的**原样形态**（含引号，与 `hook_command` 一致）：
+    /// 这里按真实形态拼装，保证与 `HookLayout::marker` 的判定同构。
     fn registered_settings(marker: &str) -> String {
         json!({
             "hooks": {
-                "Stop": [{ "matcher": "", "hooks": [{ "type": "command", "command": format!("sh '{marker}'") }] }],
-                "FinalStop": [{ "matcher": "", "hooks": [{ "type": "command", "command": format!("sh '{marker}'") }] }],
+                "Stop": [{ "matcher": "", "hooks": [{ "type": "command", "command": format!("sh {marker}") }] }],
+                "FinalStop": [{ "matcher": "", "hooks": [{ "type": "command", "command": format!("sh {marker}") }] }],
             }
         })
         .to_string()
@@ -2830,8 +3032,7 @@ mod tests {
     #[test]
     fn scan_scope_is_decided_per_source() {
         let dir = temp_dir("scan-scope");
-        let marker = dir.join(".wb-switch").join("hook.sh");
-        let marker = marker.to_string_lossy().to_string();
+        let marker = quoted_marker(&dir);
         let registered = registered_settings(&marker);
 
         let cli_root = dir.join(".codebuddy");
@@ -2889,13 +3090,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `scanIdeLogs = false` **只关两个 IDE**：CLI / WorkBuddy 的逐来源判定完全不变；
-    /// 强制全量（装 / 卸 hook）的「全量」上限也不含 IDE。
+    /// `scanIdeLogs = false` **只关两个 IDE**：CLI / WorkBuddy 的逐来源判定完全不变。
     #[test]
     fn ide_scan_switch_excludes_only_the_two_ide_sources() {
         let dir = temp_dir("ide-switch");
-        let marker = dir.join(".wb-switch").join("hook.sh");
-        let marker = marker.to_string_lossy().to_string();
+        let marker = quoted_marker(&dir);
         let registered = registered_settings(&marker);
 
         let cli_root = dir.join(".codebuddy");
@@ -2928,55 +3127,47 @@ mod tests {
         assert!(on.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
         assert!(on.covers(off), "开启是关闭的超集");
 
-        // 强制全量的边界：IDE 关闭时只能扫「hook 通路来源」。
-        assert!(ScanScope::ALL.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
-        assert!(ScanScope::HOOK_SOURCES.contains(ScanSource::Cli));
-        assert!(ScanScope::HOOK_SOURCES.contains(ScanSource::WorkBuddy(WbVariant::Ai)));
-        assert!(!ScanScope::HOOK_SOURCES.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
-        assert!(!ScanScope::HOOK_SOURCES.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
-
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 缓存失效分语义 + 保存配置的范围同步。
+    /// 缓存作废语义 + 保存配置的范围同步。
     ///
-    /// 本测试是唯一操作进程级 `SCAN_CACHE` / `FORCE_FULL_SCAN` 的测试：两者是全局静态，
-    /// 拆成多个测试会并行互相干扰。
+    /// 装 / 卸 hook 与开关类变更共用同一条：**只清缓存**，下一次扫描严格按请求的 scope 走。
+    /// 这里用一个 `NONE` 范围的请求证明「不再有任何强制全量」——它一个来源都不扫，
+    /// 因此可在单测里安全调用（不读真实日志），且扫描后缓存的 scope 就是 `NONE`。
+    ///
+    /// 本测试是唯一操作进程级 `SCAN_CACHE` 的测试：它是全局静态，拆成多个会并行互相干扰。
     #[test]
-    fn cache_clearing_semantics_and_config_scope_sync() {
+    fn cache_invalidation_keeps_the_next_scan_on_the_requested_scope() {
         let dir = temp_dir("cache-sync");
         std::fs::create_dir_all(&dir).expect("临时目录");
         let path = dir.join("rate_limit_config.json");
         crate::modules::config::save_rate_limit_config_at(&path, &json!({ "scanIdeLogs": true }))
             .expect("写入配置");
 
-        // ① 只清缓存（开关类变更）：缓存清掉，但不置「强制全量」。
+        // ① 装 / 卸 hook 后作废：缓存被清掉。
         *SCAN_CACHE.lock().unwrap() = Some(ScanCache {
             at: 1,
             scope: ScanScope::ALL,
             entries: Vec::new(),
         });
-        FORCE_FULL_SCAN.store(false, Ordering::SeqCst);
-        clear_scan_cache();
-        assert!(SCAN_CACHE.lock().unwrap().is_none(), "缓存必须清掉");
-        assert!(
-            !FORCE_FULL_SCAN.load(Ordering::SeqCst),
-            "开关类变更不得强制全量扫"
-        );
-
-        // ② 装 / 卸 hook 的 invalidate：清缓存 + 强制全量。
         invalidate_scan_cache();
-        assert!(SCAN_CACHE.lock().unwrap().is_none());
-        assert!(
-            FORCE_FULL_SCAN.load(Ordering::SeqCst),
-            "装 / 卸 hook 仍强制全量一次"
+        assert!(SCAN_CACHE.lock().unwrap().is_none(), "缓存必须清掉");
+
+        // ② 下一次扫描按请求的 scope 走，不会被放大成「全来源」。
+        let (at, entries) = cached_scan(ScanScope::NONE, 1_000_000, true);
+        assert_eq!(at, 1_000_000);
+        assert!(entries.is_empty(), "NONE 范围不扫任何来源");
+        assert_eq!(
+            SCAN_CACHE.lock().unwrap().as_ref().map(|c| c.scope),
+            Some(ScanScope::NONE),
+            "缓存记录的必须是请求的范围，不是全量"
         );
 
-        // ③ 保存配置：`scanIdeLogs` 变化才清缓存；其它字段变化不动缓存，也不置标志。
-        FORCE_FULL_SCAN.store(false, Ordering::SeqCst);
+        // ③ 保存配置：`scanIdeLogs` 变化才作废缓存；其它字段变化不动缓存。
         *SCAN_CACHE.lock().unwrap() = Some(ScanCache {
             at: 1,
-            scope: ScanScope::ALL,
+            scope: ScanScope::NONE,
             entries: Vec::new(),
         });
         save_rate_limit_config_at(&path, &json!({ "scanIdeLogs": true, "enabled": false }))
@@ -2992,16 +3183,31 @@ mod tests {
             SCAN_CACHE.lock().unwrap().is_none(),
             "scanIdeLogs 变化必须清缓存"
         );
-        assert!(
-            !FORCE_FULL_SCAN.load(Ordering::SeqCst),
-            "保存配置只清缓存，不强制全量"
-        );
         assert_eq!(
             crate::modules::config::load_rate_limit_config_at(&path)
                 .get("scanIdeLogs")
                 .and_then(Value::as_bool),
             Some(false)
         );
+
+        // ④ 装 / 卸 hook 的作废同样不改变范围判定：已注册 hook 的来源不会因为「刚装过 hook」
+        //    被带回来（没有强制全量，也没有接入前的历史补扫）——首次查询、重启、缓存过期
+        //    都由同一条 `scan_scope` 计算覆盖。
+        let root = temp_dir("cache-sync-scope");
+        let marker = quoted_marker(&root);
+        let cli_root = root.join(".codebuddy");
+        std::fs::create_dir_all(&cli_root).expect("CLI 数据根");
+        std::fs::write(
+            cli_root.join(SETTINGS_FILE_NAME),
+            registered_settings(&marker),
+        )
+        .expect("CLI 配置");
+        invalidate_scan_cache();
+        assert!(
+            !scan_scope(&scan_roots_for(&root, &marker), true).contains(ScanSource::Cli),
+            "已注册 hook 的来源始终不扫日志"
+        );
+        std::fs::remove_dir_all(&root).ok();
 
         std::fs::remove_dir_all(&dir).ok();
     }

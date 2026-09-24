@@ -3,12 +3,13 @@
 //! 路由设计对应 Python 版 server.py 与桌面端 commands.rs。仅绑定 127.0.0.1，
 //! token 不出本机。
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 #[cfg(target_os = "windows")]
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::RawQuery;
+use axum::extract::{Query, RawQuery};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,9 +19,9 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
-    credit_usage, credits, export_import, limits, oauth, process, rate_limit_events,
+    credit_usage, credits, export_import, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
-    variant::WbVariant,
+    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -80,6 +81,14 @@ pub fn router() -> Router {
         .route("/api/codebuddy-ide/status", get(api_codebuddy_ide_status))
         .route("/api/codebuddy-ide/switch", post(api_codebuddy_ide_switch))
         .route("/api/codebuddy-ide/detect", post(api_codebuddy_ide_detect))
+        .route("/api/vscode-ext/status", get(api_vscode_ext_status))
+        .route("/api/vscode-ext/sessions", get(api_vscode_ext_sessions))
+        .route("/api/vscode-ext/switch", post(api_vscode_ext_switch))
+        .route("/api/vscode-ext/detect", post(api_vscode_ext_detect))
+        .route(
+            "/api/vscode-ext/session-links",
+            post(api_vscode_ext_session_links_preview),
+        )
         .route("/api/delete", post(api_delete))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
@@ -95,6 +104,10 @@ pub fn router() -> Router {
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/copy", post(api_copy_sessions))
+        .route(
+            "/api/session-links/preview",
+            post(api_session_links_preview),
+        )
         .route("/api/checkin/status", get(api_checkin_status))
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
@@ -123,9 +136,10 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        .route("/api/notifications", get(api_notifications))
+        .route("/api/notifications/record", post(api_record_notification))
+        .route("/api/notifications/clear", post(api_clear_notifications))
         .route("/api/travel/status", get(api_travel_status))
-    .route("/api/sessions/dedup", post(api_dedup_sessions))
-    .route("/api/sessions/collapse", post(api_collapse_sessions))
         .route(
             "/api/travel/config",
             get(api_travel_config).post(api_save_travel_config),
@@ -175,13 +189,13 @@ fn body_variant(body: &Value) -> WbVariant {
 async fn api_status(RawQuery(query): RawQuery) -> Response {
     let variant = query_variant(query.as_deref());
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().map(|a| {
+    let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        })
+        Some(json!({
+            "uid": account::display_value(&acct, "uid"),
+            "nickname": account::display_value(&acct, "nickname"),
+            "email": account::display_value(&acct, "email"),
+        }))
     });
     json_ok(json!({
         "running": cached_workbuddy_running(variant),
@@ -255,6 +269,103 @@ async fn api_codebuddy_cn_ide_detect() -> Response {
     }
 }
 
+async fn api_vscode_ext_status() -> Response {
+    json_ok(vscode_ext::status())
+}
+
+/// GET /api/vscode-ext/sessions —— 当前 VS Code 扩展账号可复制的会话（未登录返回空列表）。
+async fn api_vscode_ext_sessions() -> Response {
+    let result = tokio::task::spawn_blocking(|| match vscode_ext::active_ext_uid() {
+        Some(uid) => vscode_session::list_vscode_sessions(&uid),
+        None => json!({ "sourceUid": null, "sessions": [], "skipped": 0 }),
+    })
+    .await;
+    match result {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // 默认重启（= 自动关闭并重开）：VS Code 运行时由后端先优雅退出再写入。
+    // 显式传 restart=false 时退回「请先完全退出 VS Code」的手动模式。
+    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(true);
+    // 可选：切换前把勾选会话复制到目标账号（与 /api/vscode-ext/* 命名风格一致）。
+    // 任一条目非法即整包拒绝（与 Tauri 侧 `Option<Vec<CopyItem>>` 的 serde 整包报错同形），
+    // 避免「部分成功 + 静默丢弃」让用户误以为全部复制成功。
+    let copy_items: Vec<vscode_session::CopyItem> = match body
+        .get("copySessions")
+        .and_then(|v| v.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .map(|item| serde_json::from_value::<vscode_session::CopyItem>(item.clone()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+    {
+        Ok(items) => items.unwrap_or_default(),
+        Err(error) => {
+            return json_err(
+                format!("copySessions 条目非法：{error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+
+    let result = if copy_items.is_empty() && sync_selections.is_empty() {
+        vscode_ext::switch_account(account_id, restart)
+    } else {
+        vscode_session::switch_vscode_ext_with_copy(
+            account_id,
+            restart,
+            &copy_items,
+            &sync_selections,
+        )
+    };
+    match result {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/vscode-ext/session-links —— 预览当前插件账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `vscode_session_links_preview` 同形：直接返回 core 的只读预览
+/// （`supported` / `storeStatus` / `groups`），每组的 `defaultChecked` 与 `availableModes`
+/// 是前端的勾选权限来源。
+async fn api_vscode_ext_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        vscode_session_sync::links_preview(&target)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 async fn api_codebuddy_ide_status() -> Response {
     json_ok(codebuddy_ide::status())
 }
@@ -275,12 +386,21 @@ async fn api_codebuddy_ide_switch(Json(body): Json<Value>) -> Response {
     }
 }
 
+async fn api_vscode_ext_detect() -> Response {
+    match vscode_ext::detect_current_account() {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn api_codebuddy_ide_detect() -> Response {
     match codebuddy_ide::detect_current_account() {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
 }
+
+
 
 async fn api_delete(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
@@ -439,6 +559,11 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
 
     {
         let mut running = SWITCH_RUNNING.lock().unwrap();
@@ -460,6 +585,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             restart,
             share_sessions,
             &copy_ids,
+            &sync_selections,
         )
     })
     .await;
@@ -516,32 +642,62 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     };
     // 档位取目标账号自身（源 uid 也从该档位的登录态读）。
     let variant = account::variant_of(&target);
-    let source_uid = session::current_user_uid(variant);
-    // 能力不满足时返回明确错误而不是空对象。
-    let copied = match session::copy_sessions_for_switch(&target, &session_ids) {
+    // 与桌面端同形：直接返回 core 的复制报告（copied / alreadyLinked / errors / needsRecovery）。
+    let mut report = match session::copy_sessions_for_switch(&target, &session_ids) {
         Ok(report) => report,
         Err(error) => {
             return json_err(error, StatusCode::BAD_REQUEST);
         }
     };
-    json_ok(json!({
-        "sourceUid": source_uid,
-        "targetUid": target.get("uid"),
-        "copied": copied,
-        "variant": variant.as_str(),
-    }))
+    report["variant"] = json!(variant.as_str());
+    json_ok(report)
+}
+
+/// POST /api/session-links/preview —— 预览当前账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `session_links_preview` 同形：直接返回 core 的只读预览（`supported` /
+/// `storeStatus` / `groups`），每组的 `defaultChecked` 与 `availableModes` 是前端的
+/// 勾选权限来源。`variant` 缺省取目标账号自身档位。
+async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = match body.get("variant").and_then(Value::as_str) {
+        Some(raw) => WbVariant::parse(Some(raw)),
+        None => account::variant_of(&target),
+    };
+    match session::session_links_preview(variant, &target) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 签到 / 保活
 // ---------------------------------------------------------------------------
 
-/// GET /api/checkin/status —— 全部账号的签到状态（每行带 `variant`，档位取账号自身）。
-async fn api_checkin_status() -> Response {
+/// GET /api/checkin/status —— 传 accountId 时只查询该账号；缺省保留旧批量响应。
+/// 两种形式都遵守单账号自动签到开关，避免展示状态时触发已关闭账号的请求。
+async fn api_checkin_status(Query(query): Query<HashMap<String, String>>) -> Response {
+    if let Some(id) = query.get("accountId") {
+        let Some(acc) = account::find_account(id) else {
+            return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+        };
+        let status = checkin::get_checkin_status_for_display(&acc).await;
+        return json_ok(checkin_status_item(&acc, status));
+    }
     let list = account::load_accounts();
     let mut items = Vec::new();
     for acc in &list {
-        let status = checkin::get_checkin_status(acc).await;
+        let status = checkin::get_checkin_status_for_display(acc).await;
         items.push(checkin_status_item(acc, status));
     }
     json_ok(json!({ "accounts": items }))
@@ -658,7 +814,7 @@ async fn api_rate_limit_config() -> Response {
 
 /// POST /api/rate-limits/config —— 保存限额监听配置。
 ///
-/// 与桌面端同语义：`scanIdeLogs` 变化时清扫描缓存（只清缓存、不强制全量）。
+/// 与桌面端同语义：`scanIdeLogs` 变化时作废扫描缓存，下一次按当前来源范围重算。
 async fn api_save_rate_limit_config(Json(body): Json<Value>) -> Response {
     let submitted = body.get("config").unwrap_or(&body);
     match limits::save_rate_limit_config(submitted) {
@@ -838,58 +994,6 @@ async fn static_handler(uri: Uri) -> Response {
     }
 }
 
-/// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
-async fn api_dedup_sessions(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if account_id.trim().is_empty() {
-        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let Some(target) = account::find_account(&account_id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    let uid = target
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if uid.is_empty() {
-        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let variant = account::variant_of(&target);
-    let result = session::dedup_sessions_for_user(variant, &uid);
-    json_ok(result)
-}
-
-/// POST /api/sessions/collapse —— 折叠指定账号下「同名/同目录」会话（软隐藏冗余）。
-async fn api_collapse_sessions(Json(body): Json<Value>) -> Response {
-    let account_id = body
-        .get("accountId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if account_id.trim().is_empty() {
-        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let Some(target) = account::find_account(&account_id) else {
-        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
-    };
-    let uid = target
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if uid.is_empty() {
-        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
-    }
-    let variant = account::variant_of(&target);
-    let result = session::collapse_sessions_for_user(variant, &uid);
-    json_ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{body_variant, checkin_status_item, query_variant};
@@ -948,6 +1052,18 @@ mod tests {
     }
 
     #[test]
+    fn web_checkin_status_preserves_exclusion_without_inventing_today_status() {
+        let item = checkin_status_item(
+            &json!({"id": "excluded"}),
+            json!({"ok": false, "result": "skipped", "reason": "auto_checkin_disabled"}),
+        );
+        assert_eq!(item["accountId"], "excluded");
+        assert_eq!(item["reason"], "auto_checkin_disabled");
+        assert_eq!(item["result"], "skipped");
+        assert!(item.get("todayCheckedIn").is_none());
+    }
+
+    #[test]
     fn web_checkin_status_row_carries_variant() {
         let item = checkin_status_item(
             &json!({"id": "ai-1", "variant": "ai"}),
@@ -956,5 +1072,36 @@ mod tests {
 
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/// GET /api/notifications —— 最近的应用内提示（新的在前，最多 100 条）。
+async fn api_notifications() -> Response {
+    match notifications::list() {
+        Ok(items) => json_ok(json!({ "items": items })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/notifications/record —— 记录一条提示（前端 toast 同步写一份）。
+async fn api_record_notification(Json(body): Json<Value>) -> Response {
+    let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let description = body.get("description").and_then(|v| v.as_str());
+    match notifications::record(level, title, description) {
+        Ok(()) => json_ok(json!({ "recorded": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/notifications/clear —— 清空通知存档。
+async fn api_clear_notifications() -> Response {
+    match notifications::clear() {
+        Ok(()) => json_ok(json!({ "cleared": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }

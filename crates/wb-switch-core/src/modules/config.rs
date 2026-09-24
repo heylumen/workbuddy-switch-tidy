@@ -285,9 +285,25 @@ pub fn clear_codebuddy_ide_app_cache() {
 // ---------------------------------------------------------------------------
 
 /// 默认签到配置。旧时间窗口字段仅为配置文件兼容保留，调度不再读取。
+///
+/// `enabled` 默认关闭：全新安装需用户在设置页显式开启；已有用户在
+/// [`load_checkin_config`] 中沿用历史默认（开启），升级不改其状态。
+/// `checkin_start` / `checkin_end` 为空串 = 不限制签到时间段（与改动前行为一致）。
 pub fn default_checkin_config() -> Value {
+    checkin_config_with_enabled(false)
+}
+
+/// 历史默认签到配置（`enabled: true`）：已有用户没有显式值时沿用。
+fn legacy_default_checkin_config() -> Value {
+    checkin_config_with_enabled(true)
+}
+
+fn checkin_config_with_enabled(enabled: bool) -> Value {
     json!({
-        "enabled": true,
+        "enabled": enabled,
+        "excluded_account_ids": [],
+        "checkin_start": "",
+        "checkin_end": "",
         "start_hour": 6,
         "end_hour": 12,
         "keepalive_days": 0,
@@ -295,13 +311,42 @@ pub fn default_checkin_config() -> Value {
     })
 }
 
-fn merge_checkin_config(input: &Value) -> Value {
-    let mut merged = default_checkin_config();
+/// 解析 `"HH:MM"` 本地时钟（允许 1–2 位时/分，如 `"9:5"`）。
+///
+/// 空串、多余字符、越界（`"24:00"` / `"23:60"`）一律返回 `None`。
+pub fn parse_clock(raw: &str) -> Option<(u32, u32)> {
+    let (hour, minute) = raw.split_once(':')?;
+    if !(1..=2).contains(&hour.len()) || !(1..=2).contains(&minute.len()) {
+        return None;
+    }
+    if !hour.bytes().all(|b| b.is_ascii_digit()) || !minute.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some((hour, minute))
+}
+
+/// 把 `input` 中的已知字段覆盖到 `merged`；缺失 / 非法字段保持 `merged` 原值。
+fn apply_checkin_config(merged: &mut Value, input: &Value) {
     let Some(map) = input.as_object() else {
-        return merged;
+        return;
     };
     if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
         merged["enabled"] = json!(enabled);
+    }
+    // 仅用稳定账号 id 排除自动签到；忽略无效项并去重，旧配置默认全部参与。
+    if let Some(ids) = map.get("excluded_account_ids").and_then(Value::as_array) {
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> = ids
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && seen.insert(*id))
+            .collect();
+        merged["excluded_account_ids"] = json!(ids);
     }
     for key in [
         "start_hour",
@@ -313,20 +358,50 @@ fn merge_checkin_config(input: &Value) -> Value {
             merged[key] = json!(value);
         }
     }
+    // 时间段保存归一化：合法值零填充后落盘，非法/非字符串归一为空串（= 不限制）。
+    for key in ["checkin_start", "checkin_end"] {
+        let normalized = map
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_clock)
+            .map(|(hour, minute)| format!("{hour:02}:{minute:02}"))
+            .unwrap_or_default();
+        merged[key] = json!(normalized);
+    }
+}
+
+/// 以新默认值为基线合并（保存路径）。
+fn merge_checkin_config(input: &Value) -> Value {
+    let mut merged = default_checkin_config();
+    apply_checkin_config(&mut merged, input);
     merged
 }
 
 /// 读取签到配置（缺失/损坏时合并默认值）。
+///
+/// 配置只在用户显式保存时落盘，「无配置文件」无法区分新老安装：按使用痕迹（配置文件
+/// 或签到日志）判定已有用户，没有显式值时沿用历史默认（开启）；全新安装默认关闭。
 pub fn load_checkin_config() -> Value {
-    let f = checkin_config_file();
-    if f.exists() {
-        if let Ok(text) = std::fs::read_to_string(&f) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                return merge_checkin_config(&value);
-            }
-        }
+    load_checkin_config_at(&checkin_config_file(), &checkin_logs_file())
+}
+
+fn load_checkin_config_at(config_path: &Path, logs_path: &Path) -> Value {
+    let input = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    resolve_checkin_config(input.as_ref(), config_path.exists() || logs_path.exists())
+}
+
+fn resolve_checkin_config(input: Option<&Value>, existing_install: bool) -> Value {
+    let mut merged = if existing_install {
+        legacy_default_checkin_config()
+    } else {
+        default_checkin_config()
+    };
+    if let Some(input) = input {
+        apply_checkin_config(&mut merged, input);
     }
-    default_checkin_config()
+    merged
 }
 
 /// 保存签到配置（只保留已知字段）。
@@ -494,23 +569,47 @@ pub fn add_checkin_log(entry: &Value) {
 // 派猫猫旅行配置 / 缓存
 // ---------------------------------------------------------------------------
 
-/// 默认自动旅行配置。
+/// 默认自动旅行配置（全新安装默认关闭）。
 pub fn default_travel_config() -> Value {
-    json!({ "enabled": true })
+    travel_config_with_enabled(false)
+}
+
+/// 历史默认自动旅行配置（`enabled: true`）：已有用户没有显式值时沿用。
+fn legacy_default_travel_config() -> Value {
+    travel_config_with_enabled(true)
+}
+
+fn travel_config_with_enabled(enabled: bool) -> Value {
+    json!({ "enabled": enabled })
 }
 
 /// 读取自动旅行配置（缺失/损坏时合并默认值）。
+///
+/// 与签到同理：配置只在显式保存时落盘，按使用痕迹（配置文件或旅行缓存）判定已有用户，
+/// 没有显式值时沿用历史默认（开启）；全新安装默认关闭。
 pub fn load_travel_config() -> Value {
-    let mut cfg = default_travel_config();
-    let f = travel_config_file();
-    if f.exists() {
-        if let Ok(text) = std::fs::read_to_string(&f) {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
-                if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
-                    cfg["enabled"] = json!(enabled);
-                }
-            }
-        }
+    load_travel_config_at(&travel_config_file(), &travel_cache_file())
+}
+
+fn load_travel_config_at(config_path: &Path, cache_path: &Path) -> Value {
+    let input = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    resolve_travel_config(input.as_ref(), config_path.exists() || cache_path.exists())
+}
+
+fn resolve_travel_config(input: Option<&Value>, existing_install: bool) -> Value {
+    let mut cfg = if existing_install {
+        legacy_default_travel_config()
+    } else {
+        default_travel_config()
+    };
+    if let Some(enabled) = input
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("enabled"))
+        .and_then(Value::as_bool)
+    {
+        cfg["enabled"] = json!(enabled);
     }
     cfg
 }
@@ -832,6 +931,8 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         eprintln!("[atomic] rename FAILED: {e}");
+        // rename 失败时清理临时文件，避免在目标目录残留 `<name>.tmp-*`。
+        let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
@@ -949,13 +1050,32 @@ pub async fn http_request_with_proxy(
                 serde_json::from_str(&text).unwrap_or_else(|_| {
                     json!({
                         "code": status.as_u16(),
-                        "message": text.chars().take(500).collect::<String>(),
+                        "message": normalize_error_body(&text),
                     })
                 })
             }
         }
         Err(e) => json!({"code": -1, "message": e.to_string()}),
     }
+}
+
+/// 非 JSON 错误响应体归一化：网关（openresty / APISIX 等）的 401/5xx 常返回
+/// 整页 HTML，原样截断会把 `<html>…` 整段塞进通知与界面卡片（issue #94）。
+/// HTML 提取 `<title>` 作为可读信息；其余保持原有的 500 字符截断。
+fn normalize_error_body(text: &str) -> String {
+    if text.trim_start().starts_with('<') {
+        let title = text
+            .split_once("<title>")
+            .and_then(|(_, rest)| rest.split_once("</title>"))
+            .map(|(title, _)| title.trim())
+            .unwrap_or_default();
+        return if title.is_empty() {
+            "服务端返回 HTML 错误页（无标题）".to_string()
+        } else {
+            format!("服务端返回 HTML 错误页：{title}")
+        };
+    }
+    text.chars().take(500).collect::<String>()
 }
 
 /// 通用 HTTP 请求，返回原始响应（状态码 + 响应头 + 响应体），可选是否跟随重定向。
@@ -1158,6 +1278,30 @@ pub async fn http_request_raw_timeout(
 mod tests {
     use super::*;
 
+    /// 回归 issue #94：网关 401 返回的整页 HTML 要归一化为可读信息，
+    /// 不能把 `<html>…` 原样塞进通知与界面卡片。
+    #[test]
+    fn normalize_error_body_extracts_html_title() {
+        let html = "<html>\n<head><title>401 Authorization Required</title></head>\n\
+                    <body>\n<center><h1>401 Authorization Required</h1></center>\n\
+                    <hr><center>openresty</center>\n</body>\n</html>\n";
+        assert_eq!(
+            normalize_error_body(html),
+            "服务端返回 HTML 错误页：401 Authorization Required"
+        );
+
+        assert_eq!(
+            normalize_error_body("<!DOCTYPE html><html><body>boom</body></html>"),
+            "服务端返回 HTML 错误页（无标题）"
+        );
+
+        // 非 HTML 错误体保持原有截断行为。
+        let plain = "plain gateway error";
+        assert_eq!(normalize_error_body(plain), plain);
+        let long = "x".repeat(600);
+        assert_eq!(normalize_error_body(&long).chars().count(), 500);
+    }
+
     fn local_timestamp_ms(year: i32, month: u32, day: u32, hour: u32) -> i64 {
         Local
             .with_ymd_and_hms(year, month, day, hour, 0, 0)
@@ -1167,15 +1311,236 @@ mod tests {
     }
 
     #[test]
-    fn auto_checkin_defaults_enabled_and_preserves_legacy_fields() {
+    fn auto_checkin_defaults_disabled_and_preserves_legacy_fields() {
         let cfg = default_checkin_config();
-        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(cfg["excluded_account_ids"], json!([]));
         assert_eq!(cfg.get("start_hour").and_then(Value::as_i64), Some(6));
         assert_eq!(cfg.get("end_hour").and_then(Value::as_i64), Some(12));
+
+        // 历史默认仍保留开启，供已有用户在读取路径上沿用。
+        let legacy = legacy_default_checkin_config();
+        assert_eq!(legacy.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            legacy.get("lazy_refresh_hours").and_then(Value::as_i64),
+            Some(24)
+        );
     }
 
     #[test]
-    fn auto_checkin_explicit_false_wins_and_invalid_value_uses_default() {
+    fn auto_checkin_exclusions_survive_config_roundtrip_and_global_toggle() {
+        let cfg = merge_checkin_config(&json!({
+            "enabled": true,
+            "excluded_account_ids": ["account-b", "account-a", "account-b", "", "  ", null, 42],
+            "checkin_start": "9:5",
+            "checkin_end": "12:00",
+            "keepalive_days": 7
+        }));
+        assert_eq!(
+            cfg["excluded_account_ids"],
+            json!(["account-b", "account-a"])
+        );
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let mut reloaded: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(merge_checkin_config(&reloaded), cfg);
+        reloaded["enabled"] = json!(false);
+        let disabled = merge_checkin_config(&reloaded);
+        assert_eq!(
+            disabled["excluded_account_ids"],
+            cfg["excluded_account_ids"]
+        );
+        assert_eq!(disabled["checkin_start"], "09:05");
+        assert_eq!(disabled["keepalive_days"], 7);
+    }
+
+    #[test]
+    fn auto_checkin_legacy_or_invalid_exclusions_default_to_empty() {
+        assert_eq!(
+            merge_checkin_config(&json!({}))["excluded_account_ids"],
+            json!([])
+        );
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!("account-a"),
+            json!({"id": "account-a"}),
+        ] {
+            assert_eq!(
+                merge_checkin_config(&json!({"excluded_account_ids": invalid}))
+                    ["excluded_account_ids"],
+                json!([])
+            );
+        }
+    }
+
+    #[test]
+    fn auto_checkin_exclusions_survive_usage_trace_defaults() {
+        let input = json!({"excluded_account_ids": ["account-a", "account-a", null]});
+        for existing_install in [false, true] {
+            let resolved = resolve_checkin_config(Some(&input), existing_install);
+            assert_eq!(resolved["enabled"], json!(existing_install));
+            assert_eq!(resolved["excluded_account_ids"], json!(["account-a"]));
+            // 保存已解析配置后，新老安装均保留开关状态和账号排除列表。
+            assert_eq!(merge_checkin_config(&resolved), resolved);
+        }
+    }
+
+    #[test]
+    fn checkin_default_follows_usage_trace() {
+        // 全新安装（无配置文件、无签到日志）：默认关闭。
+        let fresh = resolve_checkin_config(None, false);
+        assert_eq!(fresh.get("enabled").and_then(Value::as_bool), Some(false));
+
+        // 已有用户（签到日志即使用痕迹）：沿用历史默认开启，升级不改状态。
+        let existing = resolve_checkin_config(None, true);
+        assert_eq!(existing.get("enabled").and_then(Value::as_bool), Some(true));
+        // 痕迹只影响 enabled，其余字段仍与默认一致。
+        assert_eq!(
+            existing.get("lazy_refresh_hours").and_then(Value::as_i64),
+            Some(24)
+        );
+        assert_eq!(existing.get("checkin_start"), Some(&json!("")));
+
+        // 显式值优先于痕迹。
+        for existing_install in [false, true] {
+            let off = resolve_checkin_config(Some(&json!({"enabled": false})), existing_install);
+            assert_eq!(off.get("enabled").and_then(Value::as_bool), Some(false));
+            let on = resolve_checkin_config(Some(&json!({"enabled": true})), existing_install);
+            assert_eq!(on.get("enabled").and_then(Value::as_bool), Some(true));
+        }
+    }
+
+    #[test]
+    fn load_checkin_config_uses_usage_trace_files() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-checkin-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("auto_checkin_config.json");
+        let logs_path = dir.join("auto_checkin_logs.json");
+
+        // 两者皆无 → 全新安装，默认关闭。
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 只有签到日志（使用痕迹）→ 已有用户，保持开启。
+        std::fs::write(&logs_path, "[]").unwrap();
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式保存的 false 覆盖痕迹。
+        std::fs::write(&config_path, "{\"enabled\": false}").unwrap();
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 配置文件损坏但存在 → 仍按已有用户处理（不因损坏而改状态）。
+        std::fs::remove_file(&logs_path).unwrap();
+        std::fs::write(&config_path, "not-json").unwrap();
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn travel_default_follows_usage_trace() {
+        // 全新安装默认关闭，已有用户（旅行缓存痕迹）沿用开启。
+        assert_eq!(
+            resolve_travel_config(None, false)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_travel_config(None, true)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式值优先；非法值回落基线。
+        assert_eq!(
+            resolve_travel_config(Some(&json!({"enabled": false})), true)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_travel_config(Some(&json!({"enabled": true})), false)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_travel_config(Some(&json!({"enabled": "no"})), false)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn load_travel_config_uses_usage_trace_files() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-travel-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("auto_travel_config.json");
+        let cache_path = dir.join("travel_cache.json");
+
+        // 两者皆无 → 全新安装，默认关闭。
+        assert_eq!(
+            load_travel_config_at(&config_path, &cache_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 只有旅行缓存（使用痕迹）→ 已有用户，保持开启。
+        std::fs::write(&cache_path, "{}").unwrap();
+        assert_eq!(
+            load_travel_config_at(&config_path, &cache_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式保存的 false 覆盖痕迹。
+        std::fs::write(&config_path, "{\"enabled\": false}").unwrap();
+        assert_eq!(
+            load_travel_config_at(&config_path, &cache_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_checkin_explicit_value_wins_and_invalid_value_uses_default() {
+        // 保存路径（以新默认值为基线）：显式值原样保留，缺失/非法才回落默认。
+        let enabled = merge_checkin_config(&json!({"enabled": true, "keepalive_days": 7}));
+        assert_eq!(enabled.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            enabled.get("keepalive_days").and_then(Value::as_i64),
+            Some(7)
+        );
+
         let disabled = merge_checkin_config(&json!({"enabled": false, "keepalive_days": 7}));
         assert_eq!(
             disabled.get("enabled").and_then(Value::as_bool),
@@ -1187,9 +1552,89 @@ mod tests {
         );
 
         let corrupt = merge_checkin_config(&json!({"enabled": "no", "lazy_refresh_hours": null}));
-        assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(false));
         assert_eq!(
             corrupt.get("lazy_refresh_hours").and_then(Value::as_i64),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn parse_clock_accepts_short_forms_and_rejects_malformed_values() {
+        assert_eq!(parse_clock("22:00"), Some((22, 0)));
+        assert_eq!(parse_clock("9:5"), Some((9, 5)));
+        assert_eq!(parse_clock("00:00"), Some((0, 0)));
+        assert_eq!(parse_clock("23:59"), Some((23, 59)));
+
+        for raw in [
+            "24:00",     // 小时越界
+            "23:60",     // 分钟越界
+            "22",        // 缺分钟
+            "",          // 空串
+            "abc",       // 非数字
+            "22:00:00",  // 多余字符
+            "22:",       // 分钟为空
+            ":00",       // 小时为空
+            "-1:00",     // 符号
+            "+1:00",     // 符号
+            " 22:00",    // 前导空格
+            "22:00 ",    // 尾随空格
+            "０１:００", // 全角数字
+        ] {
+            assert_eq!(parse_clock(raw), None, "必须拒绝 {raw:?}");
+        }
+    }
+
+    #[test]
+    fn checkin_window_defaults_to_unset_and_normalizes_on_save() {
+        let defaults = default_checkin_config();
+        assert_eq!(defaults.get("checkin_start"), Some(&json!("")));
+        assert_eq!(defaults.get("checkin_end"), Some(&json!("")));
+
+        // 合法值零填充后落盘。
+        let merged = merge_checkin_config(&json!({
+            "checkin_start": "9:5",
+            "checkin_end": "23:30"
+        }));
+        assert_eq!(merged.get("checkin_start"), Some(&json!("09:05")));
+        assert_eq!(merged.get("checkin_end"), Some(&json!("23:30")));
+    }
+
+    #[test]
+    fn checkin_window_invalid_values_normalize_to_empty_and_keep_other_fields() {
+        // 缺失 → 空串。
+        let missing = merge_checkin_config(&json!({}));
+        assert_eq!(missing.get("checkin_start"), Some(&json!("")));
+        assert_eq!(missing.get("checkin_end"), Some(&json!("")));
+
+        // 非字符串 / 越界 / 格式错误 → 空串，不落盘未知值。
+        for bad in [json!(1234), json!(null), json!(true), json!("25:00")] {
+            let merged = merge_checkin_config(&json!({"checkin_start": bad}));
+            assert_eq!(
+                merged.get("checkin_start"),
+                Some(&json!("")),
+                "非法取值必须归一为空串: {bad:?}"
+            );
+        }
+
+        // 其它字段与旧时间窗口字段不受影响。
+        let merged = merge_checkin_config(&json!({
+            "checkin_start": "25:00",
+            "checkin_end": 1234,
+            "enabled": false,
+            "keepalive_days": 7,
+            "start_hour": 3,
+            "end_hour": 9
+        }));
+        assert_eq!(merged.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            merged.get("keepalive_days").and_then(Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(merged.get("start_hour").and_then(Value::as_i64), Some(3));
+        assert_eq!(merged.get("end_hour").and_then(Value::as_i64), Some(9));
+        assert_eq!(
+            merged.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)
         );
     }

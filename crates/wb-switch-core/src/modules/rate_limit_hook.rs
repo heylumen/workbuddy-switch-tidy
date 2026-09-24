@@ -50,8 +50,24 @@ const STORE_DIR_NAME: &str = ".wb-switch";
 // 平台脚本
 // ---------------------------------------------------------------------------
 
-/// 旧版 Windows 脚本名（`cmd /c` 形态，2026-09-18 弃用；安装/卸载时顺带清理其注册条目）。
+/// 旧版 Windows 脚本名（`cmd /c` 形态，2026-09-18 弃用；安装 / 卸载时顺带清理其注册条目）。
 const LEGACY_CMD_NAME: &str = "hook.cmd";
+
+/// 已知的旧版 sh 脚本正文（绝对路径化之前、依赖 `$HOME` 的那一份）。
+///
+/// 只用于**识别**：内容与它逐字节一致才允许升级重写 / 卸载删除。
+const LEGACY_SH_BODY: &str = "#!/bin/sh\npayload=$(cat)\nprintf '%s\\n' \"$payload\" >> \"$HOME/.wb-switch/hook-events.jsonl\"\nprintf '{}'\n";
+
+/// 已知的旧版 cmd 脚本正文（Windows 的 `cmd` + PowerShell 形态）。
+///
+/// 当时正文里不含任何待替换的绝对路径，因此逐字节匹配即可认出。
+const LEGACY_CMD_BODY: &str = concat!(
+    "@echo off\r\n",
+    "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$d=[Console]::In.ReadToEnd(); ",
+    "if ($d.Trim().Length -gt 0) { Add-Content -LiteralPath (Join-Path $env:USERPROFILE '.wb-switch\\hook-events.jsonl') ",
+    "-Value $d.TrimEnd() -Encoding UTF8 }\"\r\n",
+    "echo {}\r\n",
+);
 
 /// hook 脚本名：**全平台统一 sh**。Windows 的执行器是客户端自带的 PortableGit bash
 /// （与插件 hook 同款调用），实测 `cmd /c "..."` 在该环境里静默失败 —— spawn 成功但
@@ -65,16 +81,23 @@ fn script_name() -> &'static str {
 ///
 /// ⚠️ 事件文件路径在安装时**写死为绝对路径**，不依赖 `HOME` / `USERPROFILE`：
 /// hook 由各客户端自己的执行器拉起，运行环境不可控，环境变量并不可靠；
-/// 安装时一次解析，之后逐字节幂等。
+/// 安装时一次解析，之后逐字节幂等。路径统一经 [`shell_quote`] 转义：含空格 / 中文 /
+/// 单引号的合法路径都不能破坏引号配对（2026-09-20 审查实证：裸拼单引号会让
+/// `o'brien` 这类路径静默丢事件 —— stderr 报错、退出码 0、stdout 仍是 `{}`）。
 ///
-/// 一次 `cat` 读入 payload、一次 `printf` 追加（尽量单次 write，减少并发追加的
-/// 行内交错），最后必须回 `{}`——空 stdout 会被客户端当作 hook 失败。
-/// Windows 下统一正斜杠（MSYS bash 对 `C:/...` 原生支持；反斜杠在引号里是转义雷区）。
+/// 一次 `cat` 读入 payload、一次 `printf` 原样追加（尽量单次 write，减少并发追加的行内
+/// 交错），最后必须回 `{}`——空 stdout 会被客户端当作 hook 失败。
 fn script_body(events: &Path) -> String {
+    // Windows 下统一正斜杠（MSYS bash 对 `C:/...` 原生支持；反斜杠在引号里是转义雷区）。
     let sh_events = events.to_string_lossy().replace('\\', "/");
-    format!(
-        "#!/bin/sh\npayload=$(cat)\nprintf '%s\\n' \"$payload\" >> '{sh_events}'\nprintf '{{}}'\n"
-    )
+    [
+        "#!/bin/sh",
+        "payload=$(cat)",
+        &format!("printf '%s\\n' \"$payload\" >> {}", shell_quote(&sh_events)),
+        "printf '{}'",
+        "",
+    ]
+    .join("\n")
 }
 
 /// MSYS 风格路径：`C:\a\b` → `/c/a/b`（PortableGit bash 的原生形态，与插件 hook 一致）。
@@ -88,18 +111,28 @@ fn msys_path(script: &Path) -> String {
     }
 }
 
-/// 单引号包裹 shell 参数（路径可能含空格）。
+/// 注册命令里的脚本路径**实参形态**：Windows 走 MSYS 路径，其余平台原样。
+///
+/// marker 与注册命令都用它拼装，保证两侧逐字节一致。
+fn script_arg(script: &Path) -> String {
+    if cfg!(windows) {
+        msys_path(script)
+    } else {
+        script.to_string_lossy().to_string()
+    }
+}
+
+/// 单引号包裹 shell 参数（路径可能含空格 / 中文 / 单引号）。
+///
+/// 单引号按 POSIX 写法转义为 `'\''`：这是 marker 与注册命令共用的唯一形态。
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// hook 脚本的启动命令（写进三处 `settings.json` 的 `command`）。
 fn hook_command(script: &Path) -> String {
-    if cfg!(windows) {
-        format!("bash '{}'", msys_path(script))
-    } else {
-        format!("sh {}", shell_quote(&script.to_string_lossy()))
-    }
+    let interpreter = if cfg!(windows) { "bash" } else { "sh" };
+    format!("{interpreter} {}", shell_quote(&script_arg(script)))
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +157,18 @@ impl HookTarget {
     fn registered(&self, marker: &str) -> bool {
         settings_has_marker(&self.settings, marker)
     }
+}
+
+/// 既有 hook 脚本的归属：决定升级与卸载时动不动这个文件。
+enum ScriptOwnership {
+    /// 脚本不存在（全新接入）。
+    Absent,
+    /// 与当前模板逐字节一致：不需要任何动作。
+    Current,
+    /// 本工具的已知旧模板（[`LEGACY_SH_BODY`]）：升级时重写、卸载时删除都安全。
+    Outdated,
+    /// 内容未知（用户改过）：既不覆盖也不删除。
+    Foreign,
 }
 
 /// 本模块用到的全部路径（显式传入，便于单测注入）。
@@ -160,14 +205,24 @@ impl HookLayout {
         Self::under(&home_dir())
     }
 
-    /// 配置里的 marker：注册命令中实际出现的脚本路径形态
-    /// （Windows 下注册命令是 `bash '/c/...'`，marker 必须用同款 MSYS 形态才能 contains 命中）。
+    /// 配置里的 marker：注册命令中脚本路径的**原样形态**（含 [`shell_quote`] 的引号）。
+    ///
+    /// 必须与写进配置的 command 逐字节一致：否则含单引号 / 空格的路径会让
+    /// `contains(marker)` 失配 —— 判定为「未注册」后每次启动都会再追加一条条目。
+    /// Windows 的注册命令是 `bash '/c/...'`，marker 同样取 MSYS 形态。
     fn marker(&self) -> String {
-        if cfg!(windows) {
-            msys_path(&self.script)
-        } else {
-            self.script.to_string_lossy().to_string()
-        }
+        shell_quote(&script_arg(&self.script))
+    }
+
+    /// 旧版 `hook.cmd` 注册命令里使用的本工具脚本绝对路径。
+    ///
+    /// 迁移时只能按这条具体路径识别旧条目，不能用 `.wb-switch` / `hook.cmd`
+    /// 等宽泛片段认领第三方命令。
+    fn legacy_marker(&self) -> String {
+        self.script
+            .with_file_name(LEGACY_CMD_NAME)
+            .to_string_lossy()
+            .to_string()
     }
 
     /// 是否至少存在一处可接入的客户端（存在的数据根）。
@@ -184,12 +239,30 @@ impl HookLayout {
             .count()
     }
 
-    /// hook 是否已「装全」：脚本在，且每一处存在的客户端都注册了本工具条目。
+    /// 读一次脚本文件判断归属（脚本很小，不额外缓存）。
+    fn script_ownership(&self) -> ScriptOwnership {
+        let Ok(content) = std::fs::read_to_string(&self.script) else {
+            return ScriptOwnership::Absent;
+        };
+        if content == script_body(&self.events) {
+            return ScriptOwnership::Current;
+        }
+        if content == LEGACY_SH_BODY {
+            return ScriptOwnership::Outdated;
+        }
+        ScriptOwnership::Foreign
+    }
+
+    /// hook 是否已「装全」：脚本不是缺失 / 待升级，且每一处存在的客户端都注册了本工具条目。
     ///
-    /// 有客户端存在但一处都没装 / 只装了一半 / 脚本被删 → 都不算装全（启动时据此重装）。
+    /// 有客户端存在但一处都没装 / 只装了一半 / 脚本被删 / 脚本还是本工具的旧模板
+    /// → 都不算装全（启动时据此重装）。用户改过的脚本按「已接管」处理：
+    /// 启动时不去动它，避免反复重装与静默覆盖（升级 / 卸载同样只认本工具生成的正文）。
     fn fully_installed(&self) -> bool {
-        self.script.is_file()
-            && self.any_target_exists()
+        !matches!(
+            self.script_ownership(),
+            ScriptOwnership::Absent | ScriptOwnership::Outdated
+        ) && self.any_target_exists()
             && self
                 .targets
                 .iter()
@@ -236,9 +309,10 @@ fn read_settings(path: &Path) -> Option<Value> {
 }
 
 /// 条目是否属于本工具：嵌套格式里任一 command hook 的命令包含当前脚本路径。
-/// `include_legacy` = 同时认领旧版 `cmd /c …hook.cmd` 形态（仅用于**清理**：
-/// 存在性判定绝不能认旧形态，否则旧条目会挡住新脚本的自动迁移 —— 2026-09-18 实证）。
-fn entry_is_ours(entry: &Value, marker: &str, include_legacy: bool) -> bool {
+///
+/// `legacy_marker` 只在清理时传入，且必须是本工具旧 `hook.cmd` 的绝对路径；
+/// 存在性判定不认旧形态，否则旧条目会挡住新脚本的自动迁移 —— 2026-09-18 实证。
+fn entry_is_ours(entry: &Value, marker: &str, legacy_marker: Option<&str>) -> bool {
     entry
         .get("hooks")
         .and_then(Value::as_array)
@@ -250,9 +324,7 @@ fn entry_is_ours(entry: &Value, marker: &str, include_legacy: bool) -> bool {
                         .and_then(Value::as_str)
                         .is_some_and(|command| {
                             command.contains(marker)
-                                || (include_legacy
-                                    && command.contains(LEGACY_CMD_NAME)
-                                    && command.contains(STORE_DIR_NAME))
+                                || legacy_marker.is_some_and(|legacy| command.contains(legacy))
                         })
             })
         })
@@ -267,7 +339,7 @@ fn config_has_marker(root: &Value, marker: &str) -> bool {
                 hooks
                     .get(*event)
                     .and_then(Value::as_array)
-                    .is_some_and(|entries| entries.iter().any(|e| entry_is_ours(e, marker, false)))
+                    .is_some_and(|entries| entries.iter().any(|e| entry_is_ours(e, marker, None)))
             })
         })
 }
@@ -297,9 +369,15 @@ fn event_entries<'a>(root: &'a mut Value, event: &str) -> Result<&'a mut Vec<Val
 }
 
 /// 插入（已存在则更新）本工具在某个事件下的条目：先摘掉旧的同源条目，再追加一条。
-fn upsert_event(root: &mut Value, event: &str, command: &str, marker: &str) -> Result<(), String> {
+fn upsert_event(
+    root: &mut Value,
+    event: &str,
+    command: &str,
+    marker: &str,
+    legacy_marker: Option<&str>,
+) -> Result<(), String> {
     let entries = event_entries(root, event)?;
-    entries.retain(|entry| !entry_is_ours(entry, marker, true));
+    entries.retain(|entry| !entry_is_ours(entry, marker, legacy_marker));
     entries.push(json!({
         "matcher": "",
         "hooks": [{ "type": "command", "command": command }],
@@ -308,7 +386,7 @@ fn upsert_event(root: &mut Value, event: &str, command: &str, marker: &str) -> R
 }
 
 /// 移除本工具在全部已注册事件下的条目；空数组 / 空 `hooks` 对象一并摘掉。
-fn remove_event_entries(root: &mut Value, marker: &str) {
+fn remove_event_entries(root: &mut Value, marker: &str, legacy_marker: Option<&str>) {
     let Some(object) = root.as_object_mut() else {
         return;
     };
@@ -319,7 +397,7 @@ fn remove_event_entries(root: &mut Value, marker: &str) {
         let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
             continue;
         };
-        list.retain(|entry| !entry_is_ours(entry, marker, true));
+        list.retain(|entry| !entry_is_ours(entry, marker, legacy_marker));
         if list.is_empty() {
             hooks.remove(event);
         }
@@ -367,7 +445,7 @@ pub fn uninstall_hook() -> Result<Value, String> {
 /// 幂等、非阻塞、失败静默（下次启动重试）；返回是否改动了注册状态（调用方据此作废扫描缓存）。
 pub fn auto_install_on_startup() -> bool {
     let cfg = config::load_rate_limit_config();
-    let enabled = cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false); // 本 fork：默认 opt-in
+    let enabled = cfg.get("enabled").and_then(Value::as_bool).unwrap_or(false); // 本 fork：默认 opt-in（不自动改写其他客户端配置）
     let opt_out = cfg
         .get("hookOptOut")
         .and_then(Value::as_bool)
@@ -425,13 +503,14 @@ fn install_at(layout: &HookLayout) -> Result<Value, String> {
     write_script(layout)?;
     let command = hook_command(&layout.script);
     let marker = layout.marker();
+    let legacy_marker = layout.legacy_marker();
     let mut errors = Vec::new();
     for target in &layout.targets {
         // 只对**存在**的客户端写配置：不存在的数据根不创建目录 / 空 settings.json。
         if !target.exists() {
             continue;
         }
-        if let Err(error) = install_target(layout, target, &command, &marker) {
+        if let Err(error) = install_target(layout, target, &command, &marker, &legacy_marker) {
             errors.push(format!("{}：{error}", target.settings.display()));
         }
     }
@@ -442,17 +521,27 @@ fn install_at(layout: &HookLayout) -> Result<Value, String> {
     }
 }
 
+/// 写入 / 升级 hook 脚本。
+///
+/// - 已是当前模板 → 不写（避免重复安装改 mtime）；
+/// - 是本工具的已知旧模板 → 升级重写；
+/// - 内容未知（用户改过）→ **不覆盖**，返回错误让调用方明确报出。
 fn write_script(layout: &HookLayout) -> Result<(), String> {
+    match layout.script_ownership() {
+        ScriptOwnership::Current => return Ok(()),
+        ScriptOwnership::Foreign => {
+            return Err(format!(
+                "{} 不是本工具生成的脚本（可能已被手动修改），已保留原文件、未覆盖",
+                layout.script.display()
+            ));
+        }
+        ScriptOwnership::Absent | ScriptOwnership::Outdated => {}
+    }
     if let Some(parent) = layout.script.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("创建 {} 失败：{error}", parent.display()))?;
     }
-    let body = script_body(&layout.events);
-    // 内容一致就不写：避免重复安装改动 mtime，也避免与手动编辑过的脚本互相覆盖。
-    if std::fs::read_to_string(&layout.script).ok().as_deref() == Some(body.as_str()) {
-        return Ok(());
-    }
-    std::fs::write(&layout.script, body)
+    std::fs::write(&layout.script, script_body(&layout.events))
         .map_err(|error| format!("写入 {} 失败：{error}", layout.script.display()))
 }
 
@@ -461,6 +550,7 @@ fn install_target(
     target: &HookTarget,
     command: &str,
     marker: &str,
+    legacy_marker: &str,
 ) -> Result<(), String> {
     let original = std::fs::read_to_string(&target.settings).ok();
     let current = match &original {
@@ -474,16 +564,23 @@ fn install_target(
     let baseline = match &current {
         Some(root) => {
             let mut clean = root.clone();
-            remove_event_entries(&mut clean, marker);
+            remove_event_entries(&mut clean, marker, Some(legacy_marker));
             clean
         }
         None => json!({}),
     };
-    refresh_backup(layout, target, original.as_deref(), &baseline, marker)?;
+    refresh_backup(
+        layout,
+        target,
+        original.as_deref(),
+        &baseline,
+        marker,
+        legacy_marker,
+    )?;
 
     let mut root = current.unwrap_or_else(|| json!({}));
     for event in HOOK_EVENTS {
-        upsert_event(&mut root, event, command, marker)?;
+        upsert_event(&mut root, event, command, marker, Some(legacy_marker))?;
     }
     let content = pretty(&root);
     if original.as_deref() == Some(content.as_str()) {
@@ -503,6 +600,7 @@ fn refresh_backup(
     original: Option<&str>,
     baseline: &Value,
     marker: &str,
+    legacy_marker: &str,
 ) -> Result<(), String> {
     let backup = layout.backup_path(target);
     if let Some(parent) = backup.parent() {
@@ -518,7 +616,7 @@ fn refresh_backup(
             }
         }
         Some(text) => {
-            let raw_is_clean = !text.contains(marker);
+            let raw_is_clean = !text.contains(marker) && !text.contains(legacy_marker);
             if let Ok(existing) = std::fs::read_to_string(&backup) {
                 let same = serde_json::from_str::<Value>(&existing).ok().as_ref() == Some(baseline);
                 if same {
@@ -556,21 +654,24 @@ fn uninstall_and_opt_out(layout: &HookLayout, config_path: &Path) -> Result<Valu
 
 fn uninstall_at(layout: &HookLayout) -> Result<Value, String> {
     let marker = layout.marker();
+    let legacy_marker = layout.legacy_marker();
     let mut errors = Vec::new();
     for target in &layout.targets {
-        if let Err(error) = uninstall_target(layout, target, &marker) {
+        if let Err(error) = uninstall_target(layout, target, &marker, &legacy_marker) {
             errors.push(format!("{}：{error}", target.settings.display()));
         }
     }
-    // 脚本只在内容仍是本工具生成的那一份时删除；用户改过就保留，不做猜测。
-    if std::fs::read_to_string(&layout.script).ok().as_deref()
-        == Some(script_body(&layout.events).as_str())
-    {
+    // 脚本只在本工具生成的那一份（当前模板或已知旧模板）时删除；用户改过就保留，不做猜测。
+    if matches!(
+        layout.script_ownership(),
+        ScriptOwnership::Current | ScriptOwnership::Outdated
+    ) {
         let _ = std::fs::remove_file(&layout.script);
     }
-    // 旧版 cmd 脚本（2026-09-18 弃用）一并清理：内容是本工具生成的旧形态才删。
+    // 旧版 cmd 脚本（2026-09-18 弃用）一并清理，但**必须内容匹配已知生成版本**：
+    // 只看 `is_file()` 会把用户改写过的 hook.cmd 当作本工具产物删掉（2026-09-20 审查反例）。
     let legacy_script = layout.script.with_file_name(LEGACY_CMD_NAME);
-    if legacy_script.is_file() {
+    if std::fs::read_to_string(&legacy_script).is_ok_and(|content| content == LEGACY_CMD_BODY) {
         let _ = std::fs::remove_file(&legacy_script);
     }
     if errors.is_empty() {
@@ -580,7 +681,12 @@ fn uninstall_at(layout: &HookLayout) -> Result<Value, String> {
     }
 }
 
-fn uninstall_target(layout: &HookLayout, target: &HookTarget, marker: &str) -> Result<(), String> {
+fn uninstall_target(
+    layout: &HookLayout,
+    target: &HookTarget,
+    marker: &str,
+    legacy_marker: &str,
+) -> Result<(), String> {
     let Some(original) = std::fs::read_to_string(&target.settings).ok() else {
         return Ok(());
     };
@@ -588,7 +694,7 @@ fn uninstall_target(layout: &HookLayout, target: &HookTarget, marker: &str) -> R
         // 损坏的配置不动：宁可留着 marker，也不覆盖用户（或客户端）写坏的内容。
         return Ok(());
     };
-    remove_event_entries(&mut root, marker);
+    remove_event_entries(&mut root, marker, Some(legacy_marker));
     let cleaned = pretty(&root);
 
     if let Ok(bytes) = std::fs::read_to_string(layout.backup_path(target)) {
@@ -624,6 +730,49 @@ mod tests {
         HookLayout::under(&base)
     }
 
+    /// 路径里带空格 / 中文 / 单引号的临时主目录：这些都是合法且真实存在的用户目录形态。
+    fn awkward_layout() -> HookLayout {
+        let base = std::env::temp_dir().join(format!(
+            "wb switch 中文 o'brien {}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&base).expect("临时主目录");
+        HookLayout::under(&base)
+    }
+
+    /// 删除临时主目录（`HookLayout` 不持有 Drop，测试结束手动清理）。
+    fn cleanup(layout: &HookLayout) {
+        if let Some(base) = layout.script.parent().and_then(Path::parent) {
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    /// 真正执行生成的脚本：`sh <script>`，把 payload 从 stdin 喂进去，返回（stdout, stderr, 退出码）。
+    #[cfg(unix)]
+    fn run_script(script: &Path, payload: &str) -> (String, String, i32) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh 必须可用");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("写入 payload");
+        let output = child.wait_with_output().expect("等待脚本结束");
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.code().unwrap_or(-1),
+        )
+    }
+
     fn target<'a>(layout: &'a HookLayout, label: &str) -> &'a HookTarget {
         layout
             .targets
@@ -650,23 +799,56 @@ mod tests {
     #[test]
     fn script_body_appends_payload_and_always_returns_empty_object() {
         // 事件路径必须写死为绝对路径：执行器环境不可控，env 不可靠（2026-09-18 实证）。
-        let events = Path::new("/tmp/base").join(".wb-switch").join("hook-events.jsonl");
+        let events = Path::new("/tmp/base")
+            .join(".wb-switch")
+            .join("hook-events.jsonl");
         let body = script_body(&events);
         assert!(body.contains("hook-events.jsonl"), "{body}");
         assert!(!body.contains("USERPROFILE"), "不得依赖环境变量：{body}");
-        assert!(body.contains(events.to_string_lossy().replace('\\', "/").as_str()), "{body}");
+        assert!(!body.contains("$HOME"), "不得依赖环境变量：{body}");
+        // 路径必须经 shell_quote 包裹（含空格 / 中文 / 单引号都不能破坏重定向）。
+        assert!(
+            body.contains(&format!(
+                ">> {}",
+                shell_quote(&events.to_string_lossy().replace('\\', "/"))
+            )),
+            "{body}"
+        );
         assert!(body.trim_end().ends_with("printf '{}'"), "{body}");
+        // 不再注入 `_hookTs`：事件行就是原样 payload（模型归因只认当次 payload）。
+        assert!(!body.contains("_hookTs"), "{body}");
+        assert!(!body.contains("date"), "{body}");
     }
 
     #[test]
     fn hook_command_quotes_the_script_path() {
+        let interpreter = if cfg!(windows) { "bash" } else { "sh" };
         let path = Path::new("/Users/a b/.wb-switch/hook.sh");
-        if cfg!(windows) {
-            // MSYS 路径形态入参原样保留（非 C: 盘式路径不做转换）。
-            assert_eq!(hook_command(path), "bash '/Users/a b/.wb-switch/hook.sh'");
-        } else {
-            assert_eq!(hook_command(path), "sh '/Users/a b/.wb-switch/hook.sh'");
-        }
+        assert_eq!(
+            hook_command(path),
+            format!("{interpreter} '/Users/a b/.wb-switch/hook.sh'")
+        );
+        // 单引号路径按 POSIX 写法转义 —— 裸拼会破坏引号配对，事件被静默丢弃
+        // （2026-09-20 审查反例）。
+        let quoted = Path::new("/Users/o'brien/.wb-switch/hook.sh");
+        assert_eq!(
+            hook_command(quoted),
+            format!("{interpreter} '/Users/o'\\''brien/.wb-switch/hook.sh'")
+        );
+    }
+
+    /// marker 必须与注册命令里的路径形态逐字节一致：否则含引号的路径会判定为「未注册」，
+    /// 每次启动重复追加条目（2026-09-20 审查反例）。
+    #[test]
+    fn marker_matches_the_registered_command() {
+        let layout = awkward_layout();
+        let command = hook_command(&layout.script);
+        assert!(
+            command.contains(&layout.marker()),
+            "marker {} 必须命中命令 {command}",
+            layout.marker()
+        );
+        cleanup(&layout);
     }
 
     /// Windows 的注册命令用 bash + MSYS 路径（与插件 hook 同款）；
@@ -675,10 +857,190 @@ mod tests {
     #[cfg(windows)]
     fn hook_command_uses_bash_on_windows() {
         let path = Path::new(r"C:\Users\a b\.wb-switch\hook.sh");
+        assert_eq!(hook_command(path), "bash '/c/Users/a b/.wb-switch/hook.sh'");
+        let quoted = Path::new(r"C:\Users\o'brien\.wb-switch\hook.sh");
         assert_eq!(
-            hook_command(path),
-            "bash '/c/Users/a b/.wb-switch/hook.sh'"
+            hook_command(quoted),
+            "bash '/c/Users/o'\\''brien/.wb-switch/hook.sh'"
         );
+    }
+
+    /// 生成的脚本必须**真正跑得起来**：原样 append payload、stdout 恰好是 `{}`
+    /// （客户端据此判定 hook 成功）。只断言脚本文本包含路径是不够的。
+    #[cfg(unix)]
+    #[test]
+    fn generated_script_appends_the_payload_and_returns_empty_object() {
+        let layout = awkward_layout();
+        // 数据根存在 → `install_at` 会生成脚本并写入三处配置。
+        install_client(&layout, "codebuddy");
+        install_at(&layout).expect("安装");
+
+        let payload = json!({
+            "session_id": "s-1",
+            "transcript_path": "/tmp/projects/s-1.jsonl",
+            "hook_event_name": "Stop",
+            "model": "hy3",
+            "last_assistant_message": "429 您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置",
+        })
+        .to_string();
+        let (stdout, stderr, code) = run_script(&layout.script, &payload);
+        assert_eq!(stdout, "{}", "hook 必须回 `{{}}`（空 stdout 会被判失败）");
+        assert_eq!(code, 0, "stderr：{stderr}");
+        assert!(stderr.is_empty(), "路径转义正确时不该有 stderr：{stderr}");
+
+        let written = std::fs::read_to_string(&layout.events).expect("事件文件必须被写入");
+        assert_eq!(written, format!("{payload}\n"), "事件行必须是原样 payload");
+        // JSON 保真（引号 / 中文 / 空格都不被 shell 改写）。
+        let parsed: Value = serde_json::from_str(written.trim_end()).expect("事件行仍是合法 JSON");
+        assert_eq!(parsed["model"], "hy3");
+
+        // 大 payload（429 的完整助手消息可达数百 KB）同样一次写入、单行保真。
+        let big = json!({
+            "session_id": "s-2",
+            "model": "hy3",
+            "last_assistant_message": "429 ".repeat(150_000),
+        })
+        .to_string();
+        let (stdout, stderr, code) = run_script(&layout.script, &big);
+        assert_eq!(stdout, "{}");
+        assert_eq!(code, 0, "stderr：{stderr}");
+        let written = std::fs::read_to_string(&layout.events).expect("事件文件");
+        assert_eq!(written, format!("{payload}\n{big}\n"));
+
+        cleanup(&layout);
+    }
+
+    /// 单引号 / 空格 / 中文路径下安装必须幂等：marker 与注册命令形态一致，不会反复追加条目，
+    /// 并且脚本真的能写入事件文件（2026-09-20 审查：单引号路径曾静默丢事件）。
+    #[cfg(unix)]
+    #[test]
+    fn install_is_idempotent_for_awkward_paths_and_the_script_writes_events() {
+        let layout = awkward_layout();
+        install_client(&layout, "codebuddy");
+        write_settings(&target(&layout, "codebuddy").settings, "{}");
+
+        for _ in 0..2 {
+            install_at(&layout).expect("安装必须成功");
+        }
+        let root = read_settings(&target(&layout, "codebuddy").settings).expect("配置");
+        assert_eq!(
+            root["hooks"]["Stop"].as_array().expect("Stop 数组").len(),
+            1,
+            "含引号 / 空格的路径不得重复追加条目：{root}"
+        );
+        assert!(layout.fully_installed());
+
+        let payload = r#"{"session_id":"s-3","model":"hy3"}"#;
+        let (stdout, _, _) = run_script(&layout.script, payload);
+        assert_eq!(stdout, "{}");
+        assert_eq!(
+            std::fs::read_to_string(&layout.events).expect("事件文件"),
+            format!("{payload}\n")
+        );
+
+        cleanup(&layout);
+    }
+
+    /// 旧模板升级 / 用户改过的脚本保护：
+    /// - 已知旧模板（依赖 `$HOME` 的 sh 脚本）→ 安装时升级为当前模板；
+    /// - 内容未知（用户改过）→ 安装不覆盖、卸载不删除，并明确报错。
+    #[test]
+    fn install_upgrades_known_templates_and_never_overwrites_user_edits() {
+        let layout = layout();
+        install_client(&layout, "codebuddy");
+        std::fs::create_dir_all(layout.script.parent().expect("store")).expect("store 目录");
+
+        // ① 已知旧模板 → 升级。
+        std::fs::write(&layout.script, LEGACY_SH_BODY).expect("写旧脚本");
+        install_at(&layout).expect("旧模板升级必须成功");
+        assert_eq!(
+            std::fs::read_to_string(&layout.script).expect("脚本"),
+            script_body(&layout.events),
+            "已知旧模板必须升级为当前模板"
+        );
+
+        // ② 用户改过的脚本 → 不覆盖、不删除，并报出。
+        let mine = "#!/bin/sh\necho mine\n";
+        std::fs::write(&layout.script, mine).expect("写用户脚本");
+        let error = install_at(&layout).expect_err("未知内容不得静默覆盖");
+        assert!(error.contains("未覆盖"), "{error}");
+        assert_eq!(std::fs::read_to_string(&layout.script).expect("脚本"), mine);
+        // 「已接管」的脚本不再触发自动重装。
+        assert!(
+            !auto_install_at(&layout, true, false),
+            "用户改过的脚本按已接管处理，不反复重装"
+        );
+        uninstall_at(&layout).expect("卸载");
+        assert_eq!(
+            std::fs::read_to_string(&layout.script).expect("脚本仍应保留"),
+            mine
+        );
+    }
+
+    /// 旧版 `hook.cmd` 只在**内容匹配已知生成版本**时清理；用户改写过的必须保留
+    /// （2026-09-20 审查反例：仅凭 `is_file()` 无条件删除）。
+    #[test]
+    fn legacy_cmd_script_is_removed_only_when_it_matches_the_known_template() {
+        let layout = layout();
+        let legacy = layout.script.with_file_name(LEGACY_CMD_NAME);
+        std::fs::create_dir_all(layout.script.parent().expect("store")).expect("store 目录");
+
+        std::fs::write(&legacy, LEGACY_CMD_BODY).expect("写旧 cmd 脚本");
+        uninstall_at(&layout).expect("卸载");
+        assert!(!legacy.exists(), "本工具生成的旧 cmd 脚本随卸载清理");
+
+        let mine = "@echo off\r\necho mine\r\n";
+        std::fs::write(&legacy, mine).expect("写用户 cmd 脚本");
+        uninstall_at(&layout).expect("卸载");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("用户脚本必须保留"),
+            mine
+        );
+
+        cleanup(&layout);
+    }
+
+    #[test]
+    fn legacy_migration_only_removes_the_current_tools_hook_command() {
+        let layout = layout();
+        let codebuddy = target(&layout, "codebuddy");
+        let legacy = format!("cmd /c \"{}\"", layout.legacy_marker());
+        let current = hook_command(&layout.script);
+        let third_party = format!(
+            "cmd /c \"{}-third-party/hook.cmd\"",
+            layout.script.parent().expect("store").display()
+        );
+        write_settings(
+            &codebuddy.settings,
+            &json!({
+                "hooks": {
+                    "Stop": [
+                        { "matcher": "", "hooks": [{ "type": "command", "command": legacy }] },
+                        { "matcher": "", "hooks": [{ "type": "command", "command": third_party }] },
+                    ]
+                }
+            })
+            .to_string(),
+        );
+
+        install_at(&layout).expect("安装必须成功");
+
+        let root = read_settings(&codebuddy.settings).expect("配置");
+        let stop = root["hooks"]["Stop"].as_array().expect("Stop 数组");
+        assert_eq!(stop.len(), 2, "旧条目应替换为当前条目，第三方条目保留");
+        assert!(
+            stop.iter().any(|entry| {
+                entry["hooks"][0]["command"].as_str() == Some(third_party.as_str())
+            }),
+            "第三方 hook 不得被迁移逻辑认领"
+        );
+        assert!(
+            stop.iter()
+                .any(|entry| entry["hooks"][0]["command"].as_str() == Some(current.as_str())),
+            "本工具旧 hook 应替换为当前命令"
+        );
+
+        cleanup(&layout);
     }
 
     #[test]
@@ -748,10 +1110,7 @@ mod tests {
 
         install_at(&layout).expect("安装");
         let installed = read_settings(&target(&layout, "codebuddy").settings).expect("已安装");
-        assert!(config_has_marker(
-            &installed,
-            &layout.marker()
-        ));
+        assert!(config_has_marker(&installed, &layout.marker()));
 
         uninstall_at(&layout).expect("卸载");
         for label in ["codebuddy", "workbuddy", "workbuddy-ai"] {

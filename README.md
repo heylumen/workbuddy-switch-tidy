@@ -1,199 +1,128 @@
 # workbuddy-switch-tidy
 
-WorkBuddy（腾讯 AI 编程助手）多账号切换工具。
 
-本项目 fork 自 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch)，在保留上游全部功能的基础上，修复了多账号使用场景中的若干实际问题。
+> **本仓库是 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 的定制分支（品牌 Switch Tidy）**，持续跟随上游更新，并额外包含：
+>
+> - **会话整理**：一键「清理重复会话」（按工作目录 + 正文一致去重）与「折叠同名会话」（软隐藏冗余、数据保留）
+> - **限额台账独立页**：集中查看频率限制记录、重置时间与倒计时
+> - **接入客户端 hook 默认关闭**（opt-in）：不自动改写其他客户端配置
+>
+> 版本号独立于上游（当前 **1.0.8**，对应上游 0.1.47）；升级入口直达本仓库 Release 下载页。
+WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号切换桌面 App（Tauri），四者均支持国内版 / 国际版，并提供积分到期与 Token 用量监控。
 
 <p align="center">
-  <img src="public/icon-transparent.png" alt="Switch Tidy 图标" width="128" />
+  <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
 </p>
 
-<p align="center">
-  <strong>workbuddy-switch-tidy</strong><br />
-  WorkBuddy 多账号切换工具
-</p>
+多账号共享登录态，一键切换 WorkBuddy 登录账号。**会话复制**：把当前账号的会话以新 id 复制给目标账号，源账号数据不受影响，云端归属目标账号。
 
----
+**在线演示（上游）**：[打开 GitHub Pages 演示](https://changexbc.github.io/workbuddy-switch/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用）
 
-## 下载
+## 快速开始
 
-### 桌面 App（Windows 单 EXE）
+前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台的安装包：
 
-前往 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 下载最新版：
-
-| 平台 | 文件 | 使用方式 |
+| 平台 | 安装包 | 安装方式 |
 | --- | --- | --- |
-| Windows x64 | `workbuddy-switch-tidy_<版本>.exe` | 双击直接运行，无需安装 |
+| macOS Apple Silicon（M 系列，arm64） | `workbuddy-switch_<版本>_aarch64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
+| macOS Intel（x86_64） | `workbuddy-switch_<版本>_x86_64.dmg` | 打开 DMG，将 `workbuddy-switch.app` 拖入「应用程序」 |
+| Windows x64 | `workbuddy-switch_<版本>_x64-setup.exe` | 运行安装程序并按提示完成安装 |
+| Linux x64 | `workbuddy-switch_<版本>_amd64.deb` / `workbuddy-switch_<版本>_amd64.AppImage` | Debian/Ubuntu 安装 `.deb`；其他发行版可给 AppImage 添加执行权限后直接运行 |
 
-**首次运行**：Windows SmartScreen 可能提示「Windows 已保护你的电脑」，点击「更多信息」→「仍要运行」即可。
-
-> 应用会自动检查 GitHub Releases 并提示新版本，但不做应用内自动下载安装；升级时请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载新版本替换。
-
-### npm / webui（跨平台）
-
-macOS / Linux 暂无预编译 EXE，可通过 npm 使用：
+macOS 首次启动若提示无法验证开发者，先在 Finder 中按住 Control 点击应用并选择「打开」，或前往「系统设置 → 隐私与安全性」选择「仍要打开」。仅当安装包来自上述官方 Releases、且系统仍提示「已损坏」时，再执行：
 
 ```bash
-npm i -g workbuddy-switch
-workbuddy-switch              # 启动 WebUI 服务 + 自动打开浏览器
-workbuddy-switch status       # 终端查看当前账号
+xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 ```
 
-webui 界面与桌面 App 一致。
+应用能启动但切换账号时提示无权限，请参阅下方 [macOS 权限说明](#macos-权限说明)。
 
----
+另有 npm / webui 版本可在浏览器中使用，见文末 [npm / webui 版本](#npm--webui-版本)。
 
 ## 功能
 
 | 模块 | 说明 |
 | --- | --- |
-| **WorkBuddy 国际版** | 国内版与国际版账号可同时管理，各自独立的数据目录与登录状态；国际版积分 / 用量 / IDE 切换均已支持；国际版不参与自动签到 |
-| 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
-| 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
-| 会话复制 | 将勾选会话复制给目标账号；**复制前自动去重**，目标已存在等价会话则跳过 |
-| 清理重复会话 | 按「工作目录 + jsonl 正文逐字一致」合并副本，每组保留最近更新的一条 |
-| 折叠同名会话 | 按「工作区 + 标题」收起视图冗余，专治切换账号反复复制导致的同名重复 |
-| 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；30 天签到日志 |
-| Token 保活 | 惰性刷新 + 每日保活，避免 refresh token 过期 |
-| 积分到期查询 | 查询各账号积分资源、剩余量与到期时间；7 天内到期高亮并按到期优先排序 |
-| 积分统计 | 汇总官方请求用量，展示每日趋势、模型分布、账号消耗与请求明细 |
-| Token 统计 | 分别查看 WorkBuddy 与 CodeBuddy CLI 的 Token 总览；输入、输出、缓存读写按 K/M/B 展示，趋势图同时呈现每日 Token 构成与调用次数，并提供构成占比、热力图、项目/模型 Top 10 和会话排行 |
-| 限额台账 | 扫描本地 429 频率限制日志（`~/.workbuddy/logs/`），展示限额历史表与当前仍在限额中的实时倒计时；账号/模型来自会话反查（仅供参考），数据完全来自本机日志、不调用接口 |
-| CodeBuddy CLI | 与 WorkBuddy 复用账号库，默认账号独立；Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置 |
-| CodeBuddy CN IDE | 向国内版桌面客户端注入 Safe Storage 凭证（`state.vscdb`）并重启 IDE；与 CodeBuddy CLI、国际版 CodeBuddy 相互独立 |
-| 自动轮换 | 后台定时把 CLI 后续启动账号设为积分最紧迫的账号 |
-| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问） |
-
-### 两个整理功能的区别
-
-| | 清理重复会话 | 折叠同名会话 |
-| --- | --- | --- |
-| 判定依据 | 工作目录相同 **且** 正文逐字一致 | 工作区 + 标题（同标题不同内容**也会折叠**） |
-| 处理对象 | 切换复制产生的完全相同的副本 | 同一对话被反复复制产生的同名冗余 |
-| 数据风险 | **较高**：会删除 jsonl 正文，不可恢复 | **低**：仅软隐藏，正文留盘可找回 |
-| 数据处理 | 软删除（标记 `deleted_at`）+ 删除正文 | 软隐藏（标记 `deleted_at`），**jsonl 正文原样留盘** |
-| 结果 | 列表中的重复项消失 | 左栏「空间 / 任务」每个同名分组只显示最新一份 |
-
-> 折叠之所以敢按「同标题」放宽，是因为它**不删正文**、随时可恢复；清理会真删文件，因此必须要求正文逐字一致才动手。
-
-> 两者都只作用于**所选账号**，都需**先关闭 WorkBuddy** 再执行。
-
----
+| 账号管理 | OAuth 扫码登录、导入导出账号、删除账号 |
+| 账号切换 | 一键切换 WorkBuddy 登录账号，切换过程实时显示进度 |
+| 会话复制 | 把当前账号勾选的会话复制给目标账号，源账号数据不受影响 |
+| 签到 | 全新安装默认关闭，可在设置页开启；支持按账号关闭，刷新时跳过并提示 |
+| 积分到期查询 | 自动查询每个账号的积分剩余量与到期时间；7 天内到期高亮，并按紧迫程度排序、标注「建议优先使用」 |
+| 积分统计 | 汇总官方请求用量：总览、近 30 天趋势、模型分类、账号消耗与请求明细 |
+| Token 统计 | 按来源查看 Token 总览与趋势，含构成占比、活跃热力图、项目/模型 Top 10 与会话排行 |
+| CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，默认账号独立；切换后立即生效，无需重启 CLI |
+| CodeBuddy IDE | 支持切换 CodeBuddy IDE 桌面客户端账号，与 CodeBuddy CLI 相互独立 |
+| VS Code CodeBuddy 插件 | 支持切换 VS Code 内的 CodeBuddy 插件账号；VS Code 运行时可自动关闭并在写入后重新打开 |
+| 插件会话复制 | 切换插件账号时，可把当前插件账号的会话复制给目标账号（加法，源账号不变） |
+| 自动轮换 | 后台把积分最紧迫的账号设为 CodeBuddy CLI 后续启动账号；检测到 CLI 会话运行时会跳过 |
+| 自动更新 | 从 GitHub Releases 检查新版本，整包更新经签名校验 |
+| 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
 
 ## 使用
 
-1. **添加账号**：账号页 →「扫码登录」或「从本机导入」「手动添加」
+1. **添加与导出账号**：账号页 →「OAuth 扫码登录」「导入本机账号」「导入备份」；「导出」可将勾选账号备份为 JSON
 2. **切换账号**：账号卡片 →「切换」，可勾选复制当前会话
-3. **查看积分**：账号页自动查询；点「刷新积分」手动更新，临期账号排最前并标记「建议优先」
-4. **整理重复会话**：点账号卡片右上角的 **⋮ 菜单**，选择「清理重复会话」或「折叠同名会话」（**执行前请关闭 WorkBuddy**）
-5. **CodeBuddy CLI**：账号页一键接入；切换只影响后续会话，当前会话需重新加载或重启 CLI
-6. **查看 Token 统计**：侧栏进入「Token 统计」，选择 WorkBuddy 或 CodeBuddy CLI，查看输入、输出、缓存读写与调用次数
-7. **查看限额台账**：侧栏进入「限额台账」，查看近期 429 频率限制记录、重置时间与当前仍在限额中的倒计时
-8. **CodeBuddy IDE**：账号卡片一键切换国内版 CodeBuddy CN IDE；首次使用前请先手动打开并登录一次，以生成 Keychain Safe Storage；切换会关闭并重启 IDE
-9. **更新版本**：应用会自动检查新版本并提示；升级请到 [Releases](https://github.com/heylumen/workbuddy-switch-tidy/releases/latest) 手动下载替换
-
----
+3. **查看积分与统计**：账号页自动查询各账号积分到期情况，点「刷新积分」手动更新；侧栏进入「积分统计」「Token 统计」查看用量明细
+4. **签到**：全新安装默认关闭，全局开关、按账号开关与日志位于设置页。关闭某账号的自动签到后，后台轮次、页面签到状态查询、刷新附带签到与「全部立即签到」（设置页 / 托盘）均忽略该账号，积分照常刷新并提示忽略数量；仅账号卡片的单账号「手动签到」不受影响
+5. **切换各客户端账号**：CodeBuddy CLI、CodeBuddy IDE、VS Code CodeBuddy 插件均可在账号卡片一键切换；其中 VS Code 插件支持在弹窗中勾选复制当前账号的会话。CodeBuddy IDE 首次使用前需先手动打开并登录一次
+6. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后按积分紧迫程度自动设置默认账号
+7. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载
 
 ## 界面预览
 
-### 账号管理
+### 管理 WorkBuddy 与 CodeBuddy 账号
 
-账号卡片集中展示登录状态、签到状态、积分余额与到期资源。临期积分直接标注在卡片内，并按紧迫程度优先排列。
+账号卡片集中展示登录状态、积分余额和到期资源，临期积分直接标注在对应卡片内，并按紧迫程度优先排列。
 
-<table>
-  <thead>
-    <tr><th>浅色模式</th><th>深色模式</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/accounts-overview-light.png" alt="账号管理页面（浅色模式，账号信息已脱敏）" /></td>
-      <td><img src="docs/images/accounts-overview-dark.png" alt="账号管理页面（深色模式，账号信息已脱敏）" /></td>
-    </tr>
-  </tbody>
-</table>
+![账号管理页面（账号信息已脱敏）](docs/images/accounts-overview.png)
 
 ### 积分统计
 
-展示官方请求用量、每日趋势、模型分布、账号消耗与请求明细，并明确标注数据来源与更新时间。
+积分统计页展示官方请求用量、每日趋势、模型分布、账号消耗和请求明细，数据来源与更新时间会明确显示。
 
-<table>
-  <thead>
-    <tr><th>浅色模式</th><th>深色模式</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/credit-statistics-light.png" alt="积分统计趋势页面（浅色模式）" /></td>
-      <td><img src="docs/images/credit-statistics-dark.png" alt="积分统计趋势页面（深色模式）" /></td>
-    </tr>
-  </tbody>
-</table>
-
-> 以上截图取自上游项目，功能与布局一致；本项目的侧边栏品牌名为 `Switch Tidy`。
+![积分统计页面](docs/images/credit-statistics.png)
 
 ### Token 统计
 
-按来源展示 Token 总览与每日趋势：输入、输出、缓存读写使用 K/M/B 紧凑单位，趋势图用堆叠柱表示每日 Token 总量与构成、虚线表示调用次数；同时提供 Token 构成占比、活跃热力图、项目/模型 Top 10 与会话排行，帮助快速定位主要消耗来源。
+Token 统计页按来源展示 Token 总览与趋势、构成占比、活跃热力图、项目/模型 Top 10 与会话排行。
 
-### 限额台账
+![Token 统计页面](docs/images/token-statistics.png)
 
-扫描本地 429 频率限制日志，概览卡展示当前仍在限额中的数量；「限额中」表格实时倒计时显示哪个账号的哪个模型还有多久解锁，「限额历史」保留近期全部触发记录。
+## macOS 权限说明
 
-<table>
-  <thead>
-    <tr><th>浅色模式</th><th>深色模式</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><img src="docs/images/limits-overview-light.png" alt="限额台账页面（浅色模式，演示数据）" /></td>
-      <td><img src="docs/images/limits-overview-dark.png" alt="限额台账页面（深色模式，演示数据）" /></td>
-    </tr>
-  </tbody>
-</table>
+切换账号需要写入 WorkBuddy 认证文件，macOS 要求授权「App 管理」（或「完全磁盘访问」）：
 
-> 限额台账为本 fork 新增功能，以上截图取自演示模式（脱敏演示数据）。
+1. 首次切换报「无权限」时，点「打开系统设置」
+2. 优先在 **App 管理** 里打开 workbuddy-switch 开关；若没有，则去 **完全磁盘访问** 把 workbuddy-switch 拖进带箭头的框
+3. 授权后重启本应用生效；设置页「权限检测」可随时验证
+
+## npm / webui 版本
+
+```bash
+npm i -g workbuddy-switch
+workbuddy-switch              # 启动本地服务 + 自动打开浏览器
+workbuddy-switch status       # 终端查看当前账号
+```
+
+界面与桌面 App 一致，功能覆盖上方全部模块。webui 模式下的 macOS 权限由启动服务的终端进程决定；若终端已授权完全磁盘访问则无需额外操作。
 
 ---
 
 ## 更新日志
 
-### v1.0.7（最新）
+### v1.0.8（最新）
+
+跟随上游 0.1.41 → 0.1.47：**修复 WorkBuddy 5.6 更新后打开白屏**（兼容本地加密信封）、新增 VS Code CodeBuddy 插件账号切换与会话复制、会话关联组与幂等复制、签到时间段随机与账号级签到开关、积分消耗占比、首屏兜底与错误边界、更新检查与安装统一到 Rust 侧（托盘新增更新入口）；Linux 密钥环与 CodeBuddy CN 发现修复。保留本 fork 定制：会话去重 / 折叠清理、限额台账独立页、hook 默认 opt-in。
+
+### v1.0.7
 
 修复桌面与任务栏图标白色底板、托盘图标显示与清晰度；修复限额台账多项问题（24 小时制日志漏读、hook 接入后历史限额消失、会话日志回显被误判、首条事件因 BOM 丢失、Windows 下 hook 不生效、模型归属错误）；「检查更新」改为并发竞速，显著加快。
-
-### v1.0.6
-
-支持 WorkBuddy 国际版（双档位账号管理、国际版积分/用量/IDE 切换）；限额台账升级（新增 CodeBuddy CLI/IDE 数据源与 hook 实时上报、账号卡片显示受限模型与恢复时刻）；积分统计按档位切换、积分包显示官方名称；Token 统计新增请求明细弹框；修复切换账号后限额错配、限额漏读跨天记录、CLI 切换状态不一致、macOS 多托盘图标等问题。
-
----
-
-## 从源码构建
-
-需要 Node.js 22+ 与 Rust 工具链（Windows 另需 MSVC Build Tools 与 WebView2）。
-
-```bash
-npm install
-npm run tauri build
-```
-
-产物位于 `target/x86_64-pc-windows-msvc/release/wb-switch-rust.exe`（Windows 目标实测路径；`target/release/` 下通常是同一产物）。
-
-> **最终用户侧**只需 Windows 10 1809+ / 11 与 **WebView2 Runtime**（Win11 和较新 Win10 已自带），无需安装 Node、Rust 或额外运行库；程序为便携单 EXE，直接运行即可。
-
----
-
-## 数据目录
-
-- 账号与配置：`~/.wb-switch/`
-- WorkBuddy 会话数据：`~/.workbuddy/`（国内版）、`~/.workbuddy-ai/`（国际版）
-
-> 本工具不改动数据表结构，仅在整理会话时标记会话可见性（`deleted_at`）。
-> ⚠️ 执行「清理重复会话」「折叠同名会话」等写库操作前，请务必关闭 WorkBuddy 客户端，避免 SQLite 锁冲突。
 
 ---
 
 ## 致谢
 
-- 上游项目 [changexbc/workbuddy-switch](https://github.com/changexbc/workbuddy-switch) 及 [Linux.do](https://linux.do) 社区
+感谢 [Linux.do](https://linux.do) 社区。
 
 ## 许可
 

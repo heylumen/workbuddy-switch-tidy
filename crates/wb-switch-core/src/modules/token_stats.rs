@@ -1000,6 +1000,19 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// 固定 fixture 的 mtime，让「原始会话先于副本被处理」的断言不依赖目录遍历顺序。
+    ///
+    /// Windows 上 `File::set_modified` 需要 `FILE_WRITE_ATTRIBUTES`，而 `File::open`
+    /// 只申请 `GENERIC_READ`——只读句柄改时间会得到 `os error 5`，故用可写句柄打开。
+    fn pin_mtime(path: std::path::PathBuf, mtime: std::time::SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open fixture for mtime")
+            .set_modified(mtime)
+            .expect("pin fixture mtime");
+    }
+
     #[test]
     fn usage_priority_aliases_and_raw_cache_write() {
         let value = json!({
@@ -1196,14 +1209,14 @@ mod tests {
         // iteration, which is not sorted. The copy would then be processed
         // first, own the replayed record, and leave the original with zero
         // records. Pin the mtimes so the original always precedes its copy.
-        std::fs::File::open(project.join("session-original.jsonl"))
-            .expect("open original fixture")
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
-            .expect("pin original mtime");
-        std::fs::File::open(project.join("session-forked.jsonl"))
-            .expect("open forked fixture")
-            .set_modified(std::time::SystemTime::now())
-            .expect("pin forked mtime");
+        pin_mtime(
+            project.join("session-original.jsonl"),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+        );
+        pin_mtime(
+            project.join("session-forked.jsonl"),
+            std::time::SystemTime::now(),
+        );
 
         let result = source(root.clone(), "fixture", None, false);
         // The replayed record counts once; the fork's new record still counts.
@@ -1567,14 +1580,14 @@ mod tests {
         )
         .expect("write forked fixture");
         // 与聚合去重用例相同：固定 mtime，保证原始会话先于副本被处理。
-        std::fs::File::open(project.join("session-original.jsonl"))
-            .expect("open original fixture")
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
-            .expect("pin original mtime");
-        std::fs::File::open(project.join("session-forked.jsonl"))
-            .expect("open forked fixture")
-            .set_modified(std::time::SystemTime::now())
-            .expect("pin forked mtime");
+        pin_mtime(
+            project.join("session-original.jsonl"),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+        );
+        pin_mtime(
+            project.join("session-forked.jsonl"),
+            std::time::SystemTime::now(),
+        );
 
         let result = source(root.clone(), "fixture", None, true);
         assert_eq!(result["summary"]["records"], 2);
@@ -1972,14 +1985,14 @@ mod tests {
         // 与 source_deduplicates_copied_session_history 同理：毫秒级 mtime 并列时
         // 顺序退化为 readdir，重放记录可能先被第二个根认领。pin 住 mtime 让
         // 原始会话先处理，断言才稳定。
-        std::fs::File::open(projects.join("session-original.jsonl"))
-            .expect("open original fixture")
-            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
-            .expect("pin original mtime");
-        std::fs::File::open(sessions.join("session-root-two.jsonl"))
-            .expect("open second-root fixture")
-            .set_modified(std::time::SystemTime::now())
-            .expect("pin second-root mtime");
+        pin_mtime(
+            projects.join("session-original.jsonl"),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+        );
+        pin_mtime(
+            sessions.join("session-root-two.jsonl"),
+            std::time::SystemTime::now(),
+        );
 
         let result = source_from_roots(
             &[projects.clone(), sessions.clone()],

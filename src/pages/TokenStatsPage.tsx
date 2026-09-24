@@ -1672,7 +1672,7 @@ export default function TokenStatsPage() {
               value="codebuddy-ide"
               disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
             >
-              CodeBuddy IDE
+              CodeBuddy IDE / VS Code CodeBuddy 插件
             </TabsTrigger>
           </TabsList>
         </Tabs>

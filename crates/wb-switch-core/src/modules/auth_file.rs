@@ -5,9 +5,9 @@
 //! write_account_to_auth_file）在阶段 2 随 switch.rs 落地。
 
 use serde_json::{json, Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::modules::account::get_str;
+use crate::modules::account::{get_str, secret_value};
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
 use crate::modules::variant::WbVariant;
 
@@ -37,11 +37,15 @@ pub fn workbuddy_app_path(variant: WbVariant) -> PathBuf {
 
 /// 读取认证文件 JSON；不存在或解析失败返回 None。
 pub fn read_auth_file(variant: WbVariant) -> Option<Value> {
-    let path = auth_file_path(variant);
+    read_auth_file_at(&auth_file_path(variant))
+}
+
+/// 读取指定路径的认证文件（单测注入临时登录态文件用）。
+pub fn read_auth_file_at(path: &Path) -> Option<Value> {
     if !path.exists() {
         return None;
     }
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -119,13 +123,15 @@ pub fn build_auth_obj(acc: &Value) -> Value {
     let expires_at = acc.get("expiresAt").and_then(|v| v.as_i64());
     let now = now_ms();
 
+    // token 可能是明文字符串或 WorkBuddy 5.6 加密信封：信封必须原样写回，
+    // 由 WorkBuddy 读取时自行解密（同一 keyblob）。降级为空串会静默毁掉登录态。
     obj.insert(
         "accessToken".to_string(),
-        get_str(acc, "access_token").unwrap_or_default().into(),
+        secret_value(acc, "access_token").unwrap_or_else(|| json!("")),
     );
     obj.insert(
         "refreshToken".to_string(),
-        get_str(acc, "refresh_token").unwrap_or_default().into(),
+        secret_value(acc, "refresh_token").unwrap_or_else(|| json!("")),
     );
     obj.insert("tokenType".to_string(), token_type.into());
     obj.insert(
@@ -228,16 +234,16 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
         return Err(e.to_string());
     }
 
-    // 写后校验
+    // 写后校验：按值比较（token 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封对象）
     let written: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let written_token = written
         .get("auth")
         .and_then(|a| a.get("accessToken"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let expect_token = get_str(acc, "access_token").unwrap_or_default();
+        .cloned()
+        .unwrap_or(Value::Null);
+    let expect_token = auth_obj.get("accessToken").cloned().unwrap_or(Value::Null);
     if written_token != expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
@@ -269,21 +275,24 @@ fn imported_account_from_root(root: Value, variant: WbVariant) -> Option<Value> 
 
     let uid = get_str(&root, "uid").or_else(|| get_str(&account_obj, "uid"));
     let uid = uid.or_else(|| get_str(&account_obj, "id"));
-    let nickname = get_str(&root, "nickname")
-        .or_else(|| get_str(&root, "name"))
-        .or_else(|| get_str(&account_obj, "nickname"))
-        .or_else(|| get_str(&account_obj, "label"));
+    // WorkBuddy 5.6 起 nickname/accessToken/refreshToken 可能是 `{$wbEncrypted, envelope}`
+    // 加密信封：这里必须原样保留（secret_value），不能 get_str 强转字符串——
+    // 否则 accessToken 取不到导致导入恒 400，切换写回时也会把信封覆盖成空串。
+    let nickname = secret_value(&root, "nickname")
+        .or_else(|| secret_value(&root, "name"))
+        .or_else(|| secret_value(&account_obj, "nickname"))
+        .or_else(|| secret_value(&account_obj, "label"));
     let email = get_str(&root, "email")
         .or_else(|| get_str(&account_obj, "email"))
         .or_else(|| get_str(&auth_obj, "email"));
-    let access_token = get_str(&auth_obj, "accessToken")
-        .or_else(|| get_str(&auth_obj, "access_token"))
-        .or_else(|| get_str(&root, "accessToken"))
-        .or_else(|| get_str(&root, "access_token"));
-    let refresh_token = get_str(&auth_obj, "refreshToken")
-        .or_else(|| get_str(&auth_obj, "refresh_token"))
-        .or_else(|| get_str(&root, "refreshToken"))
-        .or_else(|| get_str(&root, "refresh_token"));
+    let access_token = secret_value(&auth_obj, "accessToken")
+        .or_else(|| secret_value(&auth_obj, "access_token"))
+        .or_else(|| secret_value(&root, "accessToken"))
+        .or_else(|| secret_value(&root, "access_token"));
+    let refresh_token = secret_value(&auth_obj, "refreshToken")
+        .or_else(|| secret_value(&auth_obj, "refresh_token"))
+        .or_else(|| secret_value(&root, "refreshToken"))
+        .or_else(|| secret_value(&root, "refresh_token"));
     let token_type = get_str(&auth_obj, "tokenType")
         .or_else(|| get_str(&auth_obj, "token_type"))
         .unwrap_or_else(|| "Bearer".to_string());
@@ -405,6 +414,36 @@ mod tests {
         assert_eq!(account["nickname"], "同名用户");
         assert!(account["email"].is_null());
         assert_eq!(account["variant"], "cn");
+    }
+
+    /// 回归：`"accessToken": ""`（含纯空白）的登录态必须判为「没有 token」。
+    /// 修复前 `secret_value` 对空串返回 `Some("")`，`imported_account_from_root` 里
+    /// `access_token.is_none()` 的检查拦不住，导入会落库一条空凭据账号；
+    /// `/api/import-local` 也因此不再返回 400「未读取到本地 WorkBuddy 登录信息」。
+    #[test]
+    fn blank_access_token_is_not_imported() {
+        for blank in ["", "   ", "\t\n"] {
+            let imported = imported_account_from_root(
+                json!({
+                    "account": {"uid": "u-1", "nickname": "小明"},
+                    "auth": {"accessToken": blank, "refreshToken": "RT-1"}
+                }),
+                WbVariant::Cn,
+            );
+            assert!(imported.is_none(), "空 accessToken（{blank:?}）不得被导入");
+        }
+
+        // 加密信封不受影响：仍原样保留，切换写回依赖它。
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "enc"});
+        let imported = imported_account_from_root(
+            json!({
+                "account": {"uid": "u-1"},
+                "auth": {"accessToken": envelope.clone()}
+            }),
+            WbVariant::Cn,
+        )
+        .expect("加密信封 accessToken 必须可导入");
+        assert_eq!(imported["access_token"], envelope);
     }
 
     #[test]

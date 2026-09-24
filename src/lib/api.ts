@@ -4,6 +4,7 @@ import type {
   LimitsLedger,
   AccountMeta,
   AccountRecord,
+  AppNotification,
   AppStatus,
   AutoRotateConfig,
   CodeBuddyCliInstallResult,
@@ -17,7 +18,7 @@ import type {
   CreditExpiry,
   CreditStatistics,
   TokenStatistics,
-  CopyResult,
+  ErrorLogKind,
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
@@ -29,10 +30,18 @@ import type {
   RotateLog,
   RotateStatus,
   Session,
+  SessionCopyReport,
+  SessionLinksPreview,
+  SessionSyncSelection,
   SwitchResult,
   TravelConfig,
   TravelStatus,
   UpdateInfo,
+  UpdateSnapshot,
+  VscodeExtStatus,
+  VscodeExtSwitchResult,
+  VscodeSessionList,
+  VscodeSessionRef,
   WbVariant,
 } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
@@ -46,7 +55,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = "http://127.0.0.1:57890";
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_checkin_status",
+  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "list_vscode_sessions", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
@@ -90,6 +99,11 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
   switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  get_vscode_ext_status: { method: "GET", path: "/api/vscode-ext/status" },
+  list_vscode_sessions: { method: "GET", path: "/api/vscode-ext/sessions" },
+  switch_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/switch" },
+  vscode_session_links_preview: { method: "POST", path: "/api/vscode-ext/session-links" },
+  detect_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/detect" },
   get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
   switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
   detect_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/detect" },
@@ -104,6 +118,7 @@ const ROUTES: Record<string, Route> = {
   switch_account: { method: "POST", path: "/api/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
+  session_links_preview: { method: "POST", path: "/api/session-links/preview" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -119,6 +134,9 @@ const ROUTES: Record<string, Route> = {
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  list_notifications: { method: "GET", path: "/api/notifications" },
+  record_notification: { method: "POST", path: "/api/notifications/record" },
+  clear_notifications: { method: "POST", path: "/api/notifications/clear" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
   save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
@@ -261,6 +279,50 @@ export function detectCodebuddyCnIdeAccount(): Promise<{
   return call("detect_codebuddy_cn_ide_account");
 }
 
+export function getVscodeExtStatus(): Promise<VscodeExtStatus> {
+  return call("get_vscode_ext_status");
+}
+
+/** 列出当前 VS Code 扩展账号可复制的会话（未安装/未登录时返回空列表）。 */
+export function listVscodeSessions(): Promise<VscodeSessionList> {
+  return call("list_vscode_sessions");
+}
+
+/**
+ * 预览「当前 VS Code CodeBuddy 插件账号 → 目标账号」可同步的关联会话。
+ *
+ * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
+ */
+export function vscodeSessionLinksPreview(targetAccountId: string): Promise<SessionLinksPreview> {
+  return call("vscode_session_links_preview", { targetAccountId });
+}
+
+/**
+ * 切换 VS Code CodeBuddy 扩展账号。
+ *
+ * `restart` 默认 true：VS Code 运行时由后端先优雅退出、写入后再重新打开；
+ * 传 false 退回「请先完全退出 VS Code」的手动模式（不在编辑器中自动操作）。
+ * `syncSelections` 与 WorkBuddy 侧同形；只传它（不传 `copySessions`）也能执行同步。
+ */
+export function switchVscodeExtAccount(
+  accountId: string,
+  restart = true,
+  copySessions?: VscodeSessionRef[],
+  syncSelections?: SessionSyncSelection[],
+): Promise<VscodeExtSwitchResult> {
+  return call("switch_vscode_ext_account", { accountId, restart, copySessions, syncSelections });
+}
+
+export function detectVscodeExtAccount(): Promise<{
+  ok: boolean;
+  found: boolean;
+  matched?: boolean;
+  accountId?: string;
+  message?: string;
+}> {
+  return call("detect_vscode_ext_account");
+}
+
 export function getCodebuddyIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
   return call("get_codebuddy_ide_status");
 }
@@ -328,6 +390,7 @@ export function switchAccount(args: {
   restart?: boolean;
   shareSessions?: boolean;
   copySessionIds?: string[];
+  syncSelections?: SessionSyncSelection[];
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
@@ -345,11 +408,27 @@ export function listSessions(variant?: WbVariant): Promise<{
   return call("list_sessions", variantArgs(variant));
 }
 
+/** 把勾选会话复制到指定账号；返回 core 同形的复制报告（copied / alreadyLinked / errors）。 */
 export function copySessions(
   targetAccountId: string,
   sessionIds: string[],
-): Promise<{ sourceUid: string; targetUid: string; copied: CopyResult[] }> {
+): Promise<SessionCopyReport & { variant?: WbVariant }> {
   return call("copy_sessions", { targetAccountId, sessionIds });
+}
+
+/**
+ * 预览「当前账号 → 目标账号」可同步的关联会话（只读）。
+ *
+ * 默认勾选与可选模式都来自后端：前端只按 `defaultChecked` / `availableModes` 渲染，
+ * 不自行扩大权限。`variant` 缺省由后端取目标账号自身档位。
+ */
+export function sessionLinksPreview(
+  targetAccountId: string,
+  variant?: WbVariant,
+): Promise<SessionLinksPreview> {
+  const args: Record<string, unknown> = { targetAccountId };
+  if (variant === "ai") args.variant = variant;
+  return call("session_links_preview", args);
 }
 
 /** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
@@ -393,44 +472,15 @@ export function revealAppInFinder(): Promise<void> {
 
 export async function getCheckinStatus(accountId: string): Promise<{
   ok: boolean;
-  todayCheckedIn: boolean;
+  todayCheckedIn?: boolean;
+  result?: string;
+  reason?: string;
   error?: string;
   raw?: unknown;
   /** 该行所属档位（档位取账号自身）；缺省按国内版处理。 */
   variant?: WbVariant;
 }> {
-  if (demoModeEnabled) {
-    return screenshotDemoResponse("get_checkin_status", { accountId }) as {
-      ok: boolean;
-      todayCheckedIn: boolean;
-      error?: string;
-      raw?: unknown;
-    };
-  }
-  if (isWebui()) {
-    // webui 端为批量接口，按 accountId 过滤
-    const all = await httpCall<{
-      accounts: {
-        accountId: string;
-        email: string;
-        ok: boolean;
-        todayCheckedIn: boolean;
-        error?: string;
-        raw?: unknown;
-        variant?: WbVariant;
-      }[];
-    }>("get_checkin_status");
-    const one = all.accounts.find((a) => a.accountId === accountId);
-    return one
-      ? {
-          ok: one.ok,
-          todayCheckedIn: one.todayCheckedIn,
-          error: one.error,
-          raw: one.raw,
-          variant: one.variant,
-        }
-      : { ok: false, todayCheckedIn: false, error: "未找到账号" };
-  }
+  // 两个宿主都只查询目标账号；Web 端不再为每个账号重复请求整份列表。
   return call("get_checkin_status", { accountId });
 }
 
@@ -486,17 +536,18 @@ export function checkin(accountId: string): Promise<CheckinResult> {
 
 /**
  * 批量签到：不传档位时覆盖全部档位；显式传入时只处理该档位。
+ * 关闭自动签到的账号会被跳过，并逐账号返回 skipped 原因（设置页与托盘同样遵守）。
  *
  * 这里**不能**用 `variantArgs`：`checkin_all` 的缺省语义是「全部档位」，国内版若
  * 缺省不传参，账号页在国内版 Tab 触发的批量签到会打到国际版账号。显式下发 `cn`
  * 与改造前等价（改造前账号库里只有国内版账号）。
  */
 export function checkinAll(variant?: WbVariant): Promise<{
-  accounts: { accountId: string; email: string; result: string; error?: string; inactive?: boolean }[];
+  accounts: { accountId: string; email: string; result: string; error?: string; inactive?: boolean; reason?: string }[];
   status?: string;
   reason?: string;
 }> {
-  return call("checkin_all", variant ? { variant } : undefined);
+  return call("checkin_all", variant ? { variant } : {});
 }
 
 export function getAutoCheckinConfig(): Promise<CheckinConfig> {
@@ -602,6 +653,57 @@ export function relaunchApp(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 统一更新服务（桌面端；`update-state` 事件是阶段与进度的唯一来源）
+// ---------------------------------------------------------------------------
+
+/** 浏览器 / 演示模式没有更新服务：与弹窗既有文案逐字一致。 */
+const UPDATE_UNSUPPORTED_MESSAGE = "浏览器 webui 模式不能直接安装桌面更新包";
+
+/**
+ * 更新状态快照（前端首屏初始化；之后由 `update-state` 事件推送）。
+ *
+ * webui 没有更新服务、演示模式禁止真实下载，两者都回落到静态快照：
+ * 演示模式给「有新版」态，保证演示页 / 截图里的升级入口与外链完整。
+ */
+export function updateState(): Promise<UpdateSnapshot> {
+  if (demoModeEnabled) {
+    // 复用只读演示数据的版本号，避免版本号在两处硬编码。
+    const demo = screenshotDemoResponse("check_update") as UpdateInfo;
+    return Promise.resolve({
+      phase: "available",
+      latest: demo.latest ?? null,
+      percent: null,
+      message: null,
+      checkedAt: null,
+    });
+  }
+  if (isWebui()) {
+    return Promise.resolve({
+      phase: "idle",
+      latest: null,
+      percent: null,
+      message: null,
+      checkedAt: null,
+    });
+  }
+  return call("update_state");
+}
+
+/** 启动更新包下载（异步，立即返回；进度走 `update-state` 事件与托盘）。 */
+export function updateDownload(): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<unknown>("update_download").then(() => undefined);
+}
+
+/** 安装已下载的更新包并重启（用户点「重启以完成升级」时调用）。 */
+export function updateRestart(): Promise<void> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  if (isWebui()) return Promise.reject(new Error(UPDATE_UNSUPPORTED_MESSAGE));
+  return call<unknown>("update_restart").then(() => undefined);
+}
+
+// ---------------------------------------------------------------------------
 // 开机自启（仅桌面端；webui 不提供同名接口，卡片也不在 webui 渲染）
 // ---------------------------------------------------------------------------
 
@@ -675,4 +777,60 @@ export function collapseSessions(
   accountId: string,
 ): Promise<{ ok: boolean; removed: number; removedIds?: string[]; reason?: string }> {
   return call("collapse_sessions", { accountId });
+}
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/** 记录一条应用内提示（由 `lib/notify.ts` 统一调用；失败不影响提示本身）。 */
+export function recordNotification(
+  level: AppNotification["level"],
+  title: string,
+  description?: string,
+): Promise<{ recorded: boolean }> {
+  if (demoModeEnabled) return Promise.resolve({ recorded: false });
+  return call("record_notification", { level, title, description });
+}
+
+/** 读取最近的通知（新的在前，最多 100 条）。 */
+export function listNotifications(): Promise<{ items: AppNotification[] }> {
+  if (demoModeEnabled) return Promise.resolve({ items: [] });
+  return call("list_notifications");
+}
+
+/** 清空通知存档。 */
+export function clearNotifications(): Promise<{ cleared: boolean }> {
+  if (demoModeEnabled) return Promise.resolve({ cleared: false });
+  return call("clear_notifications");
+}
+
+// ---------------------------------------------------------------------------
+// 错误日志（前端崩溃 / 未捕获错误落盘，见 lib/error-report.ts）
+// ---------------------------------------------------------------------------
+
+/**
+ * 上报一条错误到本地错误日志（桌面端落盘 `~/.wb-switch/error.log`）。
+ *
+ * webui / 演示模式没有落盘通道：静默忽略（调用方的本地提示不受影响）。
+ */
+export function logError(kind: ErrorLogKind, message: string, detail?: string): Promise<void> {
+  if (demoModeEnabled || isWebui()) return Promise.resolve();
+  return call<unknown>("log_error", { kind, message, detail: detail ?? null }).then(
+    () => undefined,
+  );
+}
+
+/** 错误日志文件路径（设置页展示）。 */
+export function getErrorLogPath(): Promise<string> {
+  // 演示模式给一条与其它演示路径同风格的值，保证演示页 / 截图里界面完整。
+  if (demoModeEnabled) return Promise.resolve("/demo/.wb-switch/error.log");
+  // webui 没有落盘通道（不写服务端日志），设置页不展示路径。
+  if (isWebui()) return Promise.resolve("");
+  return call<string>("get_error_log_path");
+}
+
+/** 在文件管理器中定位错误日志（桌面端；日志尚未生成时由后端打开所在目录）。 */
+export function revealErrorLog(): Promise<void> {
+  if (demoModeEnabled || isWebui()) return Promise.resolve();
+  return call<unknown>("reveal_error_log").then(() => undefined);
 }

@@ -4,6 +4,7 @@ mod commands;
 mod instance_lock;
 #[cfg(desktop)]
 mod tray;
+mod update_service;
 
 use std::time::Duration;
 use tauri::Emitter;
@@ -35,7 +36,8 @@ pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json:
     }
 }
 
-/// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活；
+/// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
+/// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
     let rotate_app = app.clone();
@@ -47,7 +49,7 @@ fn spawn_background_loops(app: tauri::AppHandle) {
             modules::checkin::run_checkin_cycle(modules::checkin::CheckinCycleMode::StartupVerify)
                 .await;
         loop {
-            tokio::time::sleep(modules::checkin::CHECKIN_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(modules::checkin::next_cycle_delay()).await;
             let _ = modules::checkin::run_checkin_cycle(
                 modules::checkin::CheckinCycleMode::PeriodicRecovery,
             )
@@ -101,6 +103,11 @@ fn spawn_background_loops(app: tauri::AppHandle) {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
+
+    // 统一更新服务：首次 15 秒后检查一次，之后每 30 分钟（未带 force，走 core 的
+    // 6 小时缓存）。检查由 Rust 常驻，替代前端 30 分钟轮询：轻量模式 / 主窗口关闭时
+    // 同样在跑，托盘菜单随时反映最新阶段。
+    update_service::spawn_periodic_check(app.clone());
 
     // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`（CLI / WorkBuddy 的 429 当轮
     // 由客户端 hook 追加），入账后通知前端立即拉取。轻量模式下窗口销毁但进程仍在，
@@ -181,6 +188,11 @@ pub fn run() {
             commands::get_codebuddy_cn_ide_status,
             commands::switch_codebuddy_cn_ide_account,
             commands::detect_codebuddy_cn_ide_account,
+            commands::get_vscode_ext_status,
+            commands::switch_vscode_ext_account,
+            commands::detect_vscode_ext_account,
+            commands::list_vscode_sessions,
+            commands::vscode_session_links_preview,
             commands::get_codebuddy_ide_status,
             commands::switch_codebuddy_ide_account,
             commands::detect_codebuddy_ide_account,
@@ -197,6 +209,7 @@ pub fn run() {
             commands::copy_sessions,
             commands::dedup_sessions,
             commands::collapse_sessions,
+            commands::session_links_preview,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,
@@ -227,9 +240,18 @@ pub fn run() {
             commands::get_github_config,
             commands::save_github_config,
             commands::check_update,
+            commands::update_state,
+            commands::update_download,
+            commands::update_restart,
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
+            commands::record_notification,
+            commands::list_notifications,
+            commands::clear_notifications,
+            commands::log_error,
+            commands::get_error_log_path,
+            commands::reveal_error_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -140,7 +140,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
         </DialogHeader>
 
         {!loginId && !result && (
-          <div className="space-y-3">
+          <div className="space-y-3 pt-2">
             <Button onClick={start} disabled={busy} className="w-full">
               {busy ? "正在发起登录…" : copy.start}
             </Button>
@@ -166,7 +166,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
                   href={uri}
                   target="_blank"
                   rel="noreferrer"
-                  className="text-primary underline-offset-2 hover:underline"
+                  className="cursor-pointer text-primary underline-offset-2 hover:underline"
                   onClick={(e) => {
                     // WebUI 直接使用浏览器默认链接行为，确保即使自动弹窗被拦截
                     // 也能通过用户点击打开验证页。
@@ -205,14 +205,11 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
           </Alert>
         )}
 
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            关闭
-          </Button>
-          {result && (
+        {result && (
+          <DialogFooter>
             <Button onClick={() => onOpenChange(false)}>完成</Button>
-          )}
-        </DialogFooter>
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   );

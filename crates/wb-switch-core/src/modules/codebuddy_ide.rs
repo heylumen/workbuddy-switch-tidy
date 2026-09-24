@@ -15,7 +15,7 @@ use crate::modules::config::{
     atomic_write, clear_codebuddy_ide_app_cache, load_codebuddy_ide_app_cache, now_ms,
     save_codebuddy_ide_app_cache, store_dir,
 };
-use crate::modules::variant::WbVariant;
+use crate::modules::variant::{codebuddy_domain_for, WbVariant};
 // 复用 process 模块带并发管道读取的正确实现；本地轮询版会在子进程输出
 // 超过 64KB（如 `ps -axo pid=,args=`）时因管道写满而死锁到超时。
 use crate::modules::process;
@@ -95,7 +95,10 @@ pub fn build_session_json(acc: &Value) -> String {
     let enterprise_name = get_str(acc, "enterpriseName")
         .or_else(|| get_str(acc, "enterprise_name"))
         .unwrap_or_default();
-    let domain = get_str(acc, "domain").unwrap_or_default();
+    let domain = codebuddy_domain_for(
+        get_str(acc, "domain").unwrap_or_default().as_str(),
+        account::variant_of(acc),
+    );
     let refresh_token = get_str(acc, "refresh_token").unwrap_or_default();
     let access_token = get_str(acc, "access_token").unwrap_or_default();
     let token_type = get_str(acc, "token_type").unwrap_or_else(|| "Bearer".to_string());
@@ -978,8 +981,10 @@ pub fn launch_codebuddy_ide() -> Result<(), String> {
 pub fn status() -> Value {
     let data_dir = intl_data_dir();
     let db_path = intl_state_db_path();
-    let installed = codebuddy_ide_app_path().is_some()
-        || data_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
+    // `installed` 只表示"存在可运行的客户端"。数据目录存在不能算已安装——
+    // 只读探测不再建目录（issue #91），残留空目录也不应误报「已接入」；
+    // 是否有残留数据由 dataDir / dbExists 表达。
+    let installed = codebuddy_ide_app_path().is_some();
     let db_exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
     let running = is_codebuddy_ide_running();
 
@@ -1143,7 +1148,7 @@ mod tests {
     #[test]
     fn secret_key_helper_reexported_path() {
         let key = crate::modules::vscode_cn_inject::secret_storage_item_key_for(
-            crate::modules::vscode_cn_inject::CodeBuddyIdeFlavor::Intl,
+            &crate::modules::vscode_cn_inject::CODEBUDDY_INTL_TARGET,
         );
         assert!(key.contains("planning-genie.new.accessToken"));
         assert!(!key.contains("accessTokencn"));

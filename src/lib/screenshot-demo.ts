@@ -2,7 +2,7 @@ import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
-  TravelConfig, TravelStatus,
+  TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 import { accountVariant, normalizeVariant } from "./variant";
@@ -328,7 +328,14 @@ function buildStatistics(): CreditStatistics {
 }
 
 function checkinConfig(): CheckinConfig {
-  return { enabled: true, keepalive_days: 7, lazy_refresh_hours: 12 };
+  return {
+    enabled: true,
+    excluded_account_ids: [],
+    checkin_start: "",
+    checkin_end: "",
+    keepalive_days: 7,
+    lazy_refresh_hours: 12,
+  };
 }
 
 function travelConfig(): TravelConfig {
@@ -568,6 +575,30 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       activeAccountId: demoAccounts[1].id,
       activeAccountName: demoAccounts[1].nickname,
     } satisfies CodeBuddyCnIdeStatus;
+    case "get_vscode_ext_status": return {
+      installed: true,
+      extensionInstalled: true,
+      running: false,
+      loggedIn: true,
+      dataDir: "/demo/Code",
+      dbPath: "/demo/Code/User/globalStorage/state.vscdb",
+      dbExists: true,
+      activeAccountId: demoAccounts[0].id,
+      activeAccountName: demoAccounts[0].nickname,
+      detectedFrom: "state",
+      statePath: "/demo/vscode_ext.json",
+    } satisfies VscodeExtStatus;
+    case "list_vscode_sessions": return {
+      sourceUid: demoAccounts[0].uid,
+      skipped: 0,
+      dataRoot: "/demo/CodeBuddyExtension/Data",
+      sessions: [
+        { id: "7f3a91c0d4e5b6a7c8d9e0f1a2b3c4d5", workspaceHash: "3c1f8a92b4d5e60718f9a0b1c2d3e4f5", title: "完善账号卡片交互", updatedAt: Date.now() - 1000 * 60 * 12, type: "craft", hasHistory: true },
+        { id: "9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e", workspaceHash: "3c1f8a92b4d5e60718f9a0b1c2d3e4f5", title: "修复切换后历史为空", updatedAt: Date.now() - 1000 * 60 * 60 * 3, type: "craft", hasHistory: true },
+        { id: "11223344556677889900112233445566", workspaceHash: "aabbccddeeff00112233445566778899", title: "设计会话复制方案", updatedAt: Date.now() - 1000 * 60 * 60 * 26, type: "craft", hasHistory: true },
+        { id: "66554433221100998877665544332211", workspaceHash: "aabbccddeeff00112233445566778899", title: "(无标题)", updatedAt: Date.now() - 1000 * 60 * 60 * 50, type: "craft", hasHistory: false },
+      ],
+    } satisfies VscodeSessionList;
     case "switch_codebuddy_cli_account": {
       const target = demoAccounts.find((account) => account.id === args?.accountId);
       if (!target) throw new Error("账号不存在");

@@ -3,27 +3,31 @@
 //!
 //! 数据流：hook 脚本 append payload（行级、O_APPEND）→ 本模块按**已读 offset** 逐行消费
 //! （只有完整行才处理，写到一半的行留到下一轮）→ 识别限额文案（`QUOTA_MARKERS`）并取官方
-//! 恢复时刻（`limits::parse_reset_at`）→ 归因（CLI：会话进程启动时刻不早于 `state.json`
-//! 写入时刻即当前账号；WorkBuddy：登录态文件 / 会话表）→ 入账（内存 + 落盘）→ 由宿主 emit
-//! `rate-limits-updated` 通知前端。
+//! 恢复时刻（`limits::parse_reset_at`）→ 归因（CLI：该 429 请求发出时该会话的进程启动时刻
+//! 不早于 `state.json` 写入时刻即当前账号；WorkBuddy：登录态文件 / 会话表）→ 入账
+//! （内存 + 落盘）→ 由宿主 emit `rate-limits-updated` 通知前端。
 //!
 //! 关键决定（实施时定的开放点）：
 //! - **消费方式**：记 offset + 到 1 MB 轮转（`rename` 后再读旧 inode 的增量），不裁剪写入方
 //!   正在追加的文件；轮转失败不动文件，宁可继续增长也不丢事件。
-//! - **CLI 归因**：key 是**进程级快照**（切换只对新进程生效）。本轮起「活进程 key ==
-//!   当前账号」是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/model-rate-limits.md`）：
+//! - **CLI 归因**：key 是**进程级快照**（切换只对新进程生效）。「活进程 key == 当前账号」
+//!   是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/rate-limit-ledger.md`）：
 //!   手动切换先关进程再写 `state.json`，自动轮换只在没有存活会话时才切。因此归因只需
-//!   「读当前账号 + 一个陈旧守卫」：取「该会话进程的启动时刻」（`sessions/<pid>.json` 的
-//!   `startedAt`，兜底 transcript 首行），`startedAt ≥ state.json mtime` → 当前账号；
-//!   早于 mtime ⇒ INV 被破坏（有进程持旧 key）⇒ 丢弃 + 告警；时刻取不到也丢弃。
-//!   宁可少显示，不可显示错账号。
+//!   「读当前账号 + 一个陈旧守卫」，判据是**该 429 请求自身的时刻**（`request_time_of`：
+//!   文案尾部 `(requestId/sessionId)` 里的 UUIDv7 requestId，前 48 位 = 毫秒时刻）：
+//!   取「请求时刻该会话的进程启动时刻」（`sessions/<pid>.json` 的 `startedAt`，兜底
+//!   transcript 首行），`startedAt ≥ state.json mtime` → 当前账号；早于 mtime ⇒ INV 被破坏
+//!   （有进程持旧 key）⇒ 丢弃 + 告警。用请求时刻而不是消费时刻，是为了挡住「会话恢复 /
+//!   压缩时新进程重放上一轮（旧账号）的 429 文案」——`Stop` 的 `last_assistant_message`
+//!   是「会话最后一条助手消息」，可以属于更早的一轮、更早的账号（2026-09-21 本机实证）。
+//!   请求时刻取不到 / 不合理 / 快照取不到都丢弃：宁可少显示，不可显示错账号。
 //! - **WorkBuddy 归因**：① 客户端登录态文件里的 uid → 账号库；② 兜底用会话 id 查 `sessions`
 //!   表（与日志扫描同源）；都拿不到就丢弃（宁可少显示，不可显示错账号）。
 //! - **轮询节奏**：1 秒一次 `stat`（未变则不做任何读取），hook 事件要求秒级可见；
 //!   不引入 `notify` 依赖（本 crate 不新增依赖）。
 //!
-//! 事件 payload 不含账号 uid：CLI 的 key 归属由进程启动时刻决定，WorkBuddy 由触发当轮的
-//! 登录态决定，因此必须在事件到达时归因，不能延后。
+//! 事件 payload 不含账号 uid：CLI 的 key 归属由「429 请求时刻的进程快照」决定，WorkBuddy 由
+//! 触发当轮的登录态决定，因此必须在事件到达时归因，不能延后。
 
 use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
@@ -108,6 +112,9 @@ fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// hook payload 里本模块用到的字段（其余字段与版本差异一律忽略）。
+///
+/// 历史事件行可能带已废弃的 `_hookTs`（旧脚本写入的时刻锚）：它不在结构里，
+/// `serde` 默认忽略未知字段，因此这些行照常消费。
 #[derive(Deserialize)]
 struct HookPayload {
     #[serde(default)]
@@ -135,6 +142,48 @@ struct QuotaEvent {
     session_id: Option<String>,
     model: Option<String>,
     reset_at: i64,
+    /// 该 429 请求**自身**的时刻（由文案尾部 requestId 解码）。
+    ///
+    /// 归因判据用它而不是消费时刻：`Stop` 的 `last_assistant_message` 是「会话最后一条助手
+    /// 消息」，会话恢复 / 压缩后可能是更早一轮（更早账号）的 429 文案。取不到 ⇒ `None`
+    /// （调用方丢弃该事件，不回退到消费时刻）。
+    request_at: Option<i64>,
+}
+
+/// requestId 时刻的合理下界（2024-01-01T00:00:00Z，毫秒）。
+///
+/// UUIDv7 是 2024 年才有的格式：早于此的「时刻」说明取到的不是请求时刻，按解析失败处理。
+const REQUEST_TIME_FLOOR_MS: i64 = 1_704_067_200_000;
+
+/// 从限额文案里取「该 429 请求自身的时刻」（毫秒）。
+///
+/// 文案尾部形如 `… 继续使用。 (01a0c3baf1dc7cebb43642413d3ad593/01a0c392-…-…)`：
+/// requestId 是 32 位十六进制 UUIDv7，前 12 位十六进制 = 毫秒时刻（本机实测与 CLI 日志
+/// `[ModelProvider] Sending request` 相差 ~80ms，见
+/// `.trellis/tasks/09-21-fix-stale-429-attribution/research/2026-09-21-stale-429-replay-evidence.md`）。
+///
+/// 校验：32 位十六进制 + version nibble == `7` + variant == `0b10` + 时刻 ≥ 2024-01-01；
+/// 任一不满足 → `None`（调用方丢弃该事件）。上界（`> now`）由 `attribute_cli` 判定。
+fn request_time_of(message: &str) -> Option<i64> {
+    // 取「最后一个 `(` … 其后第一个 `/`」：文案里的括号只出现在尾部身份段，
+    // 从最后一个左括号找起可避免吃到正文里的括号（`(` 与 `/` 都是 ASCII，索引必在字符边界）。
+    let start = message.rfind('(')? + 1;
+    let rest = &message[start..];
+    let hex = &rest[..rest.find('/')?];
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    // UUIDv7：version nibble（第 13 位十六进制）必须是 `7`。
+    if hex.as_bytes()[12] != b'7' {
+        return None;
+    }
+    // variant：第 17 位十六进制的高两位必须是 `0b10`。
+    let variant = u8::from_str_radix(&hex[16..18], 16).ok()?;
+    if variant >> 6 != 0b10 {
+        return None;
+    }
+    let at = i64::from_str_radix(&hex[..12], 16).ok()?;
+    (at >= REQUEST_TIME_FLOOR_MS).then_some(at)
 }
 
 /// 一行 payload → 限额事件；非限额行、解析失败、缺恢复时刻统一返回 None（静默忽略）。
@@ -150,6 +199,9 @@ fn parse_quota_line(line: &str) -> Option<QuotaEvent> {
     }
     // 取不到官方恢复时刻就不是可入账的限额事件（不猜时间）。
     let reset_at = limits::parse_reset_at(message)?;
+    // 模型直接采用**本次 payload** 的字段：它是 429 当轮客户端侧选定的模型，
+    // 与失败请求同轮（不读 transcript 全文猜模型 —— 延迟消费时那段文本已经属于
+    // 之后的轮次，会给出别的模型，2026-09-19 实证假 chip）。
     let model = payload
         .model
         .filter(|model| !MODEL_SENTINELS.contains(&model.as_str()))
@@ -159,6 +211,9 @@ fn parse_quota_line(line: &str) -> Option<QuotaEvent> {
         session_id: payload.session_id,
         model,
         reset_at,
+        // 请求时刻只从**文案本身**取：payload 的其它字段（如 `generation_id`）是「轮」的 id，
+        // 会话恢复后指向新轮，用它判陈旧会漏判（见 research 文档的取舍）。
+        request_at: request_time_of(message),
     })
 }
 
@@ -270,10 +325,11 @@ fn auth_file_uid(path: &Path) -> Option<String> {
 
 /// 事件所属会话「当前进程」的启动时刻（= 该进程取 key 的时刻）。
 ///
-/// 读 `~/.codebuddy/sessions/*.json`，取 `sessionId` 匹配且 `startedAt ≤ now` 的**最大**
-/// `startedAt`：跨进程接管后旧注册表文件可能残留，这个判据保证取「事件前最后一个持有者」。
+/// 读 `~/.codebuddy/sessions/*.json`，取 `sessionId` 匹配且 `startedAt ≤ at` 的**最大**
+/// `startedAt`：跨进程接管后旧注册表文件可能残留，这个判据保证取「`at` 时刻最后一个持有者」。
+/// 调用方传该 429 请求的时刻（不是消费时刻，见 `attribute_cli`）。
 /// 目录缺失 / 无匹配 / 文件坏 / `session_id` 为空 → None（调用方回落 transcript 首行）。
-fn session_snapshot_time(dir: &Path, session_id: Option<&str>, now: i64) -> Option<i64> {
+fn session_snapshot_time(dir: &Path, session_id: Option<&str>, at: i64) -> Option<i64> {
     let session_id = session_id.map(str::trim).filter(|id| !id.is_empty())?;
     let mut snapshot: Option<i64> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -293,7 +349,7 @@ fn session_snapshot_time(dir: &Path, session_id: Option<&str>, now: i64) -> Opti
         let Some(started_at) = root.get("startedAt").and_then(Value::as_i64) else {
             continue;
         };
-        if started_at > now {
+        if started_at > at {
             continue;
         }
         snapshot = Some(snapshot.map_or(started_at, |current| current.max(started_at)));
@@ -328,20 +384,44 @@ fn cli_state_snapshot(path: &Path) -> Option<(String, Option<i64>)> {
     Some((current_id, mtime))
 }
 
-/// CLI 归因：按「该会话进程的启动时刻」（key 快照时刻）判断这把 key 属于谁。
+/// CLI 归因：按「该 429 请求自身的时刻」取会话进程快照，判断这把 key 属于谁。
+///
+/// 判据必须落在**请求时刻**而不是消费时刻：`Stop` 的 `last_assistant_message` 是「会话最后一条
+/// 助手消息」，会话恢复 / 压缩后会连同**上一轮（可能是上一个账号）**的 429 文案一起被重放，
+/// 而触发 hook 的却是接管会话的新进程；用消费时刻取快照就会把旧账号的 429 记到新账号
+/// （2026-09-21 本机实证，见
+/// `.trellis/tasks/09-21-fix-stale-429-attribution/research/2026-09-21-stale-429-replay-evidence.md`）。
 ///
 /// 不变式（INV）：活着的 CLI 进程持有的 key == `state.json` 的 `activeAccountId`。
 /// 由两条写路径共同维持——手动切换先关进程再写 state；自动轮换只在无存活会话时切。
-/// 于是归因只需要一个陈旧守卫：
+/// 于是归因只需要一个陈旧守卫（`snap_at` = 请求时刻该会话的进程启动时刻）：
 ///
 /// - `snap_at ≥ state.mtime`：进程在最后一次切换之后启动 ⇒ 当前账号就是它的 key；
 /// - `snap_at < state.mtime`：进程在切换之前启动且（按 INV）本该已经被关掉 ⇒
 ///   INV 被破坏（第三方改写 state / 关闭失败 / 时钟异常）⇒ **丢弃 + 告警**，
 ///   绝不猜"也许是切换前那个账号"；
-/// - `snap_at` 或 `mtime` 取不到 ⇒ 丢弃（宁可少显示，不可显示错账号）。
+/// - `request_at` 取不到 / 晚于当前时刻 / `snap_at` 或 `mtime` 取不到 ⇒ 丢弃
+///   （宁可少显示，不可显示错账号）。
 fn attribute_cli(event: &QuotaEvent, ctx: &IngestContext, now: i64) -> Option<String> {
-    let snap_at = session_snapshot_time(&ctx.cli_sessions_dir, event.session_id.as_deref(), now)
-        .or_else(|| session_created_at(&event.transcript_path))?;
+    // 证据不足即丢弃：不回退到「按消费时刻归因」——那正是陈旧文案错归的来源。
+    let Some(request_at) = event.request_at else {
+        eprintln!("[cli-attribution] 丢弃限额事件：文案里取不到 requestId，无法确定 429 请求时刻");
+        return None;
+    };
+    if request_at > now {
+        eprintln!(
+            "[cli-attribution] 丢弃限额事件：429 请求时刻 {request_at} 晚于当前时刻 {now}（时钟异常）"
+        );
+        return None;
+    }
+    // 快照查询上界 = 请求时刻：只认「该请求发出时已在运行的进程」，不会被后来接管会话的
+    // 新进程顶替。配合下面的 `snap_at ≥ mtime` 判据，自动蕴含「请求发出于最后一次切换之后」。
+    let snap_at = session_snapshot_time(
+        &ctx.cli_sessions_dir,
+        event.session_id.as_deref(),
+        request_at,
+    )
+    .or_else(|| session_created_at(&event.transcript_path))?;
     if snap_at > now {
         // 时钟异常（transcript 首行时间在未来）时不猜。
         return None;
@@ -358,14 +438,15 @@ fn attribute_cli(event: &QuotaEvent, ctx: &IngestContext, now: i64) -> Option<St
     }
     eprintln!(
         "[cli-attribution] 丢弃限额事件：会话进程启动于 {snap_at}，早于 state.json 的写入时刻 {mtime}；\
-         活进程持有的 key 与当前账号不一致（不变式被破坏）"
+         该 429 请求（{request_at}）发出时活进程持有的 key 与当前账号不一致（不变式被破坏）"
     );
     None
 }
 
 /// 归因：payload 不含账号 uid，只能靠客户端侧「谁在持 key」。
 ///
-/// - CLI：会话进程启动时刻不早于 `state.json` 写入时刻 → 当前账号（见 `attribute_cli`）；
+/// - CLI：该 429 请求发出时该会话的进程启动时刻不早于 `state.json` 写入时刻 → 当前账号
+///   （见 `attribute_cli`）；
 /// - WorkBuddy：① 登录态文件 uid → 账号库；② 会话 id 查 `sessions` 表兜底；
 /// - 都拿不到 → 丢弃（宁可少显示，不可显示错账号）。
 fn attribute(
@@ -425,39 +506,6 @@ fn complete_lines(bytes: &[u8]) -> (Vec<String>, u64) {
     (lines, consumed)
 }
 
-/// transcript 里最后一条 `providerData.model`（实际服务模型）。
-///
-/// hook payload 的 `model` 是**会话 UI 选定模型**，与真正被限的服务模型可能不同
-/// （2026-09-18 实证：UI 选 glm-5.3-flash，实际被限 hy4-preview-f，台账出现双 chip）。
-/// 与日志通路「触发前同会话最近一次实际请求模型」同一语义：流式读 transcript，
-/// 取最后一条带 `providerData.model` 的行；文件不可读 / 无模型行 → None（回落 payload）。
-/// 消费发生在事件当轮（秒级），transcript 尚不会包含 429 之后的新轮次，无需时间戳截断。
-fn transcript_model(transcript_path: &str) -> Option<String> {
-    let file = std::fs::File::open(transcript_path).ok()?;
-    let mut last = None;
-    for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
-        let Ok(line) = line else { continue };
-        // 子串预筛：transcript 可达数十 MB，避免逐行做完整 JSON 解析。
-        if !line.contains("\"providerData\"") || !line.contains("\"model\"") {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let Some(model) = value
-            .get("providerData")
-            .and_then(|provider| provider.get("model"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        else {
-            continue;
-        };
-        last = Some(model.to_string());
-    }
-    last
-}
-
 /// 把一批行入账到状态；返回是否新增了条目。
 fn ingest_lines(ctx: &IngestContext, state: &mut State, lines: &[String], now: i64) -> bool {
     let mut added = false;
@@ -471,13 +519,11 @@ fn ingest_lines(ctx: &IngestContext, state: &mut State, lines: &[String], now: i
         let Some(account_id) = attribute(&event, source, ctx, now) else {
             continue;
         };
-        // 模型归因：transcript 的实际服务模型优先，payload 的 UI 选定模型只做兜底。
-        let model = transcript_model(&event.transcript_path).or(event.model.clone());
         merge_entry(
             &mut state.events,
             StoredEntry {
                 account_id,
-                model,
+                model: event.model.clone(),
                 reset_at: event.reset_at,
                 first_seen_at: now,
                 hit_count: 1,
@@ -646,14 +692,53 @@ mod tests {
 
     const UID_A: &str = "f0ae9eeb-8476-4ef5-9a3e-1d6339d545da";
 
+    /// 测试用时刻基准（2026-09-10）：晚于 requestId 时刻的合理下界（2024-01-01），
+    /// 早于 fixture 文案里的恢复时刻，便于用 `T0 + 偏移` 构造先后关系。
+    const T0: i64 = 1_789_000_000_000;
+
+    /// 文案尾部身份段里的 sessionId（本模块不解析它，只要求形态与真实文案一致）。
+    const QUOTA_SESSION_ID: &str = "01a0c392-24cf-7696-90d4-24785d3743ce";
+
+    /// 默认 fixture 文案的官方恢复时刻原文（本机实测句式）。
+    const QUOTA_RESET_TEXT: &str = "2026-09-17 17:59:27 UTC+8";
+
+    /// 本机实测的陈旧 429 文案的恢复时刻原文（2026-09-21 19:30，见 research 文档）。
+    const STALE_RESET_TEXT: &str = "2026-09-22 15:06:49 UTC+8";
+
+    /// 按毫秒生成 32 位十六进制的 UUIDv7 `requestId`：前 12 位十六进制 = 毫秒时刻，
+    /// version nibble `7`、variant `0b10`（与真实文案同形，见 research 文档）。
+    fn request_id_at(ms: i64) -> String {
+        let ms = (ms as u64) & 0x0000_ffff_ffff_ffff;
+        format!("{ms:012x}7cebb43642413d3ad593")
+    }
+
+    /// 429 文案：`reset_text` = 官方恢复时刻原文；`request_at` 给出时补上尾部
+    /// `(requestId/sessionId)` 身份段，`None` = 文案里没有身份段的形态（证据不足用例）。
+    fn quota_message(reset_text: &str, request_at: Option<i64>) -> String {
+        let mut message = format!(
+            "429 您的使用量已超出频率限制，将在 {reset_text} 重置，您也可以切换其他模型继续使用。"
+        );
+        if let Some(ms) = request_at {
+            message.push_str(&format!(" ({}/{QUOTA_SESSION_ID})", request_id_at(ms)));
+        }
+        message
+    }
+
     /// 本机实测的 WorkBuddy payload 骨架（`Stop` 行，字段已替换）。
-    fn stop_payload(session: &str, model: &str, transcript: &Path) -> String {
+    ///
+    /// `request_at` = 该 429 请求自身的时刻（CLI 归因判据；WorkBuddy 归因不用它）。
+    fn stop_payload(
+        session: &str,
+        model: &str,
+        transcript: &Path,
+        request_at: Option<i64>,
+    ) -> String {
         json!({
             "session_id": session,
             "transcript_path": transcript.to_string_lossy(),
             "hook_event_name": "Stop",
             "model": model,
-            "last_assistant_message": "429 您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置，您也可以切换其他模型继续使用。",
+            "last_assistant_message": quota_message(QUOTA_RESET_TEXT, request_at),
         })
         .to_string()
     }
@@ -670,6 +755,27 @@ mod tests {
         .to_string()
     }
 
+    /// 带废弃字段 `_hookTs` 的限额 payload（旧脚本写入的历史事件行形态）。
+    ///
+    /// 该字段已从消费端移除，但事件文件是 append-only 的：历史行必须照常消费。
+    fn legacy_stop_payload_with_hook_ts(
+        session: &str,
+        model: &str,
+        transcript: &Path,
+        hook_ts: i64,
+        request_at: Option<i64>,
+    ) -> String {
+        json!({
+            "session_id": session,
+            "transcript_path": transcript.to_string_lossy(),
+            "hook_event_name": "Stop",
+            "model": model,
+            "_hookTs": hook_ts,
+            "last_assistant_message": quota_message(QUOTA_RESET_TEXT, request_at),
+        })
+        .to_string()
+    }
+
     fn absent_lookup(_variant: WbVariant, _session: &str) -> Option<String> {
         None
     }
@@ -677,6 +783,14 @@ mod tests {
     /// 临时环境：所有路径都在 tempdir 下，绝不触碰真实用户配置。
     struct Fixture {
         root: PathBuf,
+    }
+
+    /// 测试结束自动清理 tempdir：不清理的话每轮 cargo test 留 20+ 个残留目录
+    /// （2026-09-18 实证 127 个，且目录名与事件文件形态酷似「沙箱写入」，误导过排查方向）。
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 
     impl Fixture {
@@ -786,7 +900,9 @@ mod tests {
     }
 
     /// 一条 CLI 限额事件（只用于直接调 `attribute` 的用例）。
-    fn cli_quota_event(fixture: &Fixture, session: &str) -> QuotaEvent {
+    ///
+    /// `request_at` = 该 429 请求自身的时刻（归因判据，由文案里的 requestId 解码而来）。
+    fn cli_quota_event(fixture: &Fixture, session: &str, request_at: i64) -> QuotaEvent {
         QuotaEvent {
             transcript_path: fixture
                 .cli_transcript(session)
@@ -795,7 +911,21 @@ mod tests {
             session_id: Some(session.to_string()),
             model: Some("deepseek-v4.1-flash".to_string()),
             reset_at: 1_789_670_683_000,
+            request_at: Some(request_at),
         }
+    }
+
+    /// 本机实测的陈旧 429 payload（2026-09-21 19:30，恢复时刻 2026-09-22 15:06:49 UTC+8）：
+    /// codeg 恢复会话后新进程重放的就是这条文案（`request_at` 仍是旧进程那一刻）。
+    fn stale_429_payload(session: &str, transcript: &Path, request_at: i64) -> String {
+        json!({
+            "session_id": session,
+            "transcript_path": transcript.to_string_lossy(),
+            "hook_event_name": "Stop",
+            "model": "hy3",
+            "last_assistant_message": quota_message(STALE_RESET_TEXT, Some(request_at)),
+        })
+        .to_string()
     }
 
     fn cli_account() -> Value {
@@ -829,7 +959,7 @@ mod tests {
             "缺 transcript_path → 不入账"
         );
 
-        // 模型哨兵值不得作为模型名。
+        // 模型哨兵值不得作为模型名；文案没有身份段时 request_at 为空（归因侧会丢弃）。
         let event = parse_quota_line(
             &json!({
                 "transcript_path": "/x/.workbuddy/projects/s.jsonl",
@@ -843,6 +973,54 @@ mod tests {
         assert_eq!(event.model, None);
         assert_eq!(event.session_id.as_deref(), Some("s-1"));
         assert_eq!(event.reset_at, 1_789_639_167_000);
+        assert_eq!(event.request_at, None);
+
+        // 尾部身份段 → 请求时刻（毫秒）由 requestId 解码得到。
+        let event = parse_quota_line(&stop_payload("s-1", "hy3", transcript, Some(T0 + 900)))
+            .expect("限额行");
+        assert_eq!(event.request_at, Some(T0 + 900));
+        assert_eq!(event.model.as_deref(), Some("hy3"));
+        assert_eq!(event.reset_at, 1_789_639_167_000);
+    }
+
+    /// requestId 解码：合法 UUIDv7 → 精确毫秒；形态 / 版本 / variant / 下界不符 → None
+    /// （调用方丢弃该事件，不回退到消费时刻）。
+    #[test]
+    fn request_id_decodes_to_the_request_time_or_is_rejected() {
+        // 本机实测样例：19:30:03.868 发出的 429（requestId 前 12 位十六进制 = 该毫秒时刻）。
+        let sample = "429 您的使用量已超出频率限制，将在 2026-09-22 15:06:49 UTC+8 重置。 \
+                      (01a0c3baf1dc7cebb43642413d3ad593/01a0c392-24cf-7696-90d4-24785d3743ce)";
+        assert_eq!(request_time_of(sample), Some(1_789_990_203_868));
+        // 正文里还有别的括号时取「最后一个 `(`」（身份段永远在尾部）。
+        assert_eq!(
+            request_time_of("已用额度 (约 3 次) 后限流 (01a0c3baf1dc7cebb43642413d3ad593/x)"),
+            Some(1_789_990_203_868)
+        );
+
+        let id = request_id_at(T0 + 900);
+        let decode = |value: &str| request_time_of(&format!("429 超出频率限制 ({value}/x)"));
+        assert_eq!(decode(&id), Some(T0 + 900));
+        assert_eq!(request_time_of("429 超出频率限制"), None, "无括号");
+        assert_eq!(
+            request_time_of("429 超出频率限制 (01a0c3baf1dc7cebb43642413d3ad593)"),
+            None,
+            "有括号但没有 `/` 分隔的身份段"
+        );
+        assert_eq!(
+            decode("01a0c3baf1dc7cebb43642413d3ad59g"),
+            None,
+            "非十六进制"
+        );
+        assert_eq!(decode(&id[..31]), None, "不足 32 位");
+        // version nibble ≠ 7（UUIDv4 等）与 variant ≠ 0b10（`c` = 0b11）都拒绝。
+        assert_eq!(decode(&format!("{}{}{}", &id[..12], '6', &id[13..])), None);
+        assert_eq!(decode(&format!("{}{}{}", &id[..16], 'c', &id[17..])), None);
+        // 时刻下界：2024-01-01 之前（UUIDv7 不存在）拒绝，恰在下界通过。
+        assert_eq!(decode(&request_id_at(1_704_067_199_999)), None);
+        assert_eq!(
+            decode(&request_id_at(1_704_067_200_000)),
+            Some(1_704_067_200_000)
+        );
     }
 
     #[test]
@@ -897,84 +1075,120 @@ mod tests {
     }
 
     /// 事件文件首行带 UTF-8 BOM（Windows PowerShell 5.1 `Add-Content -Encoding UTF8`
-    /// 建文件时的实测行为）不得吞掉第一个限额事件。
+    /// 建文件时的实测行为）不得吞掉第一个限额事件，也不得打乱按**字节**推进的消费偏移。
     #[test]
     fn utf8_bom_on_the_first_line_does_not_kill_the_first_event() {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
+        set_state_mtime(&fixture, T0 + 1);
         let session = "s-bom";
-        fixture.write_session_registry(4242, session, 500);
+        fixture.write_session_registry(4242, session, T0 + 500);
         std::fs::write(
             fixture.events(),
-            format!("\u{feff}{}\n", stop_payload(session, "hy3", &fixture.cli_transcript(session))),
+            format!(
+                "\u{feff}{}\n",
+                stop_payload(
+                    session,
+                    "hy3",
+                    &fixture.cli_transcript(session),
+                    Some(T0 + 900)
+                )
+            ),
         )
         .expect("带 BOM 的事件文件");
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
         assert_eq!(state.events.len(), 1, "BOM 前缀不得让首行解析失败");
+        // 偏移以字节计（BOM 也算在内）：文件被消费完，下一轮不会重复入账。
+        assert_eq!(
+            state.offset,
+            std::fs::metadata(fixture.events()).expect("事件文件").len()
+        );
+        assert_eq!(
+            consume_with(&ctx, &mut state, T0 + 1_001),
+            None,
+            "无新字节不重复消费"
+        );
     }
 
-    /// 模型归因：transcript 的实际服务模型（`providerData.model`）优先于 payload 的
-    /// UI 选定模型（2026-09-18 实证：UI 选 glm-5.3-flash，实际被限 hy4-preview-f）。
+    /// 事件模型来自**当次 payload**：切到 B 后的首个请求被限（429 轮次没有响应行），
+    /// 延迟消费期间会话又切到 C —— 事件必须仍记为 B。
+    ///
+    /// 回归 2026-09-20 审查反例：曾按 transcript 全文重判模型，会取到上一轮的 A
+    /// （时间上界只截到「最新一条模型行」），把 payload 里正确的 B 覆盖掉。
     #[test]
-    fn transcript_serving_model_wins_over_the_payload_ui_model() {
+    fn event_model_comes_from_the_current_payload_not_the_transcript() {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
-        let session = "s-model";
+        set_state_mtime(&fixture, T0 + 1);
+        let session = "s-switched";
         let transcript = fixture.cli_transcript(session);
         std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
         std::fs::write(
             &transcript,
             format!(
-                "{}\n{}\n{}\n",
-                json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }),
-                json!({ "type": "reasoning", "providerData": { "model": "glm-5.3-flash", "reasoning": "x" } }),
-                // 最后一条实际服务模型是 hy4-preview-f（中途换过模型也要取最新的）。
-                json!({ "type": "function_call", "providerData": { "model": "hy4-preview-f" } })
+                "{}\n{}\n",
+                // 上一轮用 A 成功（事件之前的最后一个 assistant 轮次）。
+                json!({ "type": "message", "timestamp": 900_000, "providerData": { "model": "model-a" } }),
+                // 事件之后主人切到 C 继续会话（延迟消费时已在文件里）。
+                json!({ "type": "message", "timestamp": 1_060_000, "providerData": { "model": "model-c" } })
             ),
         )
         .expect("写 transcript");
-        fixture.write_session_registry(4242, session, 500);
-        std::fs::write(fixture.events(), format!("{}\n", stop_payload(session, "glm-5.3-flash", &transcript)))
-            .expect("事件文件");
+        fixture.write_session_registry(4242, session, T0 + 500);
+        std::fs::write(
+            fixture.events(),
+            format!(
+                "{}\n",
+                stop_payload(session, "model-b", &transcript, Some(T0 + 1_000_000))
+            ),
+        )
+        .expect("事件文件");
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        // 请求发生在 T0 + 1 000 000，消费推迟到 T0 + 1 200 000（transcript 已含切到 C 的新轮次）。
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_200_000), Some(true));
         assert_eq!(state.events.len(), 1);
         assert_eq!(
             state.events[0].model.as_deref(),
-            Some("hy4-preview-f"),
-            "必须取 transcript 的实际服务模型，不是 payload 的 UI 模型"
+            Some("model-b"),
+            "模型必须取当次 payload，不得被 transcript 里的其它轮次覆盖"
         );
     }
 
-    /// transcript 不可读 / 无模型行 → 回落 payload 的模型，不入成「未知」。
+    /// 旧脚本写入的事件行带已废弃字段 `_hookTs`：仍须照常消费（事件文件是 append-only 的）。
     #[test]
-    fn payload_model_is_the_fallback_when_transcript_has_no_model_rows() {
+    fn legacy_events_with_the_retired_hook_ts_field_are_still_consumed() {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
-        let session = "s-fallback";
-        // transcript 存在但没有 providerData.model 行。
-        let transcript = fixture.cli_transcript(session);
-        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
-        std::fs::write(&transcript, json!({ "type": "message", "role": "user" }).to_string())
-            .expect("写 transcript");
-        fixture.write_session_registry(4242, session, 500);
-        std::fs::write(fixture.events(), format!("{}\n", stop_payload(session, "hy3", &transcript))).expect("事件文件");
+        set_state_mtime(&fixture, T0 + 1);
+        let session = "s-legacy";
+        fixture.write_session_registry(4242, session, T0 + 500);
+        std::fs::write(
+            fixture.events(),
+            format!(
+                "{}\n",
+                legacy_stop_payload_with_hook_ts(
+                    session,
+                    "hy3",
+                    &fixture.cli_transcript(session),
+                    1_000_000,
+                    Some(T0 + 1_000_000)
+                )
+            ),
+        )
+        .expect("事件文件");
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
-        assert_eq!(state.events.len(), 1);
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_200_000), Some(true));
+        assert_eq!(state.events.len(), 1, "未知字段不得让整行解析失败");
         assert_eq!(state.events[0].model.as_deref(), Some("hy3"));
     }
 
@@ -985,30 +1199,31 @@ mod tests {
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
         // 写入时刻钉在会话启动之前 ⇒ 该进程取到的 key 就是当前账号。
-        set_state_mtime(&fixture, 1);
+        set_state_mtime(&fixture, T0 + 1);
         let session = "01a0ad53-0c95-7767-bd6a-d43356edb644";
-        fixture.write_session_registry(4242, session, 500);
+        fixture.write_session_registry(4242, session, T0 + 500);
         fixture.append(&[stop_payload(
             session,
             "deepseek-v4.1-flash",
             &fixture.cli_transcript(session),
+            Some(T0 + 900),
         )]);
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.events[0].account_id, "acc-cli");
         assert_eq!(
             state.events[0].model.as_deref(),
             Some("deepseek-v4.1-flash")
         );
-        assert_eq!(state.last_event_at, Some(1_000));
+        assert_eq!(state.last_event_at, Some(T0 + 1_000));
         assert!(state.offset > 0);
-        assert_eq!(live_entries(&mut state, 1_100).len(), 1);
+        assert_eq!(live_entries(&mut state, T0 + 1_100).len(), 1);
 
         // 重复消费同一文件：偏移已推进 → 不重复入账。
         let mut reloaded = fixture.state();
-        assert_eq!(consume_with(&ctx, &mut reloaded, 2_000), None);
+        assert_eq!(consume_with(&ctx, &mut reloaded, T0 + 2_000), None);
         assert_eq!(reloaded.events.len(), 1);
 
         // 同一次事件的重复书写（重试轮）：hitCount 累加、不新增条目。
@@ -1016,9 +1231,10 @@ mod tests {
             session,
             "deepseek-v4.1-flash",
             &fixture.cli_transcript(session),
+            Some(T0 + 900),
         )]);
         let mut again = fixture.state();
-        assert_eq!(consume_with(&ctx, &mut again, 3_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut again, T0 + 3_000), Some(true));
         assert_eq!(again.events.len(), 1);
         assert_eq!(again.events[0].hit_count, 2);
     }
@@ -1033,6 +1249,26 @@ mod tests {
     const SWITCHED_TO_WKBDTEST_AT: i64 = 1_789_639_230_009;
     /// 18:43:56 旧进程触发 429。
     const EVENT_AT: i64 = 1_789_639_436_000;
+
+    /// 陈旧 429 重放时间线（research/2026-09-21-stale-429-replay-evidence.md，本机实测，CST）：
+    /// 同一会话先由旧进程持有（发出 429），切换账号后被新进程接管并重放那条旧文案。
+    const STALE_SESSION: &str = "01a0c392-24cf-7696-90d4-24785d3743ce";
+    /// 18:45:29.320 旧进程 pid=32745 启动（持旧账号 key）。
+    const STALE_OLD_PROCESS_STARTED_AT: i64 = 1_789_987_529_320;
+    /// 旧账号那次切换写入 state.json 的时刻（早于旧进程启动；实测值未留存，取启动前 1 分钟）。
+    const STALE_PREVIOUS_SWITCH_AT: i64 = 1_789_987_469_320;
+    /// 19:30:03.868 旧进程发出的 429 请求（requestId 解码；日志里 `Sending request` 为 .947）。
+    const STALE_REQUEST_AT: i64 = 1_789_990_203_868;
+    /// 19:30:06.389 旧账号那条被当轮消费（对照：修复后仍照旧入账）。
+    const STALE_OLD_CONSUME_AT: i64 = 1_789_990_206_389;
+    /// 19:31:09.492 切到新账号（state.json mtime / `updatedAt`）。
+    const STALE_SWITCH_AT: i64 = 1_789_990_269_492;
+    /// 19:31:22.122 新进程 pid=64440 启动（持新账号 key）。
+    const STALE_NEW_PROCESS_STARTED_AT: i64 = 1_789_990_282_122;
+    /// 19:31:26.185 新进程自己发出的请求时刻（AC2 的正常路径）。
+    const STALE_NEW_REQUEST_AT: i64 = 1_789_990_286_185;
+    /// 19:31:28.481 App 消费那条被新进程重放的陈旧事件。
+    const STALE_CONSUME_AT: i64 = 1_789_990_288_481;
 
     /// `state.json` 的最后写入时刻（毫秒）：构造「快照早于 / 等于 state 写入」用。
     fn state_mtime_ms(fixture: &Fixture) -> i64 {
@@ -1124,7 +1360,7 @@ mod tests {
         );
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, EVENT_AT),
                 HookSource::Cli,
                 &ctx,
                 EVENT_AT
@@ -1135,7 +1371,7 @@ mod tests {
         // transcript 也不可读 → 丢弃。
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, "missing-transcript"),
+                &cli_quota_event(&fixture, "missing-transcript", EVENT_AT),
                 HookSource::Cli,
                 &ctx,
                 EVENT_AT
@@ -1156,7 +1392,7 @@ mod tests {
         let ctx = fixture.context(vec![json!({ "id": "acc-wkbdtest" })], &absent_lookup);
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, EVENT_AT),
                 HookSource::Cli,
                 &ctx,
                 EVENT_AT
@@ -1177,7 +1413,7 @@ mod tests {
         let ctx = fixture.context(vec![json!({ "id": "acc-wkbdtest" })], &absent_lookup);
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, mtime + 500),
                 HookSource::Cli,
                 &ctx,
                 mtime + 1_000
@@ -1198,7 +1434,7 @@ mod tests {
         let ctx = fixture.context(vec![json!({ "id": "acc-wkbdtest" })], &absent_lookup);
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, mtime + 500),
                 HookSource::Cli,
                 &ctx,
                 mtime + 1_000
@@ -1216,20 +1452,20 @@ mod tests {
         fixture.write_cli_state("acc-cli");
         let ctx = fixture.context(vec![cli_account()], &absent_lookup);
         // 注册表目录不存在 + transcript 不存在 + session_id 缺失。
-        let mut event = cli_quota_event(&fixture, CLI_SESSION);
+        let mut event = cli_quota_event(&fixture, CLI_SESSION, T0 + 900);
         event.session_id = None;
-        assert_eq!(attribute(&event, HookSource::Cli, &ctx, 10_000), None);
+        assert_eq!(attribute(&event, HookSource::Cli, &ctx, T0 + 10_000), None);
 
         // state.json 缺失时同样丢弃（即使快照时刻可得）。
         let fixture = Fixture::new();
-        fixture.write_session_registry(9312, CLI_SESSION, 500);
+        fixture.write_session_registry(9312, CLI_SESSION, T0 + 500);
         let ctx = fixture.context(vec![cli_account()], &absent_lookup);
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, T0 + 900),
                 HookSource::Cli,
                 &ctx,
-                10_000
+                T0 + 10_000
             ),
             None
         );
@@ -1246,7 +1482,7 @@ mod tests {
         let ctx = fixture.context(vec![json!({ "id": "acc-zhangjia" })], &absent_lookup);
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, NEW_PROCESS_STARTED_AT + 500),
                 HookSource::Cli,
                 &ctx,
                 NEW_PROCESS_STARTED_AT + 1_000
@@ -1257,25 +1493,158 @@ mod tests {
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
+    /// AC1 回归（2026-09-21 本机实测时间线）：codeg 恢复会话后**新进程**触发 Stop，
+    /// 重放的却是旧进程上一轮（旧账号）的 429 文案 —— 判据是请求时刻，不是消费时刻。
+    ///
+    /// 同一时间线里：① 切换前消费（旧进程当轮触发）仍归旧账号（不丢那条 chip）；
+    /// ② 切换后消费同一条陈旧文案 → 丢弃；③ 消费路径不入账。
+    #[test]
+    fn stale_429_replayed_by_a_new_process_is_dropped() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(
+            vec![json!({ "id": "acc-old" }), json!({ "id": "acc-new" })],
+            &lookup,
+        );
+        // 同一会话先后被两个进程持有：旧进程发出 429，新进程接管会话并重放那条文案。
+        fixture.write_session_registry(32745, STALE_SESSION, STALE_OLD_PROCESS_STARTED_AT);
+        fixture.write_session_registry(64440, STALE_SESSION, STALE_NEW_PROCESS_STARTED_AT);
+        fixture.append(&[stale_429_payload(
+            STALE_SESSION,
+            &fixture.cli_transcript(STALE_SESSION),
+            STALE_REQUEST_AT,
+        )]);
+        let event = cli_quota_event(&fixture, STALE_SESSION, STALE_REQUEST_AT);
+
+        // ① 19:30:06 旧进程当轮触发 hook 时消费 → 归旧账号。
+        fixture.write_cli_state("acc-old");
+        set_state_mtime(&fixture, STALE_PREVIOUS_SWITCH_AT);
+        assert_eq!(
+            attribute(&event, HookSource::Cli, &ctx, STALE_OLD_CONSUME_AT).as_deref(),
+            Some("acc-old"),
+            "旧账号那条必须照旧入账（修复不得连带丢掉它）"
+        );
+
+        // ② 19:31:28 新进程重放同一条陈旧文案 → 丢弃，不记到新账号。
+        fixture.write_cli_state("acc-new");
+        set_state_mtime(&fixture, STALE_SWITCH_AT);
+        assert_eq!(
+            attribute(&event, HookSource::Cli, &ctx, STALE_CONSUME_AT),
+            None,
+            "请求时刻早于切换时刻的陈旧 429 不得归到新账号"
+        );
+
+        // ③ 消费路径：该事件不入账（行照常消费，不重放）。
+        let mut state = State::default();
+        assert_eq!(
+            consume_with(&ctx, &mut state, STALE_CONSUME_AT),
+            Some(false)
+        );
+        assert!(state.events.is_empty());
+        assert!(state.offset > 0);
+    }
+
+    /// AC2：切换之后由新进程发出的 429（请求时刻 ≥ 切换时刻）→ 仍归当前账号（正常路径不回退）。
+    #[test]
+    fn fresh_429_after_the_switch_is_attributed_to_the_current_account() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![json!({ "id": "acc-new" })], &lookup);
+        fixture.write_cli_state("acc-new");
+        set_state_mtime(&fixture, STALE_SWITCH_AT);
+        fixture.write_session_registry(64440, STALE_SESSION, STALE_NEW_PROCESS_STARTED_AT);
+        fixture.append(&[stale_429_payload(
+            STALE_SESSION,
+            &fixture.cli_transcript(STALE_SESSION),
+            STALE_NEW_REQUEST_AT,
+        )]);
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, STALE_CONSUME_AT), Some(true));
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(state.events[0].account_id, "acc-new");
+        assert_eq!(
+            state.events[0].reset_at, 1_790_060_809_000,
+            "恢复时刻仍取文案原文（2026-09-22 15:06:49 UTC+8）"
+        );
+    }
+
+    /// AC3：文案里没有 `(requestId/sessionId)` 身份段（已知边界）→ CLI 事件丢弃 + 告警，
+    /// 不 panic，且不影响同一批里的其它来源（WorkBuddy 走登录态文件归因）。
+    #[test]
+    fn cli_events_without_a_request_id_are_dropped_without_affecting_other_sources() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        std::fs::write(
+            fixture.auth_file(),
+            json!({ "account": { "uid": UID_A } }).to_string(),
+        )
+        .expect("登录态文件");
+        let ctx = fixture.context(
+            vec![json!({ "id": "acc-wb", "uid": UID_A, "variant": "cn" })],
+            &lookup,
+        );
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, T0 + 1);
+        let session = "s-no-request-id";
+        fixture.write_session_registry(4242, session, T0 + 500);
+        fixture.append(&[
+            // CLI：证据不足（无身份段）→ 丢弃。
+            stop_payload(session, "hy3", &fixture.cli_transcript(session), None),
+            // 同批次的 WorkBuddy 事件照常入账。
+            stop_payload("s-wb", "hy3", &fixture.workbuddy_transcript("s-wb"), None),
+        ]);
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
+        assert_eq!(state.events.len(), 1, "只有 WorkBuddy 那条入账");
+        assert_eq!(state.events[0].account_id, "acc-wb");
+    }
+
     /// 时钟异常（快照时刻晚于事件时刻）时不猜。
     #[test]
     fn future_snapshot_time_is_dropped() {
         let fixture = Fixture::new();
         let transcript = fixture.cli_transcript(CLI_SESSION);
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        std::fs::write(&transcript, format!("{}\n", json!({ "timestamp": 20_000 }))).unwrap();
+        // transcript 首行（兜底快照）的时间在「当前时刻」之后：时钟异常，不猜。
+        std::fs::write(
+            &transcript,
+            format!("{}\n", json!({ "timestamp": T0 + 20_000 })),
+        )
+        .unwrap();
         fixture.write_cli_state("acc-cli");
         let ctx = fixture.context(vec![cli_account()], &absent_lookup);
         assert_eq!(
             attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
+                &cli_quota_event(&fixture, CLI_SESSION, T0 + 9_000),
                 HookSource::Cli,
                 &ctx,
-                10_000
+                T0 + 10_000
             ),
             None
         );
         std::fs::remove_dir_all(&fixture.root).ok();
+    }
+
+    /// 时钟异常（请求时刻晚于当前时刻）时不猜：不得回退到消费时刻归因。
+    #[test]
+    fn future_request_time_is_dropped() {
+        let fixture = Fixture::new();
+        fixture.write_session_registry(4242, CLI_SESSION, T0 + 500);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, T0 + 1);
+        let ctx = fixture.context(vec![cli_account()], &absent_lookup);
+        assert_eq!(
+            attribute(
+                &cli_quota_event(&fixture, CLI_SESSION, T0 + 11_000),
+                HookSource::Cli,
+                &ctx,
+                T0 + 10_000
+            ),
+            None,
+            "request_at 晚于当前时刻必须丢弃，即使快照与 mtime 本来会归到当前账号"
+        );
     }
 
     /// 归因到的账号不在账号库（用户删了账号）→ 丢弃，不误归。
@@ -1285,17 +1654,18 @@ mod tests {
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![json!({ "id": "acc-other" })], &lookup);
         fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
+        set_state_mtime(&fixture, T0 + 1);
         let session = "s-1";
-        fixture.write_session_registry(4242, session, 500);
+        fixture.write_session_registry(4242, session, T0 + 500);
         fixture.append(&[stop_payload(
             session,
             "hy3",
             &fixture.cli_transcript(session),
+            Some(T0 + 900),
         )]);
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(false));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(false));
         assert!(state.events.is_empty());
         assert_eq!(state.last_event_at, None, "没有入账就不算事件时刻");
         assert!(state.offset > 0, "已消费的行不得反复重读");
@@ -1320,9 +1690,10 @@ mod tests {
             "s-wb",
             "hy3",
             &fixture.workbuddy_transcript("s-wb"),
+            Some(T0 + 900),
         )]);
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
         assert_eq!(state.events[0].account_id, "acc-wb");
 
         // ② 登录态文件缺失 → 会话兜底；③ 兜底也拿不到 → 丢弃。
@@ -1336,15 +1707,17 @@ mod tests {
                 "s-fallback",
                 "hy3",
                 &fixture.workbuddy_transcript("s-fallback"),
+                Some(T0 + 900),
             ),
             stop_payload(
                 "s-unknown",
                 "hy3",
                 &fixture.workbuddy_transcript("s-unknown"),
+                Some(T0 + 900),
             ),
         ]);
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
         assert_eq!(state.events.len(), 1, "只有兜底命中的那条入账");
         assert_eq!(state.events[0].account_id, "acc-session");
     }
@@ -1379,21 +1752,22 @@ mod tests {
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
+        set_state_mtime(&fixture, T0 + 1);
         let session = "s-1";
-        fixture.write_session_registry(4242, session, 500);
+        fixture.write_session_registry(4242, session, T0 + 500);
         fixture.append(&[stop_payload(
             session,
             "hy3",
             &fixture.cli_transcript(session),
+            Some(T0 + 900),
         )]);
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
         assert!(state.offset > 0);
 
         // 用户/编辑器把文件截短（或轮转掉）→ 偏移必须回退到可读范围，且不产生重复条目。
         std::fs::write(fixture.events(), "").expect("清空事件文件");
-        assert_eq!(consume_with(&ctx, &mut state, 2_000), None);
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 2_000), None);
         assert_eq!(state.offset, 0);
         assert_eq!(state.events.len(), 1, "同一事件不得重复入账");
     }
@@ -1404,16 +1778,21 @@ mod tests {
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
+        set_state_mtime(&fixture, T0 + 1);
         let session = "s-1";
-        fixture.write_session_registry(4242, session, 500);
-        let payload = stop_payload(session, "hy3", &fixture.cli_transcript(session));
+        fixture.write_session_registry(4242, session, T0 + 500);
+        let payload = stop_payload(
+            session,
+            "hy3",
+            &fixture.cli_transcript(session),
+            Some(T0 + 900),
+        );
         // 先把文件撑到轮转阈值，再在末尾追一条事件。
         let filler = "x".repeat(COMPACT_AFTER_BYTES as usize);
         std::fs::write(fixture.events(), format!("{filler}\n{payload}\n")).expect("大事件文件");
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(consume_with(&ctx, &mut state, T0 + 1_000), Some(true));
         assert_eq!(state.events.len(), 1);
         assert_eq!(state.offset, 0, "轮转后偏移归零");
         assert!(!fixture.events().exists(), "旧文件已轮转删除");

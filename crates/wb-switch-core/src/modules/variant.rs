@@ -20,6 +20,11 @@ const AI_DOMAIN_SUFFIX: &str = ".workbuddy.ai";
 /// 国际版 billing 接口前缀（实测形态；国内版为 config 里的 `/v2/billing/meter`）。
 const AI_BILLING_PREFIX: &str = "/billing/meter";
 
+/// CodeBuddy 系产品域：国内版（客户端 `product.json` 的 internalDomain 成员）。
+const CN_CODEBUDDY_DOMAIN: &str = "www.codebuddy.cn";
+/// CodeBuddy 系产品域：国际版（客户端 `product.json` 的 externalDomain 成员）。
+const AI_CODEBUDDY_DOMAIN: &str = "www.codebuddy.ai";
+
 const CN_AUTH_FILE_NAME: &str = "workbuddy-desktop.info";
 const AI_AUTH_FILE_NAME: &str = "workbuddy-desktop-ai.info";
 const CN_DATA_ROOT: &str = ".workbuddy";
@@ -53,6 +58,26 @@ impl HostOs {
         return Self::Windows;
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         return Self::Linux;
+    }
+}
+
+/// 注入 CodeBuddy 系目标（VS Code 扩展 / CN IDE / 国际版 IDE）前的产品域规范化。
+///
+/// WorkBuddy 客户端首次登录写下的 `www.workbuddy.{cn,ai}` 不在 CodeBuddy 客户端
+/// `product.json` 的 internalDomain / externalDomain 列表里，扩展会把它归类为
+/// `selfhosted`——该分支会读取「企业版端点」设置（`enterpriseEndpoint`），用户一旦配置
+/// 就会把请求打到那个端点。这里只映射两个已知产品域；其它域（企业自建 / iOA /
+/// cloudHosted / 已是 codebuddy 域）原样透传；空域按档位补产品默认域（避免国际版账号
+/// 空域回落到国内默认端点）。WorkBuddy 桌面目标不经过这里，保持原域。
+pub fn codebuddy_domain_for(domain: &str, variant: WbVariant) -> String {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        return variant.codebuddy_domain().to_string();
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "www.workbuddy.cn" | "workbuddy.cn" => CN_CODEBUDDY_DOMAIN.to_string(),
+        "www.workbuddy.ai" | "workbuddy.ai" => AI_CODEBUDDY_DOMAIN.to_string(),
+        _ => trimmed.to_string(),
     }
 }
 
@@ -145,6 +170,14 @@ impl WbVariant {
         WORKBUDDY_API_PREFIX
     }
 
+    /// CodeBuddy 系目标的规范产品域（注入会话时使用）。
+    pub fn codebuddy_domain(self) -> &'static str {
+        match self {
+            Self::Cn => CN_CODEBUDDY_DOMAIN,
+            Self::Ai => AI_CODEBUDDY_DOMAIN,
+        }
+    }
+
     /// OAuth `platform` 参数。
     pub fn oauth_platform(self) -> &'static str {
         match self {
@@ -179,7 +212,6 @@ impl WbVariant {
     // -----------------------------------------------------------------------
     // 本地
     // -----------------------------------------------------------------------
-
     /// 官方登录态文件路径（两档位同目录、不同文件）。
     pub fn auth_file_path(self) -> PathBuf {
         self.auth_file_path_at(&home_dir(), HostOs::current())
@@ -363,20 +395,25 @@ mod tests {
     #[test]
     fn auth_file_path_covers_three_platforms() {
         let home = Path::new("/home/tester");
+        // 比较 Path 而非 to_string_lossy：Windows 的 Path::join 产出 `\` 分隔符，
+        // 写死正斜杠的字符串断言会在 Windows 上失败——分隔符不是被测行为的一部分。
         let cn = WbVariant::Cn.auth_file_path_at(home, HostOs::Macos);
         assert_eq!(
-            cn.to_string_lossy().replace('\\', "/"),
-            "/home/tester/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+            cn,
+            home.join("Library/Application Support/CodeBuddyExtension/Data/Public/auth")
+                .join("workbuddy-desktop.info")
         );
         let cn_win = WbVariant::Cn.auth_file_path_at(home, HostOs::Windows);
         assert_eq!(
-            cn_win.to_string_lossy().replace('\\', "/"),
-            "/home/tester/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+            cn_win,
+            home.join("AppData/Local/CodeBuddyExtension/Data/Public/auth")
+                .join("workbuddy-desktop.info")
         );
         let cn_linux = WbVariant::Cn.auth_file_path_at(home, HostOs::Linux);
         assert_eq!(
-            cn_linux.to_string_lossy().replace('\\', "/"),
-            "/home/tester/.local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+            cn_linux,
+            home.join(".local/share/CodeBuddyExtension/Data/Public/auth")
+                .join("workbuddy-desktop.info")
         );
 
         for os in [HostOs::Macos, HostOs::Windows, HostOs::Linux] {
@@ -461,14 +498,13 @@ mod tests {
             WbVariant::Ai.macos_bundle_id(),
             "com.workbuddy.workbuddy-ai"
         );
-        assert_eq!(
-            WbVariant::Cn.macos_default_app_path().to_string_lossy().replace('\\', "/"),
-            "/Applications/WorkBuddy.app"
-        );
-        assert_eq!(
-            WbVariant::Ai.macos_default_app_path().to_string_lossy().replace('\\', "/"),
-            "/Applications/WorkBuddy AI.app"
-        );
+        // 断言父目录与文件名，而不是整串字符串：Windows 上 join 产出 `\`。
+        let cn_app = WbVariant::Cn.macos_default_app_path();
+        assert_eq!(cn_app.parent(), Some(Path::new("/Applications")));
+        assert_eq!(cn_app.file_name().unwrap(), "WorkBuddy.app");
+        let ai_app = WbVariant::Ai.macos_default_app_path();
+        assert_eq!(ai_app.parent(), Some(Path::new("/Applications")));
+        assert_eq!(ai_app.file_name().unwrap(), "WorkBuddy AI.app");
     }
 
     #[test]
@@ -523,5 +559,43 @@ mod tests {
         // 空域名无法判定：不阻断（由调用方决定兼容策略）。
         assert!(WbVariant::Cn.matches_domain(""));
         assert!(WbVariant::Ai.matches_domain("   "));
+    }
+
+    #[test]
+    fn codebuddy_domain_normalizes_workbuddy_product_domains() {
+        // WorkBuddy 产品域 → 对应 CodeBuddy 产品域（带不带 www 都映射）。
+        assert_eq!(
+            codebuddy_domain_for("www.workbuddy.cn", WbVariant::Cn),
+            "www.codebuddy.cn"
+        );
+        assert_eq!(
+            codebuddy_domain_for("workbuddy.cn", WbVariant::Cn),
+            "www.codebuddy.cn"
+        );
+        assert_eq!(
+            codebuddy_domain_for("WWW.WORKBUDDY.AI", WbVariant::Ai),
+            "www.codebuddy.ai"
+        );
+
+        // 已是 CodeBuddy 域 / 企业自建域 / iOA 域 → 原样透传（不改客户私有部署）。
+        assert_eq!(
+            codebuddy_domain_for("www.codebuddy.cn", WbVariant::Cn),
+            "www.codebuddy.cn"
+        );
+        assert_eq!(
+            codebuddy_domain_for("corp.example.com", WbVariant::Cn),
+            "corp.example.com"
+        );
+        assert_eq!(
+            codebuddy_domain_for("tencent.sso.codebuddy.cn", WbVariant::Cn),
+            "tencent.sso.codebuddy.cn"
+        );
+
+        // 空域 / 纯空白 → 按档位补产品默认域。
+        assert_eq!(codebuddy_domain_for("", WbVariant::Cn), "www.codebuddy.cn");
+        assert_eq!(
+            codebuddy_domain_for("   ", WbVariant::Ai),
+            "www.codebuddy.ai"
+        );
     }
 }

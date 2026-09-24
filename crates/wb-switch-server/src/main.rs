@@ -19,7 +19,8 @@ fn default_port() -> u16 {
     57890
 }
 
-/// 后台任务：自动签到启动即核验、每 30 分钟补签；自动轮换按配置间隔执行；
+/// 后台任务：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
+/// 签到时间段时固定 30 分钟）；自动轮换按配置间隔执行；
 /// 限额 hook 信号每秒轮询一次、启动时后台默认接入。
 fn spawn_background_loops() {
     tokio::spawn(async move {
@@ -28,7 +29,7 @@ fn spawn_background_loops() {
         }
         let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
         loop {
-            tokio::time::sleep(checkin::CHECKIN_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(checkin::next_cycle_delay()).await;
             let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
         }
     });
@@ -100,13 +101,13 @@ fn variant_arg(args: &[String]) -> WbVariant {
 
 fn print_status(variant: WbVariant) {
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().map(|a| {
+    let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
-        })
+        Some(json!({
+            "uid": account::display_value(&acct, "uid"),
+            "nickname": account::display_value(&acct, "nickname"),
+            "email": account::display_value(&acct, "email"),
+        }))
     });
     let running = process::is_workbuddy_running(variant);
     println!("workbuddy-switch v{}", update::APP_VERSION);
@@ -134,13 +135,7 @@ async fn main() {
         "version" | "--version" | "-V" => {
             println!("workbuddy-switch {}", env!("CARGO_PKG_VERSION"));
         }
-        "serve" => serve(&args).await,
-        // 未知子命令：给出用法提示而不是静默启动服务（避免误输入时以为命令已生效）
-        other => {
-            eprintln!("未知子命令: {other}");
-            eprintln!("用法: workbuddy-switch [serve|status|version] [--port <port>]");
-            std::process::exit(2);
-        }
+        "serve" | _ => serve(&args).await,
     }
 }
 

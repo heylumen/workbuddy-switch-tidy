@@ -93,23 +93,184 @@ export interface Session {
   isPlayground?: boolean;
 }
 
+/** 临时备份的清理状态：cleaned 已回收；pending 已保留待下次维护重试；legacyRetained 旧操作无生命周期记录。 */
+export type SessionBackupCleanupState = "cleaned" | "pending" | "legacyRetained";
+
+/**
+ * 临时备份残留（待清理 / 待恢复）：复制、同步、恢复报告共用同一结构。
+ * `cleanupPending` 表示已完成但本轮没清理成功（下次切号重试）；`needsRecovery`
+ * 表示必须保留材料、需要恢复流程或人工确认。
+ */
+export interface TemporaryFileInfo {
+  operationId: string;
+  sessionId?: string;
+  title?: string;
+  state: "cleanupPending" | "needsRecovery";
+  reason: string;
+}
+
+/** 本次新建的副本（目标 UUID 由后端预分配）。 */
 export interface CopyResult {
   id: string;
   newId: string;
-  jsonlCopied: boolean;
-  mappingWritten: boolean;
-  backup: string;
+  groupId: string;
+  /** 待清理位置（已清理为 null）；仅表示待清理，不是可撤销备份。 */
+  backup: string | null;
+  /** 成功后立即清理：cleaned 已回收 / pending 待下次维护重试；旧后端可能缺字段。 */
+  cleanupState?: SessionBackupCleanupState;
+  /** 清理失败原因（`cleanupState` 为 pending 时有值）。 */
+  cleanupError?: string;
+}
+
+/** 目标账号上已有真实有效的副本：复用而不是重复复制。 */
+export interface LinkedCopyResult {
+  id: string;
+  sessionId: string;
+  groupId: string;
 }
 
 /** 切换时的会话复制报告；复制失败时后端只回 `error`（切换本身仍继续）。 */
 export interface SessionCopyReport {
-  sourceUid: string;
-  targetUid: string;
-  /** 错误分支不返回该字段：后端只给 `{ error }`。 */
+  sourceUid?: string;
+  targetUid?: string;
   copied?: CopyResult[];
+  alreadyLinked?: LinkedCopyResult[];
   errors?: { id: string; error: string }[];
+  /** 仍有未完成的会话写入时为 true（失败项可重试，不会产生第二个副本）。 */
+  needsRecovery?: boolean;
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
   error?: string;
 }
+
+/** 切换前对未完成会话写入的恢复结果。 */
+export interface SessionRecoveryReport {
+  recovered: number;
+  abandoned: number;
+  needsRecovery: { operationId: string; reason: string; retryable: boolean }[];
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// 会话同步（关联组）：预览与执行契约，与 core / Tauri / HTTP 三端同形
+// ---------------------------------------------------------------------------
+
+/**
+ * 同步判定结果（design §3.2 优先级表）：
+ * `identical` 两边一致、`fastForward` 有新增可同步、`ahead` 仅目标账号有更新、
+ * `diverge` 两边都改过需显式覆盖、`unknown` 无法确认。
+ */
+export type SessionSyncVerdict = "identical" | "fastForward" | "ahead" | "diverge" | "unknown";
+
+/** 同步写入模式：只有后端 `availableModes` 里给出的模式才允许提交。 */
+export type SessionSyncMode = "fastForward" | "overwrite";
+
+/** 关联组成员（不含正文）：`state` 为 active 时才算该账号的有效成员。 */
+export interface SessionLinkMember {
+  memberId: string;
+  uid: string;
+  accountId: string | null;
+  sessionId: string;
+  state: "active" | "stale" | "superseded";
+}
+
+/** 关联组的预览项；`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源。 */
+export interface SessionLinkPreviewGroup {
+  groupId: string;
+  title: string;
+  cwd: string;
+  verdict: SessionSyncVerdict;
+  /** 来源独有记录数（多重集差集，仅用于向用户解释）。 */
+  extraA: number;
+  /** 目标独有记录数（多重集差集，仅用于向用户解释）。 */
+  extraB: number;
+  common: number;
+  defaultChecked: boolean;
+  /** 为空表示该项不可勾选（identical / ahead / unknown / 预览凭据不可用）。 */
+  availableModes: SessionSyncMode[];
+  reason: string;
+  /** 记录数（不是消息数）：不可验证时 source/target 为 0、baseline 为 null。 */
+  recordCount: { source: number; target: number; baseline: number | null };
+  source: SessionLinkMember | null;
+  target: SessionLinkMember | null;
+  /** 勾选时必须原样回传的预览凭据；缺失即不可勾选。 */
+  previewToken?: string;
+}
+
+/** 关联会话预览：`supported` 为 false（或 storeStatus 为 unsupported）时不展示同步区块。 */
+export interface SessionLinksPreview {
+  supported: boolean;
+  storeStatus: "ready" | "missing" | "unavailable" | "unsupported";
+  storeError?: string;
+  sourceUid: string;
+  targetUid: string;
+  groups: SessionLinkPreviewGroup[];
+}
+
+/** 一条同步选择：与预览凭据绑定，执行时后端会重新校验。 */
+export interface SessionSyncSelection {
+  groupId: string;
+  previewToken: string;
+  mode: SessionSyncMode;
+}
+
+/** 已同步的关联组（保留目标 sessionId 与标题）。 */
+export interface SessionSyncResultItem {
+  groupId: string;
+  status: "synced";
+  verdict: SessionSyncVerdict;
+  mode: SessionSyncMode;
+  sourceSessionId: string;
+  targetSessionId: string;
+  recordCount: { source: number; targetBefore: number; target: number };
+  updatedAt: number;
+  /** 待清理位置（已清理为 null）；旧操作可能仍返回目录路径。 */
+  backup: string | null;
+  backupManifest: string | null;
+  /** 成功后立即清理：cleaned 表示临时备份已回收；pending 表示待下次维护重试。 */
+  cleanupState?: SessionBackupCleanupState;
+  cleanupError?: string;
+  message: string;
+}
+
+/** 被跳过的关联组：`reasonCode` 为 previewStale 时说明预览已过期，不得显示为成功。 */
+export interface SessionSyncSkippedItem {
+  groupId: string;
+  status: "skipped";
+  reasonCode: string;
+  message: string;
+  verdict: SessionSyncVerdict | null;
+}
+
+/** 同步执行报告；`errors` 里可能是整批被拒（无 groupId）。 */
+export interface SessionSyncReport {
+  synced: SessionSyncResultItem[];
+  skipped: SessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
+  /** 仍有未完成/无法安全恢复的会话写入时为 true。 */
+  needsRecovery?: boolean;
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
+}
+
+/**
+ * 应用内通知存档条目：toast 只存活几秒，这里保存最近 100 条供事后回看
+ * （支持排障与验收核对，例如切号成功后到底提示了什么）。
+ */
+export interface AppNotification {
+  level: "success" | "error" | "warning" | "info";
+  title: string;
+  description?: string;
+  /** 毫秒时间戳。 */
+  at: number;
+}
+
+/**
+ * 错误日志来源（`~/.wb-switch/error.log` 的 `kind` 字段）：
+ * 渲染崩溃 / 未捕获异常或 Promise 拒绝 / 后端错误。
+ */
+export type ErrorLogKind = "frontend_crash" | "frontend_unhandled" | "backend";
 
 export interface SwitchResult {
   ok: boolean;
@@ -118,10 +279,18 @@ export interface SwitchResult {
   variant?: WbVariant;
   backup: string | null;
   sessionCopy?: SessionCopyReport;
+  /** 本次的会话同步报告（未勾选同步时不返回）；含跳过与失败原因，不只是成功数。 */
+  sessionSync?: SessionSyncReport;
+  sessionRecovery?: SessionRecoveryReport;
 }
 
 export interface CheckinConfig {
   enabled: boolean;
+  /** 关闭自动签到的账号 id；状态展示和刷新附带签到也跳过，主动手动签到不受影响。 */
+  excluded_account_ids?: string[];
+  /** 签到时间段（"HH:MM"，本地时区）；空串 = 不限制。两端都合法且 start < end 才生效。 */
+  checkin_start: string;
+  checkin_end: string;
   /** Legacy persisted fields; accepted by the backend but ignored by scheduling. */
   start_hour?: number;
   end_hour?: number;
@@ -495,6 +664,29 @@ export interface UpdateInfo {
   message?: string;
 }
 
+/** 统一更新服务的阶段（Rust 状态机，经 `update-state` 事件推送）。 */
+export type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "upToDate"
+  | "available"
+  | "downloading"
+  | "readyToRestart"
+  | "error";
+
+/**
+ * 更新状态快照：托盘菜单与前端弹窗显示同一阶段（单一真相源在 Rust）。
+ *
+ * `latest` 无 `v` 前缀；`percent` 在下载总量未知时为 null；`message` 是错误 / 提示文案。
+ */
+export interface UpdateSnapshot {
+  phase: UpdatePhase;
+  latest: string | null;
+  percent: number | null;
+  message: string | null;
+  checkedAt: number | null;
+}
+
 /** CodeBuddy CN IDE（桌面客户端）状态；与 CodeBuddy CLI 独立。 */
 export interface CodeBuddyCnIdeStatus {
   installed: boolean;
@@ -543,3 +735,129 @@ export interface LimitsLedger {
   coverageStartAt?: number | null;
   coverageEndAt?: number | null;
 }
+/** VS Code 内 CodeBuddy 扩展（tencent-cloud.coding-copilot）状态；与 CN IDE / CLI 独立。 */
+export interface VscodeExtStatus {
+  /** VS Code 用户数据目录是否存在。 */
+  installed: boolean;
+  /** CodeBuddy 扩展是否已安装（globalStorage/<extensionId> 存在）。 */
+  extensionInstalled: boolean;
+  running: boolean;
+  /**
+   * 是否存在扩展登录态（`state.vscdb` 里有会话 secret 行）。
+   *
+   * 只读查询、不解密；查询失败或文件不存在时为 false。仅用于提示文案，
+   * 不参与切换判定（false 时切换按新会话写入，同样可用）。
+   */
+  loggedIn: boolean;
+  dataDir: string | null;
+  dbPath: string | null;
+  dbExists: boolean;
+  activeAccountId: string | null;
+  activeAccountName: string | null;
+  detectedFrom?: string;
+  statePath?: string;
+}
+
+export interface VscodeExtSwitchResult {
+  ok: boolean;
+  account: string;
+  accountId: string;
+  dbPath?: string;
+  /** 本次是否真的执行了「关闭并重新打开 VS Code」（切换前未运行时为 false）。 */
+  restarted?: boolean;
+  /** 本次切换是否由 wb-switch 关闭了 VS Code（为 false 时表示编辑器本来没运行）。 */
+  closedByUs?: boolean;
+  /** 切换前是否读到了既有会话；false = 扩展未登录，按新会话载荷写入。 */
+  existingSession?: boolean;
+  /**
+   * 后端生成的生效说明：区分「已重新打开 VS Code」「自动重开失败（含原因）」
+   * 「本来未运行」三种情形，不再出现「重载窗口生效」。
+   */
+  message?: string;
+  /** 切换时复制会话的结果（未勾选复制时不返回）。 */
+  sessionCopy?: VscodeSessionCopyResult;
+  /** 切换时同步关联会话的结果（未勾选同步时不返回）。 */
+  sessionSync?: VscodeSessionSyncReport;
+}
+
+/** VS Code 扩展的一条可复制会话。 */
+export interface VscodeSession {
+  /** 会话 id（32 位小写 hex）。 */
+  id: string;
+  /** 工作区目录名 md5(工作区)（32 位小写 hex，不可反解为路径）。 */
+  workspaceHash: string;
+  /** 会话标题；无标题时为 "(无标题)"。 */
+  title: string;
+  /** 最近消息时间（epoch 毫秒，0 表示未知）。 */
+  updatedAt: number;
+  /** 会话类型（如 "craft"）。 */
+  type: string;
+  /** 是否包含正文消息。 */
+  hasHistory: boolean;
+}
+
+/** 复制某项会话的引用（工作区 hash + 会话 id）。 */
+export interface VscodeSessionRef {
+  workspaceHash: string;
+  conversationId: string;
+}
+
+/** VS Code 扩展会话复制结果。 */
+export interface VscodeSessionCopyResult {
+  sourceUid: string | null;
+  targetUid: string;
+  copied: { workspaceHash: string; oldId: string; newId: string; messages: number }[];
+  errors?: { workspaceHash: string; conversationId: string; error: string }[];
+  /** 索引备份根目录（便于用户找回）。 */
+  backup?: string;
+  /**
+   * 已复制但未能建立关联的条目（复制成功、登记失败；登记失败不回滚复制）。
+   * 前端据此提示「已复制但未建立关联」，不得静默当成成功。
+   */
+  linkErrors?: { workspaceHash?: string; conversationId?: string; error: string }[];
+}
+
+/** VS Code 插件侧「关联会话」的同步结果项（与 core 报告同形）。 */
+export interface VscodeSessionSyncResultItem {
+  groupId: string;
+  status: "synced";
+  verdict: SessionSyncVerdict;
+  mode: SessionSyncMode;
+  /** 记录数（条）：source 为来源当前条数，targetBefore/target 为副本写入前后条数。 */
+  recordCount: { source: number; targetBefore: number; target: number };
+  /** 附件合并结果（快进模式补入的附件）。 */
+  assets: { copied: number; overwritten: number };
+  /** 本次备份目录（快进为索引备份，覆盖为整目录备份）。 */
+  backup: string;
+  message: string;
+}
+
+/** 被跳过的同步项（`reasonCode` 为 previewStale 时说明预览已过期，不得显示为成功）。 */
+export interface VscodeSessionSyncSkippedItem {
+  groupId: string;
+  status: "skipped";
+  reasonCode: string;
+  message: string;
+  verdict: SessionSyncVerdict | null;
+}
+
+/** VS Code 插件侧「关联会话」同步报告；`errors` 里可能是整批被拒（无 groupId）。 */
+export interface VscodeSessionSyncReport {
+  synced: VscodeSessionSyncResultItem[];
+  skipped: VscodeSessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
+}
+
+/** 可复制会话列表。 */
+export interface VscodeSessionList {
+  sourceUid: string | null;
+  sessions: VscodeSession[];
+  /** 无法解析（损坏）的工作区索引数量。 */
+  skipped?: number;
+  /**
+   * 扩展数据根目录；`null` 表示未找到（与「有目录但没有会话」区分）。
+   * 可选：旧后端不返回该字段时为 `undefined`，前端按旧文案处理。
+   */
+  dataRoot?: string | null;
+}
+

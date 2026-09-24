@@ -1,19 +1,19 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "workbuddy-switch-tidy",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "identifier": "com.wbswitch.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "vite build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
   "app": {
     "windows": [
       {
         "label": "main",
-        "title": "workbuddy-switch-tidy",
+        "title": "workbuddy-switch · WorkBuddy 账号切换",
         "width": 1000,
         "height": 720,
         "minWidth": 720,

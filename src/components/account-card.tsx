@@ -1,4 +1,4 @@
-import { ArrowRight, Eraser, Layers, CalendarCheck2, CalendarDays, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowRight, Eraser, Layers, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
+import { CodeBuddyCnIdeMark, CodeBuddyMark, VscodeExtMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import * as api from "@/lib/api";
@@ -42,18 +42,27 @@ function formatCredits(value: number): string {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
 }
 
+/** 积分包到期时刻（精确到分）。行内不再带「到期」后缀：区块标题已表达，带后缀会把名称列挤到截断。 */
 function formatCreditExpiry(ts: number | null): string {
   if (!ts) return "长期有效";
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return "长期有效";
-  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} 到期`;
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} ${hh}:${mm}`;
 }
 
-function formatFullDate(ts: number | null): string {
+function formatFullDateTime(ts: number | null): string {
   if (!ts) return "—";
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatCreditUpdatedAt(ts: number | undefined): string {
@@ -102,6 +111,7 @@ function statusIconChip({
   tooltip,
   variant,
   count,
+  muted,
 }: {
   icon: ReactNode;
   label: string;
@@ -109,12 +119,18 @@ function statusIconChip({
   variant: "secondary" | "success" | "warning";
   /** 数量角标；≤1 时不显示（单个受限模型不需要角标）。 */
   count?: number;
+  /** 置灰（未激活状态，如「未旅行」）：图标与角标一起使用 muted 前景色。 */
+  muted?: boolean;
 }) {
   const badge = count != null && count > 1;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Badge variant={variant} className={cn(chipClass, "px-1", badge && "gap-0.5")} aria-label={label}>
+        <Badge
+          variant={variant}
+          className={cn(chipClass, "px-1", badge && "gap-0.5", muted && "text-muted-foreground")}
+          aria-label={label}
+        >
           {icon}
           {badge ? (
             <span
@@ -135,12 +151,14 @@ function travelIconChip({
   label,
   tooltip,
   variant,
+  muted,
 }: {
   label: string;
   tooltip: string;
   variant: "secondary" | "success";
+  muted?: boolean;
 }) {
-  return statusIconChip({ icon: <PlaneTakeoff className="size-3.5" />, label, tooltip, variant });
+  return statusIconChip({ icon: <PlaneTakeoff className="size-3.5" />, label, tooltip, variant, muted });
 }
 
 function formatTravelRemaining(arriveAt: number | null | undefined): string | null {
@@ -175,7 +193,7 @@ function travelTooltip(status: TravelStatus): string {
   return "未旅行";
 }
 
-/** 按旅行状态渲染标签：无 Buddy / 未旅行 / 旅行中 / 已结束。 */
+/** 按旅行状态渲染 chip：无 Buddy 用文字 badge；未旅行用置灰图标；旅行中 / 已结束用图标 chip。 */
 function travelChip(status: TravelStatus | undefined) {
   if (!status) return null;
   switch (status.label) {
@@ -187,8 +205,16 @@ function travelChip(status: TravelStatus | undefined) {
       return travelIconChip({ label: travelTooltip(status), tooltip: travelTooltip(status), variant: "success" });
     case "untraveled":
     default:
-      return <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>未旅行</Badge>;
+      // 未旅行是多数账号的常态：只留置灰图标，文案交给 tooltip。
+      return travelIconChip({ label: "未旅行", tooltip: "未旅行", variant: "secondary", muted: true });
   }
+}
+
+/** VS Code 目标 tooltip：区分「未装 VS Code / 未装扩展 / 可切换」三态。 */
+function vscodeExtTooltip(installed?: boolean, extensionInstalled?: boolean): string {
+  if (!installed) return "未检测到 VS Code";
+  if (!extensionInstalled) return "未检测到 VS Code CodeBuddy 插件";
+  return "切换 VS Code CodeBuddy 插件账号（可选复制会话；可自动关闭并重开）";
 }
 
 /** 倒计时：`2h14m 后恢复`；不足 1 分钟按「即将恢复」，已过期由调用方过滤。 */
@@ -256,6 +282,8 @@ interface Props {
   onRefresh?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
   todayCheckedIn?: boolean;
+  /** 单账号参与许可，独立于全局开关；undefined 表示配置尚未加载。 */
+  autoCheckinAllowed?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
   travelStatus?: TravelStatus;
   /** 该账号当前受限的模型（来自本机日志台账）；空/缺失=无受限，不渲染图标。 */
@@ -279,18 +307,32 @@ interface Props {
   codebuddyCnIdeBusy?: boolean;
   codebuddyCnIdeLoading?: boolean;
   onSwitchCodebuddyCnIde?: (a: AccountMeta) => void;
+  /** VS Code 是否已安装（用户数据目录存在）。 */
+  vscodeExtInstalled?: boolean;
+  /** CodeBuddy 扩展是否已安装。 */
+  vscodeExtExtensionInstalled?: boolean;
+  /** VS Code 与扩展均已就绪，可执行切换。 */
+  vscodeExtAvailable?: boolean;
+  vscodeExtActive?: boolean;
+  /** 任一 VS Code 扩展账号切换正在进行，用于阻止并发切换。 */
+  vscodeExtBusy?: boolean;
+  /** 当前卡片是否为正在切换的目标账号。 */
+  vscodeExtLoading?: boolean;
+  onSwitchVscodeExt?: (a: AccountMeta) => void;
   featuresDisabled?: boolean;
   /** 紧凑模式：头部缩成一条、按钮图标化、无 footer */
   compact?: boolean;
 }
 
-function ProductCurrentState({ product, compact = false }: { product: "workbuddy" | "codebuddy" | "codebuddy-cn"; compact?: boolean }) {
+function ProductCurrentState({ product, compact = false }: { product: "workbuddy" | "codebuddy" | "codebuddy-cn" | "vscode-ext"; compact?: boolean }) {
   const title =
     product === "workbuddy"
       ? "WorkBuddy 当前账号"
       : product === "codebuddy-cn"
         ? "CodeBuddy IDE 当前账号"
-        : "CodeBuddy CLI 当前账号";
+        : product === "vscode-ext"
+          ? "VS Code CodeBuddy 插件当前账号"
+          : "CodeBuddy CLI 当前账号";
   return (
     <span
       role="status"
@@ -305,6 +347,8 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
         <WorkBuddyMark size={compact ? 18 : 22} />
       ) : product === "codebuddy-cn" ? (
         <CodeBuddyCnIdeMark size={compact ? 18 : 22} />
+      ) : product === "vscode-ext" ? (
+        <VscodeExtMark size={compact ? 18 : 22} />
       ) : (
         <CodeBuddyMark size={compact ? 18 : 22} />
       )}
@@ -341,9 +385,10 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   const name = resource ? creditResourceName(resource, "积分包") : "\u00a0";
   const remainingText = resource ? `${formatCredits(resource.remaining)} 积分` : "\u00a0";
   const expiryText = resource ? formatCreditExpiry(resource.expireAt) : "\u00a0";
+  const expiryTitle = resource?.expireAt ? `${expiryText} 到期` : expiryText;
   const ratio = resource && resource.total > 0 ? Math.min(100, Math.max(0, (resource.remaining / resource.total) * 100)) : 0;
   const barTone = resource && (resource.expiringSoon || resource.expired) ? "bg-orange-500" : "bg-primary";
-  const title = resource ? `${name} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${expiryText}` : undefined;
+  const title = resource ? `${name} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${expiryTitle}` : undefined;
   return (
     <div className={cn("min-w-0", placeholder && "invisible")} aria-hidden={placeholder || undefined} title={title}>
       <div className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3", compact ? "text-[11px]" : "text-xs")}>
@@ -358,7 +403,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, featuresDisabled = true, compact = false }: Props) {
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
   const [collapseOpen, setCollapseOpen] = useState(false);
@@ -391,11 +436,18 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
     })
     .map(({ resource }) => resource);
 
-  const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive].filter(Boolean).length;
+  const activeProductCount = [workbuddyActive, codebuddyCliActive, codebuddyCnIdeActive, vscodeExtActive].filter(Boolean).length;
 
   const statusChips = (
     <>
-      {todayCheckedIn !== undefined &&
+      {autoCheckinAllowed === false &&
+        statusIconChip({
+          icon: <CalendarOff className="size-3.5" />,
+          label: "自动签到已关闭",
+          tooltip: `${todayCheckedIn === undefined ? "" : todayCheckedIn ? "今日已签到。" : "今日未签到。"}该账号已关闭自动签到，刷新时也会忽略，仍可手动签到`,
+          variant: "secondary",
+        })}
+      {autoCheckinAllowed !== false && todayCheckedIn !== undefined &&
         statusIconChip({
           icon: todayCheckedIn ? (
             <CalendarCheck2 className="size-3.5" />
@@ -430,11 +482,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         className={cn(
           "relative flex items-center border-b border-border",
           compact ? "min-h-[52px] px-3.5 py-1.5" : "min-h-[104px] px-5 py-3",
-          /* 选中态染色，优先级：WorkBuddy（品牌绿）> CodeBuddy IDE（淡紫）> CodeBuddy CLI（中性灰）> 默认。
+          /* 选中态染色，优先级：WorkBuddy / VS Code 插件（品牌绿）> CodeBuddy IDE（淡紫）> CodeBuddy CLI（中性灰）> 默认。
              多个产品同时选中时取优先级最高者；具体哪几个产品在使用由 header 的标记+勾选角标表达。
              CodeBuddy IDE 的紫是产品专属色：主题里没有对应语义 token，故用 Tailwind 的 violet-500
              （本文件 AVATAR_TONES 已在用同一调色板），透明度与 WorkBuddy 的 /5、/15 保持同一强度。 */
-          workbuddyActive ? "bg-primary/5" : codebuddyCnIdeActive ? "bg-violet-500/5" : codebuddyCliActive ? "bg-muted/60" : "bg-muted/30",
+          workbuddyActive || vscodeExtActive ? "bg-primary/5" : codebuddyCnIdeActive ? "bg-violet-500/5" : codebuddyCliActive ? "bg-muted/60" : "bg-muted/30",
         )}
       >
         <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -442,7 +494,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
             className={cn(
               "absolute -right-10 -top-16 rounded-full blur-2xl",
               compact ? "size-20" : "size-24",
-              workbuddyActive ? "bg-primary/15" : codebuddyCnIdeActive ? "bg-violet-500/15" : codebuddyCliActive ? "bg-muted/50" : "bg-muted/30",
+              workbuddyActive || vscodeExtActive ? "bg-primary/15" : codebuddyCnIdeActive ? "bg-violet-500/15" : codebuddyCliActive ? "bg-muted/50" : "bg-muted/30",
             )}
           />
           {workbuddyActive && (
@@ -461,6 +513,13 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                完全重合，因此无需再引入第三套偏移规则。 */
             <div className={cn("absolute top-[64%] -translate-y-1/2 opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
               <WorkBuddyMark size={compact ? 40 : 56} />
+            </div>
+          )}
+          {vscodeExtActive && (
+            /* 插件标记是 currentColor 字形（无底块）：显式取品牌绿，与 WorkBuddy 水印同色系；
+               位置规则同 WorkBuddy / IDE，两者同时选中时重合（同样无需第三套偏移规则）。 */
+            <div className={cn("absolute top-[64%] -translate-y-1/2 text-primary opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
+              <VscodeExtMark size={compact ? 40 : 56} />
             </div>
           )}
         </div>
@@ -483,7 +542,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
                   <RefreshCw />刷新 Token
                 </DropdownMenuItem>
-                {todayCheckedIn === false && (
+                {onCheckin && todayCheckedIn !== true && (
                   <DropdownMenuItem disabled={featuresDisabled || !onCheckin} onSelect={() => onCheckin?.(account)}>
                     <CircleCheck />手动签到
                   </DropdownMenuItem>
@@ -559,6 +618,34 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
                 </Tooltip>
               )}
+              {vscodeExtActive ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="relative inline-flex size-7 items-center justify-center rounded-lg border border-primary/25 bg-primary/10 text-primary">
+                      <VscodeExtMark size={15} />
+                      <span className="absolute -right-1 -top-1 flex size-3.5 items-center justify-center rounded-full bg-primary text-primary-foreground">
+                        <Check className="size-2.5" strokeWidth={3} />
+                      </span>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">VS Code CodeBuddy 插件当前账号</TooltipContent>
+                </Tooltip>
+              ) : demoModeEnabled ? (
+                <DemoAction>
+                  <Button variant="outline" size="icon" className="relative size-7 rounded-lg" aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）">
+                    <VscodeExtMark size={15} />
+                  </Button>
+                </DemoAction>
+              ) : (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="outline" size="icon" className="relative size-7 rounded-lg" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）" aria-busy={vscodeExtLoading}>
+                      {vscodeExtLoading ? <Loader2 className="size-3.5 animate-spin" /> : <VscodeExtMark size={15} />}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">{vscodeExtTooltip(vscodeExtInstalled, vscodeExtExtensionInstalled)}</TooltipContent>
+                </Tooltip>
+              )}
               {codebuddyCliActive ? (
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -615,7 +702,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 <strong className={cn("font-semibold leading-none tabular-nums tracking-[-0.025em]", compact ? "text-[20px]" : "text-[22px]")} style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}>{formatCredits(credit.totalRemaining ?? 0)}</strong>
               </span>
               <span className={cn("text-muted-foreground", compact ? "text-[11px]" : "text-xs")}>{resources.length} 个积分包</span>
-              <div className={cn("ml-auto flex items-center gap-1.5 text-muted-foreground", compact ? "text-[11px]" : "text-xs")} title={expiringAmount > 0 ? `${formatCredits(expiringAmount)} 积分将在 7 天内到期` : resources[0]?.expireAt ? `最近到期 ${formatCreditExpiry(resources[0].expireAt).replace(" 到期", "")}` : "当前积分长期有效"}>
+              <div className={cn("ml-auto flex items-center gap-1.5 text-muted-foreground", compact ? "text-[11px]" : "text-xs")} title={expiringAmount > 0 ? `${formatCredits(expiringAmount)} 积分将在 7 天内到期` : resources[0]?.expireAt ? `最近到期 ${formatCreditExpiry(resources[0].expireAt)}` : "当前积分长期有效"}>
                 <Clock3 className="size-3.5 shrink-0" />
                 <span className="whitespace-nowrap tabular-nums">{creditUpdatedAt ? `${formatCreditUpdatedAt(creditUpdatedAt)} 更新` : "—"}</span>
               </div>
@@ -626,7 +713,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               {resources.length > 2 && (
                 <button
                   type="button"
-                  className="inline-flex shrink-0 items-center gap-1 text-[11px] font-medium text-primary transition-colors hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                  className="inline-flex shrink-0 cursor-pointer items-center gap-1 text-[11px] font-medium text-primary transition-colors hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
                   onClick={() => setResourcesOpen(true)}
                 >
                   查看全部积分包
@@ -685,6 +772,22 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
             </Tooltip>
           )}
+          {vscodeExtActive ? <ProductCurrentState product="vscode-ext" compact /> : demoModeEnabled ? (
+            <DemoAction>
+              <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）">
+                <VscodeExtMark size={18} /><span>VS Code</span>
+              </Button>
+            </DemoAction>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label="切换到 VS Code CodeBuddy 插件（可复制会话）" aria-busy={vscodeExtLoading}>
+                  {vscodeExtLoading ? <Loader2 className="size-4 animate-spin" /> : <VscodeExtMark size={18} />}<span>{vscodeExtLoading ? "切换中…" : "VS Code"}</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="top">{vscodeExtTooltip(vscodeExtInstalled, vscodeExtExtensionInstalled)}</TooltipContent>
+            </Tooltip>
+          )}
           {codebuddyCliActive ? <ProductCurrentState product="codebuddy" compact /> : (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -717,7 +820,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium">{creditResourceName(resource, "未命名资源包")}</div>
                         <div className="mt-1 text-[11px] text-muted-foreground">
-                          {resource.expired ? "已到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
+                          {resource.expired ? "已到期" : resource.expireAt ? `到期 ${formatFullDateTime(resource.expireAt)}` : "长期有效"}
                         </div>
                       </div>
                       <div className="shrink-0 text-right text-xs">
@@ -735,7 +838,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
           )}
         </DialogContent>
       </Dialog>
-      <Dialog open={dedupOpen} onOpenChange={(open) => { if (!dedupBusy) setDedupOpen(open); }}>
+    <Dialog open={dedupOpen} onOpenChange={(open) => { if (!dedupBusy) setDedupOpen(open); }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>清理重复会话</DialogTitle>
@@ -833,6 +936,6 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </TooltipProvider>
+</TooltipProvider>
   );
 }
