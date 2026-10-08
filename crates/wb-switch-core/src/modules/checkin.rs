@@ -12,8 +12,13 @@
 //! 窗口内按 (本地日期, 账号 id) 确定性抽一个目标分钟；只有到点未办的账号才发请求，
 //! 未到点整轮不发任何请求。窗口未生效（字段为空/非法）时节奏、payload 与日志
 //! 行为与既有实现逐字一致。
+//!
+//! 账号页「刷新并签到」按 `respect_window=true` 调用 `run_checkin_all`：窗口生效且
+//! 当前时刻不在 `[start, end)` 内时整轮跳过，逐账号返回 `skipped` /
+//! `outside_checkin_window`，不查状态、不提交、不写日志。设置页 / 托盘 / 单账号
+//! 手动入口不传该参数（默认 `false`），保持「立即签到」语义。
 
-use chrono::{Local, TimeZone};
+use chrono::{Local, TimeZone, Timelike};
 use serde_json::{json, Value};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -441,6 +446,51 @@ fn window_minutes(cfg: &Value) -> Option<(u32, u32)> {
     (start < end).then_some((start, end))
 }
 
+/// `now`（ms）的本地分钟是否落在窗口 `[start, end)` 内。
+///
+/// 与抽签 target 同口径：`end` 为开区间。时间戳无法解析成本地时刻时保守判为不在
+/// 窗口内（真实调用方传入 `now_ms()`，不会走到这一支）。
+fn now_in_window(now: i64, win: (u32, u32)) -> bool {
+    Local
+        .timestamp_millis_opt(now)
+        .single()
+        .is_some_and(|dt| (win.0..win.1).contains(&(dt.hour() * 60 + dt.minute())))
+}
+
+/// 手动批量签到的窗口跳过行：仅在 `respect_window` 且窗口生效且当前在窗口外时返回
+/// `Some`（逐账号 `skipped` / `outside_checkin_window`）；否则返回 `None`，调用方走
+/// 原有「立即签」路径。
+///
+/// 返回 `Some` 时整轮不查询状态、不提交、不写日志：行内不携带任何请求结果。
+fn manual_window_skip_rows(
+    accounts: &[Value],
+    cfg: &Value,
+    respect_window: bool,
+    now: i64,
+) -> Option<Vec<Value>> {
+    if !respect_window {
+        return None;
+    }
+    let win = window_minutes(cfg)?;
+    if now_in_window(now, win) {
+        return None;
+    }
+    Some(
+        accounts
+            .iter()
+            .map(|acc| {
+                json!({
+                    "accountId": acc.get("id").cloned().unwrap_or(Value::Null),
+                    "email": account_display_name(acc),
+                    "result": "skipped",
+                    "error": Value::Null,
+                    "reason": "outside_checkin_window",
+                })
+            })
+            .collect(),
+    )
+}
+
 /// 本地日期 `day` 的相邻日（`delta` 为 ±1 天）。
 fn shift_day(day: &str, delta: i64) -> Option<String> {
     let date = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
@@ -787,13 +837,18 @@ fn latest_today_result<'a>(logs: &'a [Value], account_id: &str, today: &str) -> 
         .and_then(|entry| entry.get("result").and_then(Value::as_str))
 }
 
-/// 对全部账号立即签到（前端一键签到）。
+/// 对全部账号批量签到（前端「刷新并签到」/ 一键签到）。
 ///
 /// `variant = None` 覆盖全部档位（设置页与托盘「立即签到」语义）；
 /// 显式传入时只处理该档位（账号页按当前档位触发，避免跨档位误签到）。
 /// 无论哪种取值，都只处理支持签到的档位：国际版没有签到接口，绝不发起请求；
 /// 关闭自动签到的账号同样跳过，并逐账号返回 skipped 原因。
-pub async fn run_checkin_all(variant: Option<WbVariant>) -> Value {
+///
+/// `respect_window` 只由账号页「刷新并签到」传 `true`：窗口生效且当前不在
+/// `[start, end)` 内时整轮跳过（逐账号 `skipped` / `outside_checkin_window`，
+/// 返回 `{"status":"skipped","reason":"outside_checkin_window"}`），窗口外不发
+/// 任何签到请求。设置页 / 托盘 / 单账号手动入口传 `false`，保持立即签到语义。
+pub async fn run_checkin_all(variant: Option<WbVariant>, respect_window: bool) -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&CHECKIN_RUNNING) else {
         return json!({"accounts": [], "status": "skipped", "reason": "already_running"});
     };
@@ -805,6 +860,9 @@ pub async fn run_checkin_all(variant: Option<WbVariant>) -> Value {
             acc_variant.supports_checkin() && variant.is_none_or(|target| acc_variant == target)
         })
         .collect();
+    if let Some(rows) = manual_window_skip_rows(&accounts, &cfg, respect_window, now_ms()) {
+        return json!({"accounts": rows, "status": "skipped", "reason": "outside_checkin_window"});
+    }
     json!({"accounts": checkin_all_rows(accounts, &cfg).await})
 }
 
@@ -1126,7 +1184,7 @@ mod tests {
     async fn manual_all_reports_busy_when_cycle_is_running() {
         let _cycle_guard =
             RunFlagGuard::try_acquire(&CHECKIN_RUNNING).expect("test acquires cycle guard");
-        let result = run_checkin_all(None).await;
+        let result = run_checkin_all(None, false).await;
 
         assert_eq!(result["accounts"], json!([]));
         assert_eq!(result["status"], "skipped");
@@ -1375,6 +1433,73 @@ mod tests {
         assert_eq!(
             window_minutes(&json!({"checkin_start": "0:0", "checkin_end": "1:0"})),
             Some((0, 60))
+        );
+    }
+
+    /// 手动入口窗口判定边界：`[start, end)`，end 整点已在窗口外。
+    #[test]
+    fn now_in_window_covers_window_boundaries() {
+        let win = TEST_WINDOW;
+        assert!(
+            !now_in_window(local_ms(2026, 9, 21, 21, 59), win),
+            "start 前必须判为窗口外"
+        );
+        assert!(
+            now_in_window(local_ms(2026, 9, 21, 22, 0), win),
+            "start 整点必须判为窗口内"
+        );
+        assert!(
+            now_in_window(local_ms(2026, 9, 21, 22, 45), win),
+            "窗口内必须判为窗口内"
+        );
+        assert!(
+            now_in_window(local_ms(2026, 9, 21, 23, 29), win),
+            "end-1 分必须判为窗口内"
+        );
+        assert!(
+            !now_in_window(local_ms(2026, 9, 21, 23, 30), win),
+            "end 整点是开区间，必须判为窗口外"
+        );
+        assert!(
+            !now_in_window(local_ms(2026, 9, 21, 23, 31), win),
+            "end 后必须判为窗口外"
+        );
+    }
+
+    /// 手动批量签到的窗口跳过行：仅 `respect_window + 窗口生效 + 窗口外` 才整轮跳过。
+    #[test]
+    fn manual_window_skip_rows_only_when_respecting_effective_window_outside() {
+        let cfg = json!({"checkin_start": "22:00", "checkin_end": "23:30"});
+        let accounts = vec![
+            json!({"id": "cn-a", "email": "a@example.com"}),
+            json!({"id": "cn-b"}),
+        ];
+        let outside = local_ms(2026, 9, 21, 12, 0);
+        let inside = local_ms(2026, 9, 21, 22, 30);
+
+        // respect_window=false：任何时刻都走立即签路径。
+        assert!(manual_window_skip_rows(&accounts, &cfg, false, outside).is_none());
+        // 窗口未生效（未设置）：不限制，照常立即签。
+        assert!(manual_window_skip_rows(&accounts, &json!({}), true, outside).is_none());
+        // 窗口生效且在窗口内：照常立即签。
+        assert!(manual_window_skip_rows(&accounts, &cfg, true, inside).is_none());
+
+        // 窗口生效且在窗口外：逐账号 skipped 行，整轮不发任何签到请求。
+        let rows = manual_window_skip_rows(&accounts, &cfg, true, outside).expect("窗口外必须跳过");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["accountId"], "cn-a");
+        assert_eq!(rows[0]["email"], "a@example.com");
+        assert_eq!(rows[1]["accountId"], "cn-b");
+        for row in &rows {
+            assert_eq!(row["result"], "skipped");
+            assert_eq!(row["reason"], "outside_checkin_window");
+            assert_eq!(row["error"], Value::Null);
+        }
+
+        // 空账号列表同样按跳过返回空行集。
+        assert_eq!(
+            manual_window_skip_rows(&[], &cfg, true, outside),
+            Some(vec![])
         );
     }
 

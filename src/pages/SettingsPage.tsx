@@ -30,9 +30,12 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
 import { TimePicker } from "@/components/ui/time-picker";
+import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import { canPersistErrorLog } from "@/lib/error-report";
+import { setSessionsNavEnabled, useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
+import { SUPPORTED_TOOLS, setToolEnabled, useSupportedTools, type ToolId } from "@/lib/supported-tools";
 import type {
   AccountMeta,
   AppNotification,
@@ -49,10 +52,12 @@ import type {
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
 import { useUpdateState } from "@/lib/use-update-state";
+import { changeCompanionEnabled, reloadCompanionEnabled, useCompanionEnabled } from "@/lib/use-companion-enabled";
 import { cn } from "@/lib/utils";
-import { accountVariant, variantSupportsCheckin, variantSupportsTravel } from "@/lib/variant";
+import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
+import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface SettingsGroupProps {
@@ -717,7 +722,7 @@ function AutoCheckinCard() {
                     <p className="py-2 text-xs text-muted-foreground">暂无可签到的账号</p>
                   ) : (
                     checkinAccounts.map((account) => {
-                      const name = account.nickname || account.email || account.uid || account.id;
+                      const name = displayName(account);
                       return (
                         <div
                           key={account.id}
@@ -1532,6 +1537,57 @@ function StartupCard() {
   );
 }
 
+/** 桌面版 Agent Companion：状态以宿主后端的持久化结果为准。 */
+function CompanionCard() {
+  const { enabled, busy, error } = useCompanionEnabled();
+
+  async function onToggle(next: boolean) {
+    try {
+      const confirmed = await changeCompanionEnabled(next);
+      toast.success(confirmed ? "已启用 Agent Companion 悬浮窗" : "已关闭 Agent Companion 悬浮窗");
+    } catch (cause) {
+      toast.error("悬浮窗设置失败", { description: api.asError(cause) });
+    }
+  }
+
+  async function openSettings() {
+    try {
+      await api.openCompanionSettings();
+    } catch (error) {
+      toast.error("打开悬浮窗设置失败", { description: api.asError(error) });
+    }
+  }
+
+  return (
+    <SettingsGroup id="settings-companion" title="Agent Companion">
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          className="border-b-0"
+          label="启用会话悬浮窗"
+          description="启用后显示悬浮栏；开机静默启动时也会显示，可从托盘临时隐藏"
+          htmlFor="companion-enabled"
+        >
+          <div className="flex items-center gap-2">
+            {error && enabled === null ? (
+              <Button size="sm" variant="outline" onClick={() => void reloadCompanionEnabled()}>重试</Button>
+            ) : null}
+            {enabled ? (
+              <Button size="sm" variant="outline" onClick={() => void openSettings()}>悬浮窗设置</Button>
+            ) : null}
+            <Switch
+              id="companion-enabled"
+              checked={enabled ?? false}
+              disabled={busy || enabled === null}
+              onCheckedChange={(value) => void onToggle(value)}
+              aria-label="启用会话悬浮窗"
+            />
+          </div>
+        </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 /** 外观：主题选择（持久化到 localStorage）。 */
 const NOTIFICATION_LEVEL_LABEL: Record<AppNotification["level"], string> = {
   success: "成功",
@@ -1748,6 +1804,7 @@ function ErrorLogCard() {
 
 function AppearanceCard() {
   const [theme, setTheme] = useState<ThemePreference>(getThemePreference);
+  const sessionsNavEnabled = useSessionsNavEnabled();
 
   function onThemeChange(value: string) {
     if (value !== "system" && value !== "light" && value !== "dark") return;
@@ -1762,7 +1819,6 @@ function AppearanceCard() {
     >
       <CardContent className="space-y-0 p-0">
         <SettingsFieldRow
-          className="border-b-0"
           label="主题"
           description="选择浅色、深色，或跟随系统外观自动切换"
           htmlFor="appearance-theme"
@@ -1778,6 +1834,68 @@ function AppearanceCard() {
             </SelectContent>
           </Select>
         </SettingsFieldRow>
+        <SettingsFieldRow
+          className="border-b-0"
+          label="显示关联会话菜单"
+          description="关闭后左侧导航不再显示「关联会话」入口，会话数据与关联关系不受影响"
+          htmlFor="appearance-sessions-nav"
+        >
+          <Switch
+            id="appearance-sessions-nav"
+            checked={sessionsNavEnabled}
+            onCheckedChange={(on) => setSessionsNavEnabled(on)}
+            aria-label="显示关联会话菜单"
+          />
+        </SettingsFieldRow>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
+/**
+ * 支持工具：控制各客户端入口是否在界面上出现。
+ *
+ * 关闭只隐藏入口（账号卡片按钮、页顶状态徽标）并跳过该端的状态轮询，
+ * 不动账号库、不影响其它工具，重新打开即恢复。JetBrains 端默认关闭
+ * （新增端先灰度），打开后才出现对应入口。
+ */
+function SupportedToolsCard() {
+  const enabled = useSupportedTools();
+  const variant = useAccountsStore((s) => s.variant);
+  /** 行内产品图标：与账号页页顶徽标同一套档位规则（国际版用国际版字块）。 */
+  const marks: Record<ToolId, (size: number) => ReactNode> = {
+    workbuddy: (size) => (variant === "ai" ? <WorkBuddyAiMark size={size} /> : <WorkBuddyMark size={size} />),
+    codebuddyIde: (size) =>
+      variantUsesIntlCodebuddyIde(variant) ? <CodeBuddyAiIdeMark size={size} /> : <CodeBuddyCnIdeMark size={size} />,
+    codebuddyCli: (size) => <CodeBuddyMark size={size} />,
+    vscodeExt: (size) => <VscodeExtMark size={size} />,
+    jetbrains: (size) => <JetbrainsMark size={size} />,
+  };
+
+  return (
+    <SettingsGroup id="settings-tools" title="支持工具">
+      <CardContent className="space-y-0 p-0">
+        {SUPPORTED_TOOLS.map((tool, index) => (
+          <SettingsFieldRow
+            key={tool.id}
+            className={index === SUPPORTED_TOOLS.length - 1 ? "border-b-0" : undefined}
+            label={
+              <span className="flex items-center gap-2.5">
+                {marks[tool.id](20)}
+                <span>{tool.label}</span>
+              </span>
+            }
+            description={tool.description}
+            htmlFor={`tools-${tool.id}`}
+          >
+            <Switch
+              id={`tools-${tool.id}`}
+              checked={enabled[tool.id]}
+              onCheckedChange={(on) => setToolEnabled(tool.id, on)}
+              aria-label={tool.label}
+            />
+          </SettingsFieldRow>
+        ))}
       </CardContent>
     </SettingsGroup>
   );
@@ -1974,21 +2092,25 @@ function RateLimitCard() {
   );
 }
 
-/** 设置页：外观 / 权限检测 / 自动签到（含自动旅行）/ 自动轮换 / 限额监听 / 更新配置。 */
+/** 设置页：演示模式不渲染自动签到；Agent Companion 只在桌面正式版显示。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">自动签到、限额监听、权限检测与自动更新配置。</p>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">
+          {api.isDemoMode() ? "限额监听、权限检测与自动更新配置。" : "自动签到、限额监听、权限检测与自动更新配置。"}
+        </p>
       </header>
 
       <div className="min-w-0 space-y-12">
         <AppearanceCard />
+        <SupportedToolsCard />
         <PermissionCheckCard />
-        <AutoCheckinCard />
+        {api.isDemoMode() ? null : <AutoCheckinCard />}
         <AutoRotateCard />
         <RateLimitCard />
+        {api.isDesktop() && !api.isDemoMode() ? <CompanionCard /> : null}
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         <NotificationHistoryCard />
         <ErrorLogCard />

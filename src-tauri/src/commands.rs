@@ -8,9 +8,10 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
-    credits, error_log, export_import, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
+    export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
     variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
@@ -40,13 +41,13 @@ pub async fn get_status(variant: Option<String>) -> Result<AppStatus, String> {
 
 fn build_app_status(variant: WbVariant) -> AppStatus {
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().and_then(|a| {
+    let current = auth.as_ref().map(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
+        json!({
             "uid": account::display_value(&acct, "uid"),
             "nickname": account::display_value(&acct, "nickname"),
             "email": account::display_value(&acct, "email"),
-        }))
+        })
     });
     AppStatus {
         running: process::is_workbuddy_running(variant),
@@ -87,10 +88,14 @@ pub async fn get_codebuddy_cli_status() -> Result<Value, String> {
 
 /// POST /api/codebuddy-cli/install-helper —— 显式安装/升级 CLI helper。
 #[tauri::command]
-pub async fn install_codebuddy_cli_helper() -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(codebuddy_cli::install_helper)
+pub async fn install_codebuddy_cli_helper(app: tauri::AppHandle) -> Result<Value, String> {
+    let result = tauri::async_runtime::spawn_blocking(codebuddy_cli::install_helper)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())??;
+    // 写入 settings.json 与随后的状态重算之间存在短暂窗口，让前端立即重读，
+    // 避免把「刚写完、正在校验」误显示为脱节。
+    crate::notify_codebuddy_cli_updated(&app);
+    Ok(result)
 }
 
 /// POST /api/codebuddy-cli/switch —— 只切换 CodeBuddy CLI，不重启 WorkBuddy。
@@ -104,6 +109,7 @@ pub async fn install_codebuddy_cli_helper() -> Result<Value, String> {
 /// 校验账号（子进程无超时），同步 command 会阻塞主线程造成 UI 卡顿。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn switch_codebuddy_cli_account(
+    app: tauri::AppHandle,
     account_id: String,
     close_running_cli: Option<bool>,
 ) -> Result<Value, String> {
@@ -111,9 +117,13 @@ pub async fn switch_codebuddy_cli_account(
         return Err("缺少 accountId".to_string());
     }
     let _ = close_running_cli;
-    tauri::async_runtime::spawn_blocking(move || codebuddy_cli::switch_active_account(&account_id))
-        .await
-        .map_err(|e| e.to_string())?
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        codebuddy_cli::switch_active_account(&account_id)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    crate::notify_codebuddy_cli_updated(&app);
+    Ok(result)
 }
 
 /// GET /api/codebuddy-cn-ide/status —— CodeBuddy IDE 安装/运行/当前账号。
@@ -129,18 +139,67 @@ pub async fn get_codebuddy_cn_ide_status() -> Result<Value, String> {
 
 /// POST /api/codebuddy-cn-ide/switch —— 注入凭证并可选重启 CodeBuddy CN IDE。
 ///
+/// `copySessions` 非空时，切换前先把勾选的会话复制到目标账号（默认沿用会话 id，
+/// 目标已有同 id 时才重随机）并登记关联；`syncSelections` 非空时，再把关联会话的
+/// 新增内容同步过去（只同步不复制同样可用）。两者都为空时行为与纯切换逐字一致。
+///
 /// async + spawn_blocking：切换会关闭并重启 CodeBuddy CN，可能阻塞数十秒，
 /// 与 WorkBuddy 切换同理，若在同步 command（主线程）执行会卡死整个 UI。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn switch_codebuddy_cn_ide_account(
     account_id: String,
     restart: Option<bool>,
+    copy_sessions: Option<Vec<vscode_session::CopyItem>>,
+    sync_selections: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
+    let restart = restart.unwrap_or(true);
+    let items = copy_sessions.unwrap_or_default();
+    // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传。
+    let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
     tauri::async_runtime::spawn_blocking(move || {
-        codebuddy_cn_ide::switch_account(&account_id, restart.unwrap_or(true))
+        if items.is_empty() && sync_selections.is_empty() {
+            codebuddy_cn_ide::switch_account(&account_id, restart)
+        } else {
+            codebuddy_ide_session::switch_codebuddy_cn_ide_with_copy(
+                &account_id,
+                restart,
+                &items,
+                &sync_selections,
+            )
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// GET /api/codebuddy-cn-ide/sessions —— 列出当前 IDE 账号可复制的会话。
+///
+/// async + spawn_blocking：会扫描 IDE 会话目录（可能较大）并读取本机登录 secret，
+/// 避免阻塞主线程。未登录/未安装时返回空列表而非报错（供前端渲染空态）。
+#[tauri::command]
+pub async fn list_codebuddy_ide_sessions() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(codebuddy_ide_session::list_current_codebuddy_ide_sessions)
+        .await
+        .map_err(|error| format!("列出 CodeBuddy IDE 会话失败: {error}"))
+}
+
+/// POST /api/codebuddy-cn-ide/session-links —— 预览「当前 IDE 账号 → 目标账号」可同步的关联会话。
+///
+/// 只读：每组的 `defaultChecked` 与 `availableModes` 是前端勾选权限的唯一来源。
+/// async + spawn_blocking：会扫描会话目录并读取正文，避免阻塞 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn codebuddy_ide_session_links_preview(
+    target_account_id: String,
+) -> Result<Value, String> {
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        codebuddy_ide_session_sync::links_preview(&target)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -246,16 +305,115 @@ pub async fn get_codebuddy_ide_status() -> Result<Value, String> {
         .map_err(|error| format!("查询 CodeBuddy IDE 状态失败: {error}"))
 }
 
+/// GET /api/jetbrains/status —— JetBrains IDE（IDEA / PyCharm）CodeBuddy 插件状态。
+///
+/// async + spawn_blocking：状态检测会跑 CIM / tasklist 等子进程，账号页每次挂载
+/// 都会刷新，若在主线程执行会造成页面卡顿/闪窗。
+#[tauri::command]
+pub async fn get_jetbrains_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(jetbrains::status)
+        .await
+        .map_err(|error| format!("查询 JetBrains IDE 状态失败: {error}"))
+}
+
+/// POST /api/jetbrains/switch —— 注入凭证到 JetBrains IDE 的 CodeBuddy 插件。
+///
+/// `restart` 缺省 true：IDE 正在运行时由后端「优雅退出 → 写入 → 重新打开」，
+/// 传 false 则退回「请先完全退出 IDE」的手动模式。
+/// `configDirs` 可选：目标配置目录名列表（如 ["PyCharm2026.2"]），缺省 / 空数组
+/// = 全部装了插件的 IDE；非空时只写所选目录、只关闭/重开这些目录的运行实例。
+///
+/// async + spawn_blocking：等待 IDE 退出 + 读写 secret-storage.xml 都可能阻塞。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn switch_codebuddy_ide_account(
+pub async fn switch_jetbrains_account(
     account_id: String,
     restart: Option<bool>,
+    config_dirs: Option<Vec<String>>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
+    let dirs = config_dirs.filter(|list| !list.is_empty());
     tauri::async_runtime::spawn_blocking(move || {
-        codebuddy_ide::switch_account(&account_id, restart.unwrap_or(true))
+        jetbrains::switch_account(&account_id, restart.unwrap_or(true), dirs.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/jetbrains/detect —— 读取本机 JetBrains IDE 插件当前登录并尝试匹配账号库。
+///
+/// async + spawn_blocking：会读多份 secret-storage.xml，避免阻塞主线程。
+#[tauri::command]
+pub async fn detect_jetbrains_account() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(jetbrains::detect_current_account)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// POST /api/codebuddy-ide/switch —— 注入凭证到 CodeBuddy IDE（国际版），可选复制 / 同步会话。
+///
+/// `copySessions` 非空时，切换前先把勾选的会话复制到目标账号（默认沿用会话 id，
+/// 目标已有同 id 时才重随机）并登记关联；`syncSelections` 非空时，再把关联会话的
+/// 新增内容同步过去（只同步不复制同样可用）。两者都为空时行为与纯切换逐字一致。
+///
+/// async + spawn_blocking：切换会关闭并重启 CodeBuddy，可能阻塞数十秒，
+/// 与 WorkBuddy 切换同理，若在同步 command（主线程）执行会卡死整个 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn switch_codebuddy_ide_account(
+    account_id: String,
+    restart: Option<bool>,
+    copy_sessions: Option<Vec<vscode_session::CopyItem>>,
+    sync_selections: Option<Value>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    let restart = restart.unwrap_or(true);
+    let items = copy_sessions.unwrap_or_default();
+    // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传。
+    let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        if items.is_empty() && sync_selections.is_empty() {
+            codebuddy_ide::switch_account(&account_id, restart)
+        } else {
+            codebuddy_ide_session::switch_codebuddy_intl_ide_with_copy(
+                &account_id,
+                restart,
+                &items,
+                &sync_selections,
+            )
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// GET /api/codebuddy-ide/sessions —— 列出当前国际版 IDE 账号可复制的会话。
+///
+/// async + spawn_blocking：会扫描 IDE 会话目录（可能较大）并读取本机登录 secret，
+/// 避免阻塞主线程。未登录/未安装时返回空列表而非报错（供前端渲染空态）。
+#[tauri::command]
+pub async fn list_codebuddy_intl_ide_sessions() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(codebuddy_ide_session::list_current_intl_ide_sessions)
+        .await
+        .map_err(|error| format!("列出 CodeBuddy IDE 会话失败: {error}"))
+}
+
+/// POST /api/codebuddy-ide/session-links —— 预览「当前国际版 IDE 账号 → 目标账号」可同步的关联会话。
+///
+/// 只读：每组的 `defaultChecked` 与 `availableModes` 是前端勾选权限的唯一来源。
+/// async + spawn_blocking：会扫描会话目录并读取正文，避免阻塞 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn codebuddy_intl_ide_session_links_preview(
+    target_account_id: String,
+) -> Result<Value, String> {
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        codebuddy_ide_session_sync::links_preview_intl(&target)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -278,7 +436,6 @@ pub async fn detect_codebuddy_ide_account() -> Result<Value, String> {
         .map_err(|e| e.to_string())?
 }
 
-
 /// DELETE /api/delete —— 删除账号。
 #[tauri::command]
 pub fn delete_account(account_id: String) -> Result<Value, String> {
@@ -290,6 +447,12 @@ pub fn delete_account(account_id: String) -> Result<Value, String> {
     }
     account::save_accounts(&accounts).map_err(|e| e.to_string())?;
     Ok(json!({ "ok": true }))
+}
+
+/// POST /api/update-account-display —— 更新账号本地展示字段（备注 / 显示选择）。
+#[tauri::command]
+pub fn update_account_display(account_id: String, patch: Value) -> Result<Value, String> {
+    account::update_account_display(&account_id, &patch)
 }
 
 /// POST /api/oauth/start —— 发起 OAuth 扫码登录（`variant` 缺省国内版）。
@@ -455,6 +618,32 @@ pub fn list_sessions(variant: Option<String>) -> Value {
     }
 }
 
+/// GET /api/sessions/account —— 指定账号名下的会话列表（会话管理页源账号视角）。
+///
+/// `client` 缺省 workbuddy（读 WorkBuddy 数据库）；`vscodeExt` 改读插件数据仓。
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_account_sessions(account_id: String, client: Option<String>) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    let account = account::find_account(&account_id).ok_or("账号不存在")?;
+    match session_groups::SessionClient::parse(client.as_deref().unwrap_or("workbuddy"))? {
+        session_groups::SessionClient::VscodeExt => {
+            let uid = account::get_str(&account, "uid")
+                .map(|uid| uid.trim().to_string())
+                .filter(|uid| !uid.is_empty())
+                .ok_or("账号缺少 uid")?;
+            Ok(vscode_session::list_vscode_sessions(&uid))
+        }
+        session_groups::SessionClient::Workbuddy => {
+            Ok(session::list_sessions_for_account(&account))
+        }
+        session_groups::SessionClient::CodebuddyIde => {
+            Err("当前客户端暂不支持列出账号会话".to_string())
+        }
+    }
+}
+
 /// POST /api/sessions/copy —— 把勾选会话复制到指定账号（路径 B）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn copy_sessions(
@@ -471,6 +660,34 @@ pub async fn copy_sessions(
         let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
         // 档位取目标账号自身（copy_sessions_for_switch 内部判定）。
         session::copy_sessions_for_switch(&target, &session_ids)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/sessions/copy-cross —— 跨档复制：源与目标账号都显式给出（会话管理页用）。
+///
+/// 与 `copy_sessions` 同形，只多一个 `sourceAccountId`：源 uid 取自该账号，
+/// 不再从目标档登录态读取，支持国内版 ↔ 国际版。写入侧仍以目标账号为准。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn copy_sessions_cross(
+    source_account_id: String,
+    target_account_id: String,
+    session_ids: Vec<String>,
+) -> Result<Value, String> {
+    if source_account_id.trim().is_empty() {
+        return Err("缺少 sourceAccountId".to_string());
+    }
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    if session_ids.is_empty() {
+        return Err("缺少 sessionIds".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        session::copy_sessions_cross(&source, &target, &session_ids)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -500,6 +717,271 @@ pub async fn session_links_preview(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// POST /api/session-links/preview-cross —— 预览「显式来源账号 → 显式目标账号」（跨档支持）。
+///
+/// 与 `session_links_preview` 同形，多一个 `sourceAccountId`；成员内容按成员自身档位读取。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_links_preview_cross(
+    source_account_id: String,
+    target_account_id: String,
+) -> Result<Value, String> {
+    if source_account_id.trim().is_empty() {
+        return Err("缺少 sourceAccountId".to_string());
+    }
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        session::session_links_preview_cross(&source, &target)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/session-sync/cross —— 把显式来源账号的新增同步到显式目标账号（会话管理页）。
+///
+/// `syncSelections` 与切号弹窗同形（core 校验缺 groupId / previewToken / mode）；
+/// 跨档支持：源正文按源档读取，写入侧仍以目标账号为准。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_sync_cross(
+    source_account_id: String,
+    target_account_id: String,
+    sync_selections: Value,
+) -> Result<Value, String> {
+    if source_account_id.trim().is_empty() {
+        return Err("缺少 sourceAccountId".to_string());
+    }
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    // 入参形状由 core 校验：缺字段/未知模式一律拒绝，这里只做透传。
+    let selections = session::parse_sync_selections(Some(&sync_selections))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = account::find_account(&source_account_id).ok_or("源账号不存在")?;
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        session::sync_sessions_cross(&source, &target, &selections)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_session_groups(
+    client: String,
+    variant_scope: Option<String>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || session_groups::list(client, scope))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_session_group(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || session_groups::detail(client, scope, &group_id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn preview_session_group_pair(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+    source_member_id: String,
+    target_member_id: String,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::preview_pair(
+            client,
+            scope,
+            &group_id,
+            &source_member_id,
+            &target_member_id,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[allow(clippy::too_many_arguments)] // 与 core 内核同口径：参数都是本次同步的显式输入
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sync_session_group_pair(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+    source_member_id: String,
+    target_member_id: String,
+    preview_token: String,
+    mode: String,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let restart = restart.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::sync_pair(
+            client,
+            scope,
+            &group_id,
+            &source_member_id,
+            &target_member_id,
+            &preview_token,
+            &mode,
+            restart,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sync_session_group_unify(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+    source_member_id: String,
+    targets: Vec<session_groups::GroupUnifyTarget>,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let restart = restart.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::sync_unify_batch(
+            client,
+            scope,
+            &group_id,
+            &source_member_id,
+            &targets,
+            restart,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn sync_session_group_safe_batch(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let restart = restart.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::sync_safe_batch(client, scope, &group_id, restart)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn add_session_group_member(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+    source_member_id: String,
+    target_account_id: String,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let restart = restart.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::add_member(
+            client,
+            scope,
+            &group_id,
+            &source_member_id,
+            &target_account_id,
+            restart,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 插件：把来源账号的勾选会话复制到目标账号并登记关联（无现成组则新建关联组）。
+///
+/// `restart` 缺省 false：VS Code 运行中需用户确认（确认框授权）后传 true，由后端关闭并重开。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn copy_linked_sessions(
+    client: String,
+    source_account_id: String,
+    target_account_id: String,
+    session_ids: Vec<String>,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let restart = restart.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::copy_linked_sessions(
+            client,
+            &source_account_id,
+            &target_account_id,
+            &session_ids,
+            restart,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 预检：是否需要关闭 VS Code 才能安全执行写操作（运行中 且 目标账号含当前登录账号）。
+///
+/// 供前端决定「是否先弹确认框」；最终把关仍在各写入口的实时判定。
+#[tauri::command(rename_all = "camelCase")]
+pub fn vscode_restart_precheck(target_account_ids: Vec<String>) -> Value {
+    session_groups::vscode_restart_precheck(&target_account_ids)
+}
+
+/// 取消关联：从会话组移除一个成员，只解除管理关系，不删除账号内的会话内容。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn unlink_session_group_member(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+    member_id: String,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::remove_member(client, scope, &group_id, &member_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// 删除会话组：组内所有成员一起解除关联，只解除管理关系，不删除账号内的会话内容。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_session_group(
+    client: String,
+    variant_scope: Option<String>,
+    group_id: String,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        session_groups::delete_group(client, scope, &group_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 // ---------------------------------------------------------------------------
@@ -616,13 +1098,16 @@ pub async fn checkin(account_id: String) -> Result<Value, String> {
     Ok(checkin::checkin_account(&acc).await)
 }
 
-/// POST /api/checkin/all —— 全部账号立即签到（每个账号按自身档位）。
+/// POST /api/checkin/all —— 全部账号批量签到（每个账号按自身档位）。
 /// `variant` 缺省为 `None`（全部档位，保持原行为）；显式传入时只处理该档位。
 /// 关闭自动签到的账号逐账号返回 skipped 原因（设置页与托盘同样遵守）。
+/// `respectWindow` 只由账号页「刷新并签到」传 `true`：窗口生效且当前不在时间段内
+/// 时整轮跳过（逐账号 `skipped` / `outside_checkin_window`）；缺省 `false` =
+/// 设置页 / 托盘 / 单账号入口的立即签到语义。
 #[tauri::command]
-pub async fn checkin_all(variant: Option<String>) -> Value {
+pub async fn checkin_all(variant: Option<String>, respect_window: Option<bool>) -> Value {
     let variant = variant.as_deref().map(|raw| WbVariant::parse(Some(raw)));
-    checkin::run_checkin_all(variant).await
+    checkin::run_checkin_all(variant, respect_window.unwrap_or(false)).await
 }
 
 /// GET /api/checkin/config —— 自动签到配置。
@@ -837,10 +1322,9 @@ pub fn get_launch_at_login_enabled(_app: tauri::AppHandle) -> Result<bool, Strin
     #[cfg(desktop)]
     {
         use tauri_plugin_autostart::ManagerExt;
-        return _app
-            .autolaunch()
+        _app.autolaunch()
             .is_enabled()
-            .map_err(|e| format!("查询开机自启状态失败：{e}"));
+            .map_err(|e| format!("查询开机自启状态失败：{e}"))
     }
     #[cfg(not(desktop))]
     {

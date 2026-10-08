@@ -18,9 +18,10 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
-    credit_usage, credits, export_import, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
+    export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
     variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
@@ -78,18 +79,45 @@ pub fn router() -> Router {
             "/api/codebuddy-cn-ide/detect",
             post(api_codebuddy_cn_ide_detect),
         )
+        .route(
+            "/api/codebuddy-cn-ide/sessions",
+            get(api_codebuddy_cn_ide_sessions),
+        )
+        .route(
+            "/api/codebuddy-cn-ide/session-links",
+            post(api_codebuddy_cn_ide_session_links_preview),
+        )
         .route("/api/codebuddy-ide/status", get(api_codebuddy_ide_status))
         .route("/api/codebuddy-ide/switch", post(api_codebuddy_ide_switch))
         .route("/api/codebuddy-ide/detect", post(api_codebuddy_ide_detect))
+        .route(
+            "/api/codebuddy-ide/sessions",
+            get(api_codebuddy_intl_ide_sessions),
+        )
+        .route(
+            "/api/codebuddy-ide/session-links",
+            post(api_codebuddy_intl_ide_session_links_preview),
+        )
+        .route("/api/jetbrains/status", get(api_jetbrains_status))
+        .route("/api/jetbrains/switch", post(api_jetbrains_switch))
+        .route("/api/jetbrains/detect", post(api_jetbrains_detect))
         .route("/api/vscode-ext/status", get(api_vscode_ext_status))
         .route("/api/vscode-ext/sessions", get(api_vscode_ext_sessions))
         .route("/api/vscode-ext/switch", post(api_vscode_ext_switch))
         .route("/api/vscode-ext/detect", post(api_vscode_ext_detect))
         .route(
+            "/api/vscode-ext/restart-precheck",
+            post(api_vscode_restart_precheck),
+        )
+        .route(
             "/api/vscode-ext/session-links",
             post(api_vscode_ext_session_links_preview),
         )
         .route("/api/delete", post(api_delete))
+        .route(
+            "/api/update-account-display",
+            post(api_update_account_display),
+        )
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
         .route("/api/import-local", post(api_import_local))
@@ -103,10 +131,48 @@ pub fn router() -> Router {
         .route("/api/switch", post(api_switch))
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/account", get(api_account_sessions))
         .route("/api/sessions/copy", post(api_copy_sessions))
+        .route("/api/sessions/copy-cross", post(api_copy_sessions_cross))
         .route(
             "/api/session-links/preview",
             post(api_session_links_preview),
+        )
+        .route(
+            "/api/session-links/preview-cross",
+            post(api_session_links_preview_cross),
+        )
+        .route("/api/session-sync/cross", post(api_session_sync_cross))
+        .route("/api/session-groups/list", post(api_list_session_groups))
+        .route("/api/session-groups/detail", post(api_get_session_group))
+        .route(
+            "/api/session-groups/preview",
+            post(api_preview_session_group_pair),
+        )
+        .route(
+            "/api/session-groups/sync",
+            post(api_sync_session_group_pair),
+        )
+        .route(
+            "/api/session-groups/unify",
+            post(api_sync_session_group_unify),
+        )
+        .route(
+            "/api/session-groups/sync-safe",
+            post(api_sync_session_group_safe_batch),
+        )
+        .route(
+            "/api/session-groups/add",
+            post(api_add_session_group_member),
+        )
+        .route(
+            "/api/session-groups/unlink",
+            post(api_unlink_session_group_member),
+        )
+        .route("/api/session-groups/delete", post(api_delete_session_group))
+        .route(
+            "/api/session-groups/copy-linked",
+            post(api_copy_linked_sessions),
         )
         .route("/api/checkin/status", get(api_checkin_status))
         .route("/api/credits", post(api_credits))
@@ -182,6 +248,15 @@ fn body_variant(body: &Value) -> WbVariant {
     WbVariant::parse(body.get("variant").and_then(Value::as_str))
 }
 
+/// 从 query string 取指定键的原值（键值均为账号 id 这类 ASCII 串；
+/// 与 `query_variant` 同一解析口径，不做百分号解码）。
+fn query_param(query: Option<&str>, key: &str) -> Option<String> {
+    query.unwrap_or("").split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (name == key).then_some(value.to_string())
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 状态 / 账号
 // ---------------------------------------------------------------------------
@@ -189,13 +264,13 @@ fn body_variant(body: &Value) -> WbVariant {
 async fn api_status(RawQuery(query): RawQuery) -> Response {
     let variant = query_variant(query.as_deref());
     let auth = auth_file::read_auth_file(variant);
-    let current = auth.as_ref().and_then(|a| {
+    let current = auth.as_ref().map(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
-        Some(json!({
+        json!({
             "uid": account::display_value(&acct, "uid"),
             "nickname": account::display_value(&acct, "nickname"),
             "email": account::display_value(&acct, "email"),
-        }))
+        })
     });
     json_ok(json!({
         "running": cached_workbuddy_running(variant),
@@ -256,9 +331,81 @@ async fn api_codebuddy_cn_ide_switch(Json(body): Json<Value>) -> Response {
         .get("restart")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    match codebuddy_cn_ide::switch_account(account_id, restart) {
+    // 可选：切换前把勾选会话复制到目标账号（与 /api/vscode-ext/switch 同形）。
+    // 任一条目非法即整包拒绝（与 Tauri 侧 `Option<Vec<CopyItem>>` 的 serde 整包报错同形），
+    // 避免「部分成功 + 静默丢弃」让用户误以为全部复制成功。
+    let copy_items: Vec<vscode_session::CopyItem> = match body
+        .get("copySessions")
+        .and_then(|v| v.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .map(|item| serde_json::from_value::<vscode_session::CopyItem>(item.clone()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+    {
+        Ok(items) => items.unwrap_or_default(),
+        Err(error) => {
+            return json_err(
+                format!("copySessions 条目非法：{error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let result = if copy_items.is_empty() && sync_selections.is_empty() {
+        codebuddy_cn_ide::switch_account(account_id, restart)
+    } else {
+        codebuddy_ide_session::switch_codebuddy_cn_ide_with_copy(
+            account_id,
+            restart,
+            &copy_items,
+            &sync_selections,
+        )
+    };
+    match result {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/codebuddy-cn-ide/sessions —— 当前 IDE 账号可复制的会话（未登录返回空列表）。
+async fn api_codebuddy_cn_ide_sessions() -> Response {
+    let result =
+        tokio::task::spawn_blocking(codebuddy_ide_session::list_current_codebuddy_ide_sessions)
+            .await;
+    match result {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/codebuddy-cn-ide/session-links —— 预览当前 IDE 账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `codebuddy_ide_session_links_preview` 同形：直接返回 core 的只读预览。
+async fn api_codebuddy_cn_ide_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        codebuddy_ide_session_sync::links_preview(&target)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -294,7 +441,10 @@ async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
         .unwrap_or("");
     // 默认重启（= 自动关闭并重开）：VS Code 运行时由后端先优雅退出再写入。
     // 显式传 restart=false 时退回「请先完全退出 VS Code」的手动模式。
-    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(true);
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     // 可选：切换前把勾选会话复制到目标账号（与 /api/vscode-ext/* 命名风格一致）。
     // 任一条目非法即整包拒绝（与 Tauri 侧 `Option<Vec<CopyItem>>` 的 serde 整包报错同形），
     // 避免「部分成功 + 静默丢弃」让用户误以为全部复制成功。
@@ -370,6 +520,10 @@ async fn api_codebuddy_ide_status() -> Response {
     json_ok(codebuddy_ide::status())
 }
 
+/// POST /api/codebuddy-ide/switch —— 注入凭证到 CodeBuddy IDE（国际版），可选复制 / 同步会话。
+///
+/// `copySessions` / `syncSelections` 与国内版（`/api/codebuddy-cn-ide/switch`）同形：
+/// 任一条目非法即整包拒绝，两者都为空时行为与纯切换逐字一致。
 async fn api_codebuddy_ide_switch(Json(body): Json<Value>) -> Response {
     let account_id = body
         .get("accountId")
@@ -380,9 +534,77 @@ async fn api_codebuddy_ide_switch(Json(body): Json<Value>) -> Response {
         .get("restart")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    match codebuddy_ide::switch_account(account_id, restart) {
+    let copy_items: Vec<vscode_session::CopyItem> = match body
+        .get("copySessions")
+        .and_then(|v| v.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .map(|item| serde_json::from_value::<vscode_session::CopyItem>(item.clone()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+    {
+        Ok(items) => items.unwrap_or_default(),
+        Err(error) => {
+            return json_err(
+                format!("copySessions 条目非法：{error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let result = if copy_items.is_empty() && sync_selections.is_empty() {
+        codebuddy_ide::switch_account(account_id, restart)
+    } else {
+        codebuddy_ide_session::switch_codebuddy_intl_ide_with_copy(
+            account_id,
+            restart,
+            &copy_items,
+            &sync_selections,
+        )
+    };
+    match result {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// GET /api/codebuddy-ide/sessions —— 当前国际版 IDE 账号可复制的会话（未登录返回空列表）。
+async fn api_codebuddy_intl_ide_sessions() -> Response {
+    let result =
+        tokio::task::spawn_blocking(codebuddy_ide_session::list_current_intl_ide_sessions).await;
+    match result {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/codebuddy-ide/session-links —— 预览当前国际版 IDE 账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `codebuddy_intl_ide_session_links_preview` 同形：直接返回 core 的只读预览。
+async fn api_codebuddy_intl_ide_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        codebuddy_ide_session_sync::links_preview_intl(&target)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -400,12 +622,60 @@ async fn api_codebuddy_ide_detect() -> Response {
     }
 }
 
+async fn api_jetbrains_status() -> Response {
+    json_ok(jetbrains::status())
+}
 
+async fn api_jetbrains_switch(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    // 可选：目标配置目录名列表（如 ["PyCharm2026.2"]）。缺省 / 空数组 = 全部装了插件的 IDE。
+    let config_dirs: Option<Vec<String>> = body
+        .get("configDirs")
+        .and_then(|v| v.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .filter(|list| !list.is_empty());
+    match jetbrains::switch_account(account_id, restart, config_dirs.as_deref()) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_jetbrains_detect() -> Response {
+    match jetbrains::detect_current_account() {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
 
 async fn api_delete(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
     match account::delete_account(id) {
         Ok(()) => json_ok(json!({ "ok": true })),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/update-account-display —— 更新账号本地展示字段（备注 / 显示选择）。
+///
+/// body：`{ accountId, patch }`，patch 可含 `note`（字符串或 null）与 `displayField`。
+async fn api_update_account_display(Json(body): Json<Value>) -> Response {
+    let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
+    let patch = body.get("patch").cloned().unwrap_or_else(|| json!({}));
+    match account::update_account_display(id, &patch) {
+        Ok(meta) => json_ok(json!({ "ok": true, "account": meta })),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }
 }
@@ -622,6 +892,40 @@ async fn api_sessions(RawQuery(query): RawQuery) -> Response {
     }
 }
 
+/// GET /api/sessions/account —— 指定账号名下的会话列表（会话管理页的源账号视角）。
+///
+/// 与 `GET /api/sessions` 同形，但来源是显式账号（`accountId` query）：账号不存在
+/// 返回 400；账号缺 uid 时返回空列表 + `current: null`（与现有容错一致）。
+async fn api_account_sessions(RawQuery(query): RawQuery) -> Response {
+    let account_id = query_param(query.as_deref(), "accountId").unwrap_or_default();
+    let client = query_param(query.as_deref(), "client").unwrap_or_else(|| "workbuddy".to_string());
+    let Some(account) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let client = match session_groups::SessionClient::parse(&client) {
+        Ok(client) => client,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match client {
+        session_groups::SessionClient::VscodeExt => {
+            let Some(uid) = account::get_str(&account, "uid")
+                .map(|uid| uid.trim().to_string())
+                .filter(|uid| !uid.is_empty())
+            else {
+                return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+            };
+            json_ok(vscode_session::list_vscode_sessions(&uid))
+        }
+        session_groups::SessionClient::Workbuddy => {
+            json_ok(session::list_sessions_for_account(&account))
+        }
+        session_groups::SessionClient::CodebuddyIde => json_err(
+            "当前客户端暂不支持列出账号会话".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    }
+}
+
 async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     let target_account_id = body
         .get("targetAccountId")
@@ -653,6 +957,49 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     json_ok(report)
 }
 
+/// POST /api/sessions/copy-cross —— 跨档复制：源与目标账号都显式给出（会话管理页用）。
+///
+/// 与 `POST /api/sessions/copy` 同形，多一个 `sourceAccountId`：源 uid 取自该账号，
+/// 不再从目标档登录态读取，支持国内版 ↔ 国际版。报告与桌面端 `copy_sessions_cross`
+/// 同形（含 `sourceVariant` / `targetVariant`）。
+async fn api_copy_sessions_cross(Json(body): Json<Value>) -> Response {
+    let source_account_id = body
+        .get("sourceAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_ids: Vec<String> = body
+        .get("sessionIds")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(source) = account::find_account(&source_account_id) else {
+        return json_err("源账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let target_variant = account::variant_of(&target);
+    let mut report = match session::copy_sessions_cross(&source, &target, &session_ids) {
+        Ok(report) => report,
+        Err(error) => {
+            return json_err(error, StatusCode::BAD_REQUEST);
+        }
+    };
+    // 与同档端点同形：`variant` 恒为目标档（前端按目标账号渲染）。
+    report["variant"] = json!(target_variant.as_str());
+    json_ok(report)
+}
+
 /// POST /api/session-links/preview —— 预览当前账号 → 目标账号的关联会话同步项。
 ///
 /// 与桌面端 `session_links_preview` 同形：直接返回 core 的只读预览（`supported` /
@@ -676,6 +1023,312 @@ async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
     };
     match session::session_links_preview(variant, &target) {
         Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/session-links/preview-cross —— 预览「显式来源账号 → 显式目标账号」（跨档支持）。
+///
+/// 与 `POST /api/session-links/preview` 同形，多一个 `sourceAccountId`；
+/// 成员内容按成员自身档位读取（跨档组的源读源档、目标读目标档）。
+async fn api_session_links_preview_cross(Json(body): Json<Value>) -> Response {
+    let source_account_id = body
+        .get("sourceAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if source_account_id.trim().is_empty() {
+        return json_err("缺少 sourceAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(source) = account::find_account(&source_account_id) else {
+        return json_err("源账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match session::session_links_preview_cross(&source, &target) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/session-sync/cross —— 把显式来源账号的新增同步到显式目标账号（跨档支持）。
+///
+/// `syncSelections` 与切号弹窗同形（core 校验缺 groupId / previewToken / mode）。
+async fn api_session_sync_cross(Json(body): Json<Value>) -> Response {
+    let source_account_id = body
+        .get("sourceAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(source) = account::find_account(&source_account_id) else {
+        return json_err("源账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match session::sync_sessions_cross(&source, &target, &selections) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+fn session_group_request(
+    body: &Value,
+) -> Result<(session_groups::SessionClient, Option<WbVariant>), String> {
+    let client = body
+        .get("client")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "缺少 client".to_string())?;
+    let client = session_groups::SessionClient::parse(client)?;
+    let scope =
+        session_groups::parse_variant_scope(body.get("variantScope").and_then(Value::as_str))?;
+    Ok((client, scope))
+}
+
+async fn api_list_session_groups(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match session_groups::list(client, scope) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_get_session_group(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let group_id = body.get("groupId").and_then(Value::as_str).unwrap_or("");
+    match session_groups::detail(client, scope, group_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_preview_session_group_pair(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let args = (
+        body.get("groupId").and_then(Value::as_str).unwrap_or(""),
+        body.get("sourceMemberId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        body.get("targetMemberId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    match session_groups::preview_pair(client, scope, args.0, args.1, args.2) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_sync_session_group_pair(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let args = (
+        body.get("groupId").and_then(Value::as_str).unwrap_or(""),
+        body.get("sourceMemberId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        body.get("targetMemberId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        body.get("previewToken")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        body.get("mode").and_then(Value::as_str).unwrap_or(""),
+    );
+    let restart = body
+        .get("restart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match session_groups::sync_pair(
+        client, scope, args.0, args.1, args.2, args.3, args.4, restart,
+    ) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_sync_session_group_unify(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let targets = match serde_json::from_value::<Vec<session_groups::GroupUnifyTarget>>(
+        body.get("targets").cloned().unwrap_or(Value::Null),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_err(
+                format!("目标副本参数无效：{error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
+    let group_id = body.get("groupId").and_then(Value::as_str).unwrap_or("");
+    let source_member_id = body
+        .get("sourceMemberId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match session_groups::sync_unify_batch(
+        client,
+        scope,
+        group_id,
+        source_member_id,
+        &targets,
+        restart,
+    ) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_sync_session_group_safe_batch(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let group_id = body.get("groupId").and_then(Value::as_str).unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match session_groups::sync_safe_batch(client, scope, group_id, restart) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_add_session_group_member(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let args = (
+        body.get("groupId").and_then(Value::as_str).unwrap_or(""),
+        body.get("sourceMemberId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        body.get("targetAccountId")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    let restart = body
+        .get("restart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match session_groups::add_member(client, scope, args.0, args.1, args.2, restart) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_copy_linked_sessions(Json(body): Json<Value>) -> Response {
+    let (client, _scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let source_account_id = body
+        .get("sourceAccountId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let session_ids: Vec<String> = body
+        .get("sessionIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let restart = body
+        .get("restart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match session_groups::copy_linked_sessions(
+        client,
+        source_account_id,
+        target_account_id,
+        &session_ids,
+        restart,
+    ) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_vscode_restart_precheck(Json(body): Json<Value>) -> Response {
+    let target_account_ids: Vec<String> = body
+        .get("targetAccountIds")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    json_ok(session_groups::vscode_restart_precheck(&target_account_ids))
+}
+
+/// 取消关联：只解除管理关系，不触碰账号内的会话内容。
+async fn api_unlink_session_group_member(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let group_id = body.get("groupId").and_then(Value::as_str).unwrap_or("");
+    let member_id = body.get("memberId").and_then(Value::as_str).unwrap_or("");
+    match session_groups::remove_member(client, scope, group_id, member_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// 删除会话组：组内所有成员一起解除关联，只解除管理关系，不触碰账号内的会话内容。
+async fn api_delete_session_group(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let group_id = body.get("groupId").and_then(Value::as_str).unwrap_or("");
+    match session_groups::delete_group(client, scope, group_id) {
+        Ok(value) => json_ok(value),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
@@ -838,7 +1491,15 @@ async fn api_checkin_all(body: Option<Json<Value>>) -> Response {
         .and_then(|Json(value)| value.get("variant"))
         .and_then(|value| value.as_str())
         .map(|raw| WbVariant::parse(Some(raw)));
-    json_ok(checkin::run_checkin_all(variant).await)
+    // `respectWindow`（camelCase，与 `accountId` 先例一致）只由账号页「刷新并签到」
+    // 传 true：窗口生效且当前不在时间段内时整轮跳过；缺省 false 保持设置页 /
+    // 托盘 / 旧客户端的立即签到语义。
+    let respect_window = body
+        .as_ref()
+        .and_then(|Json(value)| value.get("respectWindow"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    json_ok(checkin::run_checkin_all(variant, respect_window).await)
 }
 
 async fn api_checkin_config() -> Response {
@@ -979,26 +1640,83 @@ async fn static_handler(uri: Uri) -> Response {
     if path.is_empty() || path == "index.html" {
         path = "index.html".to_string();
     }
-    // 前端路由回退到 index.html
-    let data = Assets::get(&path).or_else(|| Assets::get("index.html"));
-    match data {
-        Some(f) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, content_type(&path))
-            .body(Body::from(f.data.into_owned()))
-            .unwrap(),
-        None => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("not found"))
-            .unwrap(),
+    // 前端路由回退到 index.html。Content-Type 必须按**实际命中的文件**给：按请求路径算
+    // 会把 `/sessions` 这类前端路由标成 application/octet-stream，浏览器直接当下载。
+    let (data, served) = match Assets::get(&path) {
+        Some(f) => (f, path),
+        None => match Assets::get("index.html") {
+            Some(f) => (f, "index.html".to_string()),
+            None => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("not found"))
+                    .unwrap()
+            }
+        },
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type(&served))
+        .body(Body::from(data.data.into_owned()))
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/// GET /api/notifications —— 最近的应用内提示（新的在前，最多 100 条）。
+async fn api_notifications() -> Response {
+    match notifications::list() {
+        Ok(items) => json_ok(json!({ "items": items })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/notifications/record —— 记录一条提示（前端 toast 同步写一份）。
+async fn api_record_notification(Json(body): Json<Value>) -> Response {
+    let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let description = body.get("description").and_then(|v| v.as_str());
+    match notifications::record(level, title, description) {
+        Ok(()) => json_ok(json!({ "recorded": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/notifications/clear —— 清空通知存档。
+async fn api_clear_notifications() -> Response {
+    match notifications::clear() {
+        Ok(()) => json_ok(json!({ "cleared": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{body_variant, checkin_status_item, query_variant};
+    use super::{body_variant, checkin_status_item, query_variant, static_handler};
+    use axum::http::{header, StatusCode, Uri};
     use serde_json::json;
     use wb_switch_core::modules::variant::WbVariant;
+
+    /// SPA 回退必须按**命中的文件**给 Content-Type：`/sessions` 这类前端路由曾按请求路径
+    /// 被标成 application/octet-stream，浏览器直接当文件下载、页面打不开（真机验收发现）。
+    #[tokio::test]
+    async fn spa_fallback_serves_html_content_type() {
+        for path in ["/", "/sessions", "/accounts"] {
+            let resp = static_handler(Uri::from_static(path)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                content_type.starts_with("text/html"),
+                "{path} 的 Content-Type 应为 text/html，实际 {content_type}"
+            );
+        }
+    }
 
     /// 缺省档位必须与改造前一致（不传 variant 即国内版）。
     #[test]
@@ -1072,36 +1790,5 @@ mod tests {
 
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 通知存档（toast 事后可查）
-// ---------------------------------------------------------------------------
-
-/// GET /api/notifications —— 最近的应用内提示（新的在前，最多 100 条）。
-async fn api_notifications() -> Response {
-    match notifications::list() {
-        Ok(items) => json_ok(json!({ "items": items })),
-        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-/// POST /api/notifications/record —— 记录一条提示（前端 toast 同步写一份）。
-async fn api_record_notification(Json(body): Json<Value>) -> Response {
-    let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let description = body.get("description").and_then(|v| v.as_str());
-    match notifications::record(level, title, description) {
-        Ok(()) => json_ok(json!({ "recorded": true })),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
-    }
-}
-
-/// POST /api/notifications/clear —— 清空通知存档。
-async fn api_clear_notifications() -> Response {
-    match notifications::clear() {
-        Ok(()) => json_ok(json!({ "cleared": true })),
-        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }

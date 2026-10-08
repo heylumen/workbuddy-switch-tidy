@@ -17,6 +17,7 @@ import type {
   CheckinResult,
   CreditExpiry,
   CreditStatistics,
+  DisplayField,
   TokenStatistics,
   ErrorLogKind,
   GithubConfig,
@@ -32,7 +33,14 @@ import type {
   Session,
   SessionCopyReport,
   SessionLinksPreview,
+  SessionSyncReport,
   SessionSyncSelection,
+  SessionSyncMode,
+  SessionGroupClient,
+  SessionGroupList,
+  SessionGroupDetail,
+  SessionGroupPairPreview,
+  SessionGroupActionReport,
   SwitchResult,
   TravelConfig,
   TravelStatus,
@@ -40,6 +48,8 @@ import type {
   UpdateSnapshot,
   VscodeExtStatus,
   VscodeExtSwitchResult,
+  JetbrainsStatus,
+  JetbrainsSwitchResult,
   VscodeSessionList,
   VscodeSessionRef,
   WbVariant,
@@ -55,7 +65,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = "http://127.0.0.1:57890";
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "list_vscode_sessions", "get_checkin_status",
+  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
@@ -87,6 +97,12 @@ export function isDesktop(): boolean {
   return !isWebui() && !isMobilePlatform();
 }
 
+/** Agent Companion 只由桌面宿主管理，不能经 WebUI 或演示模式访问。 */
+function requireCompanionDesktop(): void {
+  if (demoModeEnabled) throw new Error(DEMO_UNAVAILABLE_MESSAGE);
+  if (!isDesktop()) throw new Error("Agent Companion 仅在桌面版中可用");
+}
+
 type Route = { method: "GET" | "POST"; path: string };
 
 /** Tauri command → HTTP 路由映射（webui 模式）。 */
@@ -99,7 +115,15 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
   switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  list_codebuddy_ide_sessions: { method: "GET", path: "/api/codebuddy-cn-ide/sessions" },
+  codebuddy_ide_session_links_preview: {
+    method: "POST",
+    path: "/api/codebuddy-cn-ide/session-links",
+  },
   get_vscode_ext_status: { method: "GET", path: "/api/vscode-ext/status" },
+  get_jetbrains_status: { method: "GET", path: "/api/jetbrains/status" },
+  switch_jetbrains_account: { method: "POST", path: "/api/jetbrains/switch" },
+  detect_jetbrains_account: { method: "POST", path: "/api/jetbrains/detect" },
   list_vscode_sessions: { method: "GET", path: "/api/vscode-ext/sessions" },
   switch_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/switch" },
   vscode_session_links_preview: { method: "POST", path: "/api/vscode-ext/session-links" },
@@ -107,7 +131,13 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
   switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
   detect_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/detect" },
+  list_codebuddy_intl_ide_sessions: { method: "GET", path: "/api/codebuddy-ide/sessions" },
+  codebuddy_intl_ide_session_links_preview: {
+    method: "POST",
+    path: "/api/codebuddy-ide/session-links",
+  },
   delete_account: { method: "POST", path: "/api/delete" },
+  update_account_display: { method: "POST", path: "/api/update-account-display" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
   import_local: { method: "POST", path: "/api/import-local" },
@@ -117,8 +147,23 @@ const ROUTES: Record<string, Route> = {
   import_accounts: { method: "POST", path: "/api/import" },
   switch_account: { method: "POST", path: "/api/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
+  list_account_sessions: { method: "GET", path: "/api/sessions/account" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
+  copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
   session_links_preview: { method: "POST", path: "/api/session-links/preview" },
+  session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
+  session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
+  list_session_groups: { method: "POST", path: "/api/session-groups/list" },
+  get_session_group: { method: "POST", path: "/api/session-groups/detail" },
+  preview_session_group_pair: { method: "POST", path: "/api/session-groups/preview" },
+  sync_session_group_pair: { method: "POST", path: "/api/session-groups/sync" },
+  sync_session_group_unify: { method: "POST", path: "/api/session-groups/unify" },
+  sync_session_group_safe_batch: { method: "POST", path: "/api/session-groups/sync-safe" },
+  add_session_group_member: { method: "POST", path: "/api/session-groups/add" },
+  copy_linked_sessions: { method: "POST", path: "/api/session-groups/copy-linked" },
+  vscode_restart_precheck: { method: "POST", path: "/api/vscode-ext/restart-precheck" },
+  unlink_session_group_member: { method: "POST", path: "/api/session-groups/unlink" },
+  delete_session_group: { method: "POST", path: "/api/session-groups/delete" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -262,11 +307,36 @@ export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
   return call("get_codebuddy_cn_ide_status");
 }
 
+/**
+ * 切换 CodeBuddy IDE 账号（可同时复制 / 同步会话）。
+ *
+ * `restart` 默认 true：IDE 运行时由后端先关闭、写入后再重新打开。
+ * `copySessions` 非空时切换前把勾选会话复制到目标账号（默认沿用会话 id，冲突才重随机）；
+ * `syncSelections` 与 VS Code 侧同形；两者都不传时行为与纯切换逐字一致。
+ */
 export function switchCodebuddyCnIdeAccount(
   accountId: string,
   restart = true,
+  copySessions?: VscodeSessionRef[],
+  syncSelections?: SessionSyncSelection[],
 ): Promise<CodeBuddyCnIdeSwitchResult> {
-  return call("switch_codebuddy_cn_ide_account", { accountId, restart });
+  return call("switch_codebuddy_cn_ide_account", { accountId, restart, copySessions, syncSelections });
+}
+
+/** 列出当前 CodeBuddy IDE 账号可复制的会话（未登录/未安装时返回空列表）。 */
+export function listCodebuddyIdeSessions(): Promise<VscodeSessionList> {
+  return call("list_codebuddy_ide_sessions");
+}
+
+/**
+ * 预览「当前 CodeBuddy IDE 账号 → 目标账号」可同步的关联会话。
+ *
+ * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
+ */
+export function codebuddyIdeSessionLinksPreview(
+  targetAccountId: string,
+): Promise<SessionLinksPreview> {
+  return call("codebuddy_ide_session_links_preview", { targetAccountId });
 }
 
 export function detectCodebuddyCnIdeAccount(): Promise<{
@@ -323,15 +393,70 @@ export function detectVscodeExtAccount(): Promise<{
   return call("detect_vscode_ext_account");
 }
 
+export function getJetbrainsStatus(): Promise<JetbrainsStatus> {
+  return call("get_jetbrains_status");
+}
+
+/**
+ * 切换 JetBrains IDE（IDEA / PyCharm）CodeBuddy 插件账号。
+ *
+ * `restart` 默认 true：IDE 运行时由后端先优雅退出、写入后再重新打开；
+ * 传 false 退回「请先完全退出 IDE」的手动模式（不在 IDE 中自动操作）。
+ * `configDirs` 可选：目标配置目录名列表（如 ["PyCharm2026.2"]），缺省 / 空
+ * = 全部装了插件的 IDE；非空时只写所选目录、只关闭/重开这些目录的运行实例。
+ */
+export function switchJetbrainsAccount(
+  accountId: string,
+  restart = true,
+  configDirs?: string[],
+): Promise<JetbrainsSwitchResult> {
+  return call("switch_jetbrains_account", { accountId, restart, configDirs });
+}
+
+export function detectJetbrainsAccount(): Promise<{
+  ok: boolean;
+  found: boolean;
+  matched?: boolean;
+  accountId?: string;
+  message?: string;
+}> {
+  return call("detect_jetbrains_account");
+}
+
 export function getCodebuddyIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
   return call("get_codebuddy_ide_status");
 }
 
+/**
+ * 切换 CodeBuddy IDE（国际版）账号（可同时复制 / 同步会话）。
+ *
+ * `restart` 默认 true：IDE 运行时由后端先关闭、写入后再重新打开。
+ * `copySessions` 非空时切换前把勾选会话复制到目标账号（默认沿用会话 id，冲突才重随机）；
+ * `syncSelections` 与国内版同形；两者都不传时行为与纯切换逐字一致。
+ */
 export function switchCodebuddyIdeAccount(
   accountId: string,
   restart = true,
+  copySessions?: VscodeSessionRef[],
+  syncSelections?: SessionSyncSelection[],
 ): Promise<CodeBuddyCnIdeSwitchResult> {
-  return call("switch_codebuddy_ide_account", { accountId, restart });
+  return call("switch_codebuddy_ide_account", { accountId, restart, copySessions, syncSelections });
+}
+
+/** 列出当前国际版 CodeBuddy IDE 账号可复制的会话（未登录/未安装时返回空列表）。 */
+export function listCodebuddyIntlIdeSessions(): Promise<VscodeSessionList> {
+  return call("list_codebuddy_intl_ide_sessions");
+}
+
+/**
+ * 预览「当前国际版 CodeBuddy IDE 账号 → 目标账号」可同步的关联会话。
+ *
+ * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
+ */
+export function codebuddyIntlIdeSessionLinksPreview(
+  targetAccountId: string,
+): Promise<SessionLinksPreview> {
+  return call("codebuddy_intl_ide_session_links_preview", { targetAccountId });
 }
 
 export function detectCodebuddyIdeAccount(): Promise<{
@@ -347,6 +472,25 @@ export function detectCodebuddyIdeAccount(): Promise<{
 
 export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
+}
+
+/**
+ * 更新账号本地展示字段（备注 / 显示选择）。
+ * patch 只传需要改的项：`note`（字符串或 null 清空）、`displayField`。
+ */
+export function updateAccountDisplay(
+  accountId: string,
+  patch: { note?: string | null; displayField?: DisplayField },
+): Promise<{ ok: boolean; account: AccountMeta }> {
+  if (demoModeEnabled) {
+    return Promise.resolve(
+      screenshotDemoResponse("update_account_display", { accountId, patch }) as {
+        ok: boolean;
+        account: AccountMeta;
+      },
+    );
+  }
+  return call("update_account_display", { accountId, patch });
 }
 
 /** 发起登录：国内版为扫码授权，国际版为浏览器 Web 登录授权；`variant` 缺省为国内版（档位由后端记忆，轮询无需再传）。 */
@@ -408,12 +552,39 @@ export function listSessions(variant?: WbVariant): Promise<{
   return call("list_sessions", variantArgs(variant));
 }
 
+/** 指定账号名下的会话列表（会话管理页的源账号视角）；账号不存在时后端返回明确错误。 */
+export function listAccountSessions(accountId: string, client?: SessionGroupClient): Promise<{
+  /** 插件侧会话没有 `cwd`（只有 `workspaceHash`）：调用方补齐默认值后再交给会话树。 */
+  sessions: (Omit<Session, "cwd"> & { cwd?: string })[];
+  current: string | null;
+  variant?: WbVariant;
+  /** 插件侧：插件数据仓根目录（`null` = 未找到目录，与「该账号无会话」区分）。 */
+  dataRoot?: string | null;
+  sourceUid?: string;
+}> {
+  return call("list_account_sessions", { accountId, ...(client ? { client } : {}) });
+}
+
 /** 把勾选会话复制到指定账号；返回 core 同形的复制报告（copied / alreadyLinked / errors）。 */
 export function copySessions(
   targetAccountId: string,
   sessionIds: string[],
 ): Promise<SessionCopyReport & { variant?: WbVariant }> {
   return call("copy_sessions", { targetAccountId, sessionIds });
+}
+
+/**
+ * 跨档把会话从**显式源账号**复制到**显式目标账号**（会话管理页用）。
+ *
+ * 与 `copySessions` 同形，只多一个 `sourceAccountId`：源可为国内版或国际版账号，
+ * 不再要求源是当前登录账号；报告另带 `sourceVariant` / `targetVariant`。
+ */
+export function copySessionsCross(
+  sourceAccountId: string,
+  targetAccountId: string,
+  sessionIds: string[],
+): Promise<SessionCopyReport & { variant?: WbVariant }> {
+  return call("copy_sessions_cross", { sourceAccountId, targetAccountId, sessionIds });
 }
 
 /**
@@ -429,6 +600,141 @@ export function sessionLinksPreview(
   const args: Record<string, unknown> = { targetAccountId };
   if (variant === "ai") args.variant = variant;
   return call("session_links_preview", args);
+}
+
+/**
+ * 预览「显式来源账号 → 显式目标账号」可同步的关联会话（只读；跨档支持）。
+ *
+ * 与 `sessionLinksPreview` 同形，多一个 `sourceAccountId`；成员内容按成员自身档位读取
+ * （跨档组的源读源档、目标读目标档）。报告在跨档时带 `sourceVariant` / `targetVariant`。
+ */
+export function sessionLinksPreviewCross(
+  sourceAccountId: string,
+  targetAccountId: string,
+): Promise<SessionLinksPreview> {
+  return call("session_links_preview_cross", { sourceAccountId, targetAccountId });
+}
+
+/**
+ * 把显式来源账号的新增同步到显式目标账号（跨档支持；会话管理页用）。
+ *
+ * `syncSelections` 与切号弹窗同形（含预览凭据，执行时后端逐项复核）；
+ * 目标档客户端运行时会返回明确错误（不写半成品）。
+ */
+export function sessionSyncCross(
+  sourceAccountId: string,
+  targetAccountId: string,
+  syncSelections: SessionSyncSelection[],
+): Promise<SessionSyncReport> {
+  return call("session_sync_cross", { sourceAccountId, targetAccountId, syncSelections });
+}
+
+export function listSessionGroups(client: SessionGroupClient, variantScope?: WbVariant): Promise<SessionGroupList> {
+  return call("list_session_groups", { client, ...(variantScope ? { variantScope } : {}) });
+}
+
+export function getSessionGroup(client: SessionGroupClient, groupId: string, variantScope?: WbVariant): Promise<SessionGroupDetail> {
+  return call("get_session_group", { client, groupId, ...(variantScope ? { variantScope } : {}) });
+}
+
+export function previewSessionGroupPair(args: {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId: string;
+  targetMemberId: string;
+  variantScope?: WbVariant;
+}): Promise<SessionGroupPairPreview> {
+  return call("preview_session_group_pair", args as unknown as Record<string, unknown>);
+}
+
+export function syncSessionGroupPair(args: {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId: string;
+  targetMemberId: string;
+  previewToken: string;
+  mode: SessionSyncMode;
+  variantScope?: WbVariant;
+  /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
+  restart?: boolean;
+}): Promise<SessionGroupActionReport> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("sync_session_group_pair", args as unknown as Record<string, unknown>);
+}
+
+export function syncSessionGroupUnify(args: {
+  client: "workbuddy" | "vscodeExt";
+  groupId: string;
+  sourceMemberId: string;
+  targets: { targetMemberId: string; previewToken: string; mode: SessionSyncMode }[];
+  /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
+  restart?: boolean;
+}): Promise<SessionGroupActionReport> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("sync_session_group_unify", args as unknown as Record<string, unknown>);
+}
+
+export function syncSessionGroupSafeBatch(client: SessionGroupClient, groupId: string, variantScope?: WbVariant, restart?: boolean): Promise<SessionGroupActionReport> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("sync_session_group_safe_batch", { client, groupId, ...(variantScope ? { variantScope } : {}), ...(restart ? { restart: true } : {}) });
+}
+
+export function addSessionGroupMember(args: {
+  client: SessionGroupClient;
+  groupId: string;
+  sourceMemberId: string;
+  targetAccountId: string;
+  variantScope?: WbVariant;
+  /** 已获用户授权（确认框）时传 `true`：插件侧运行中允许关闭并重开 VS Code。 */
+  restart?: boolean;
+}): Promise<{ status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed"; editorError?: string; restartedEditor?: boolean; /** 内容缺失 / 索引丢失而被跳过的会话。 */ skipped?: { id: string; error: string }[]; [key: string]: unknown }> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("add_session_group_member", args as unknown as Record<string, unknown>);
+}
+
+/** 插件：把来源账号的勾选会话复制到目标账号并登记关联（无现成组则新建关联组）。 */
+export function copyLinkedSessions(args: {
+  client: SessionGroupClient;
+  sourceAccountId: string;
+  targetAccountId: string;
+  sessionIds: string[];
+  /** 已获用户授权（确认框）时传 `true`：运行中允许关闭并重开 VS Code。 */
+  restart?: boolean;
+}): Promise<{ status: "linked" | "alreadyLinked" | "copiedUnlinked" | "failed"; editorError?: string; restartedEditor?: boolean; [key: string]: unknown }> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("copy_linked_sessions", args as unknown as Record<string, unknown>);
+}
+
+/** 预检：当前是否需要关闭 VS Code（运行中 且 目标账号含当前登录账号）；供前端决定是否先弹确认框。 */
+export function vscodeRestartPrecheck(targetAccountIds: string[]): Promise<{ required: boolean; running: boolean }> {
+  return call("vscode_restart_precheck", { targetAccountIds });
+}
+
+/**
+ * 取消关联：把成员从会话组移除（只解除管理关系，不删除账号内的会话内容）。
+ *
+ * `groupRemoved` 表示移除后组内已无成员，该组已被删除。
+ */
+export function unlinkSessionGroupMember(args: {
+  client: SessionGroupClient;
+  groupId: string;
+  memberId: string;
+  variantScope?: WbVariant;
+}): Promise<{ status: "removed" | "groupRemoved"; client: SessionGroupClient; groupId: string; memberId: string; remaining: number }> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("unlink_session_group_member", args as unknown as Record<string, unknown>);
+}
+
+/**
+ * 删除会话组：组内所有成员一起解除关联（只解除管理关系，不删除账号内的会话内容）。
+ */
+export function deleteSessionGroup(args: {
+  client: SessionGroupClient;
+  groupId: string;
+  variantScope?: WbVariant;
+}): Promise<{ status: "groupRemoved"; client: SessionGroupClient; groupId: string; removed: number }> {
+  if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
+  return call("delete_session_group", args as unknown as Record<string, unknown>);
 }
 
 /** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
@@ -464,6 +770,35 @@ export function revealAppInFinder(): Promise<void> {
   if (demoModeEnabled) return Promise.reject(new Error(DEMO_UNAVAILABLE_MESSAGE));
   if (isWebui()) return Promise.resolve();
   return call("reveal_app_in_finder");
+}
+
+/** 后端持久化的悬浮栏启用状态；默认值由后端决定。 */
+export function getCompanionEnabled(): Promise<boolean> {
+  try {
+    requireCompanionDesktop();
+    return call("get_companion_enabled");
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+/** 返回后端确认的最终状态，不在前端单独持久化。 */
+export function setCompanionEnabled(enabled: boolean): Promise<boolean> {
+  try {
+    requireCompanionDesktop();
+    return call("set_companion_enabled", { enabled });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+export function openCompanionSettings(): Promise<void> {
+  try {
+    requireCompanionDesktop();
+    return call("open_companion_settings");
+  } catch (error) {
+    return Promise.reject(error);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,17 +872,22 @@ export function checkin(accountId: string): Promise<CheckinResult> {
 /**
  * 批量签到：不传档位时覆盖全部档位；显式传入时只处理该档位。
  * 关闭自动签到的账号会被跳过，并逐账号返回 skipped 原因（设置页与托盘同样遵守）。
+ * `respectWindow=true` 时遵守签到时间段：窗口外整轮返回 skipped /
+ * `outside_checkin_window`，不发起任何签到请求（账号页「刷新并签到」专用）；
+ * 缺省不下发该字段，保持设置页 / 托盘 / 旧客户端的立即签到语义。
  *
  * 这里**不能**用 `variantArgs`：`checkin_all` 的缺省语义是「全部档位」，国内版若
  * 缺省不传参，账号页在国内版 Tab 触发的批量签到会打到国际版账号。显式下发 `cn`
  * 与改造前等价（改造前账号库里只有国内版账号）。
  */
-export function checkinAll(variant?: WbVariant): Promise<{
+export function checkinAll(variant?: WbVariant, respectWindow?: boolean): Promise<{
   accounts: { accountId: string; email: string; result: string; error?: string; inactive?: boolean; reason?: string }[];
   status?: string;
   reason?: string;
 }> {
-  return call("checkin_all", variant ? { variant } : {});
+  const args: Record<string, unknown> = variant ? { variant } : {};
+  if (respectWindow === true) args.respectWindow = true;
+  return call("checkin_all", args);
 }
 
 export function getAutoCheckinConfig(): Promise<CheckinConfig> {

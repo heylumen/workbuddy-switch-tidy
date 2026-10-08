@@ -62,6 +62,8 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
             "update-now" => start_update_download(app),
             "update-restart" => start_update_restart(app),
             "lightweight-mode" => toggle_lightweight(app),
+            "companion-toggle" => crate::companion::toggle_rail(app),
+            "companion-settings" => crate::companion::open_settings_from_tray(app),
             "quit-app" => app.exit(0),
             _ => {}
         })
@@ -401,7 +403,8 @@ fn start_checkin_all<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _busy = CheckinBusyGuard { app: app.clone() };
-        let payload = checkin::run_checkin_all(None).await;
+        // 托盘「一键签到」保持立即语义，不遵守签到时间段（respect_window=false）。
+        let payload = checkin::run_checkin_all(None, false).await;
         let text = format_checkin_tooltip(&payload);
         if checkin_succeeded(&payload) {
             notify_checkin(&app, &text);
@@ -590,9 +593,11 @@ fn update_menu_spec(snapshot: &UpdateSnapshot) -> (UpdateMenuAction, String, boo
             },
             false,
         ),
-        UpdatePhase::ReadyToRestart => {
-            (UpdateMenuAction::Restart, "重启以完成升级".to_string(), true)
-        }
+        UpdatePhase::ReadyToRestart => (
+            UpdateMenuAction::Restart,
+            "重启以完成升级".to_string(),
+            true,
+        ),
         UpdatePhase::Error => {
             if snapshot.latest.is_some() {
                 (
@@ -658,6 +663,7 @@ fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>>
         .item(&update_item)
         .separator()
         .item(&lightweight_item)
+        .separator()
         .separator()
         .item(&quit_item)
         .build()
@@ -895,10 +901,17 @@ mod tests {
     fn tray_icon_has_transparency_and_antialiasing() {
         let icon = tray_icon();
         assert_eq!((icon.width(), icon.height()), (36, 36));
-        assert!(icon.rgba().chunks_exact(4).any(|pixel| pixel[3] == 0));
         assert!(icon
             .rgba()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] == 0));
+        assert!(icon
+            .rgba()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| (1..=254).contains(&pixel[3])));
     }
 
@@ -940,7 +953,12 @@ mod tests {
         ));
         for (name, bytes) in [("黑猫", black), ("白猫", white)] {
             assert_eq!(bytes.len(), 32 * 32 * 4, "{name}素材尺寸应为 32×32");
-            let px: Vec<&[u8]> = bytes.chunks_exact(4).collect();
+            let px: Vec<&[u8]> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p.as_slice())
+                .collect();
             assert!(px.iter().any(|p| p[3] == 0), "{name}背景必须透明");
             assert!(px.iter().any(|p| p[3] == 255), "{name}应存在不透明像素");
             let inks: std::collections::HashSet<&[u8]> =
@@ -952,7 +970,13 @@ mod tests {
             );
         }
         let ink = |bytes: &[u8]| {
-            let p = bytes.chunks_exact(4).find(|p| p[3] == 255).unwrap();
+            let p = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .find(|p| p[3] == 255)
+                .unwrap()
+                .as_slice();
             p[0] as u32 + p[1] as u32 + p[2] as u32
         };
         assert!(ink(black) < ink(white), "黑猫必须比白猫暗");
@@ -1181,15 +1205,14 @@ mod tests {
     fn update_menu_spec_maps_each_phase_to_its_entry() {
         use super::{update_menu_spec, UpdateMenuAction, UpdatePhase, UpdateSnapshot};
 
-        let snapshot = |phase: UpdatePhase, latest: Option<&str>, percent: Option<u8>| {
-            UpdateSnapshot {
+        let snapshot =
+            |phase: UpdatePhase, latest: Option<&str>, percent: Option<u8>| UpdateSnapshot {
                 phase,
                 latest: latest.map(str::to_string),
                 percent,
                 message: None,
                 checked_at: None,
-            }
-        };
+            };
 
         assert_eq!(
             update_menu_spec(&snapshot(UpdatePhase::Idle, None, None)),
@@ -1213,7 +1236,11 @@ mod tests {
             )
         );
         assert_eq!(
-            update_menu_spec(&snapshot(UpdatePhase::Downloading, Some("0.1.48"), Some(42))),
+            update_menu_spec(&snapshot(
+                UpdatePhase::Downloading,
+                Some("0.1.48"),
+                Some(42)
+            )),
             (
                 UpdateMenuAction::Download,
                 "正在下载更新 42%".to_string(),

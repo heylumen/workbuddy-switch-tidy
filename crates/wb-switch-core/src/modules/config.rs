@@ -62,17 +62,37 @@ pub fn set_test_home(path: Option<PathBuf>) {
     TEST_HOME.with(|cell| *cell.borrow_mut() = path);
 }
 
+/// 覆盖家目录的环境变量名。
+///
+/// 设置后 `home_dir()` 返回它的值，于是 `~/.wb-switch`、`~/.codebuddy`、
+/// `~/.codebuddy-rotate` 全部落在指定目录下。用途：
+/// - 集成测试把家目录沙箱化，避免读写真实账号与 CLI 配置；
+/// - 自定义部署位置。
+///
+/// 未设置时行为与之前完全一致（`dirs::home_dir()`）。
+pub const HOME_ENV_VAR: &str = "WB_SWITCH_HOME";
+
+/// 本 fork 历史上使用的重定向变量名（保留兼容：便携化运行 / 手工调试）。
+const LEGACY_HOME_ENV_VAR: &str = "WORKBUDDY_HOME";
+
+/// 家目录：支持三级覆盖，优先级从高到低。
+///
+/// 1. **测试线程局部覆盖**（本 fork）：`#[cfg(test)] TEST_HOME`。
+///    为什么不用环境变量——Rust 测试在同一进程内多线程并行，环境变量是进程级的，
+///    会污染其他模块的测试夹具（实测导致 token_stats 三条用例失败）。
+/// 2. **环境变量重定向**（上游）：`WB_SWITCH_HOME`（集成测试 / 自定义部署），
+///    并兼容本 fork 历史的 `WORKBUDDY_HOME`。
+/// 3. 系统家目录（`dirs::home_dir()`）。
 pub fn home_dir() -> PathBuf {
-    // 1) 测试线程的显式覆盖（隔离性最好，不影响并行测试）
     #[cfg(test)]
     if let Some(dir) = TEST_HOME.with(|cell| cell.borrow().clone()) {
         return dir;
     }
-    // 2) 本 fork 保留：WORKBUDDY_HOME 进程级重定向（便携化运行 / 手工调试用）
-    if let Ok(dir) = std::env::var("WORKBUDDY_HOME") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+    for key in [HOME_ENV_VAR, LEGACY_HOME_ENV_VAR] {
+        if let Some(value) = std::env::var_os(key) {
+            if !value.is_empty() {
+                return PathBuf::from(value);
+            }
         }
     }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
