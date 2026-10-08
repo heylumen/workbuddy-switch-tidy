@@ -14,6 +14,7 @@ import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import * as api from "@/lib/api";
+import { displayName } from "@/lib/account-display";
 import type { AccountMeta, LimitEvent, LimitsLedger } from "@/lib/types";
 
 type RangeKey = "7d" | "30d" | "total";
@@ -46,10 +47,29 @@ function formatDuration(ms: number): string {
   return `${seconds} 秒`;
 }
 
-function accountName(uid: string | null | undefined, accounts: AccountMeta[]): string {
-  if (!uid) return "—";
-  const match = accounts.find((account) => account.uid === uid);
-  return match?.nickname || match?.email || uid.slice(0, 8);
+/**
+ * 台账事件的账号显示名。
+ *
+ * 注意：事件里的 `accountUid` 实际是账号 **id**（见 ~/.wb-switch/rate_limit_state.json
+ * 与 credit_usage_snapshots.json 的 `accountId` 字段），与 `AccountMeta.uid` 是两个
+ * 不同的 UUID；早期实现只比对 uid，导致永远匹配不上、退化成 8 位截断。
+ * 这里按 id → uid → 前缀 依次匹配，命中后统一走 `displayName()`（对齐上游实现），
+ * 保证台账、账号卡片、切换弹窗显示一致。
+ */
+function accountName(
+  accountId: string | null | undefined,
+  accounts: AccountMeta[],
+): string {
+  if (!accountId) return "—";
+  const key = String(accountId);
+  const match =
+    accounts.find((account) => account.id === key) ??
+    accounts.find((account) => account.uid === key) ??
+    accounts.find(
+      (account) =>
+        account.id.startsWith(key) || (account.uid ?? "").startsWith(key),
+    );
+  return match ? displayName(match) : key.slice(0, 8);
 }
 
 function LimitRow({

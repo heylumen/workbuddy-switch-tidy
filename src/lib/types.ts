@@ -6,11 +6,23 @@
  */
 export type WbVariant = "cn" | "ai";
 
+/**
+ * 账号显示名取哪个字段（每账号独立的本地偏好）。
+ * 缺省/异常按 `nickname` 处理；选定字段为空时回退 `nickname → uid → id`。
+ */
+export type DisplayField = "nickname" | "phone" | "note";
+
 export interface AccountMeta {
   id: string;
   uid: string | null;
   email: string | null;
   nickname: string | null;
+  /** 官方手机号（实时读 profile_raw，仅国内版账号可能有）。 */
+  phoneNumber?: string | null;
+  /** 本地备注（用户自填，不来自官方数据）。 */
+  note?: string | null;
+  /** 本地显示字段偏好。 */
+  displayField?: DisplayField | null;
   enterpriseName: string | null;
   expiresAt: number | null;
   refreshExpiresAt: number | null;

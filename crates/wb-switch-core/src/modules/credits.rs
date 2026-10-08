@@ -291,18 +291,43 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     })
 }
 
+/// 网关 WAF 客户端指纹拦截：不是账号或 token 问题，重试或更换网络环境才有意义。
+const WAF_FINGERPRINT_CODE: i64 = 10085;
+
+/// 把接口返回的错误文本变成对用户有意义的说明。
+///
+/// 官方错误体字段名并不统一（message / msg / data.message / data.msg），
+/// 个别响应还会把无意义状态词（如 OK、success）放进消息字段——直接透出会变成
+/// 「积分查询失败 · OK」这种无法理解的提示。这里统一兜底为可读文案。
+fn humanize_error(code: i64, message: Option<&str>) -> String {
+    let trimmed = message.unwrap_or("").trim();
+    let uninformative = trimmed.is_empty()
+        || trimmed.len() < 2
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "ok" | "success" | "succeed" | "true" | "done"
+        );
+    if !uninformative {
+        return trimmed.chars().take(160).collect();
+    }
+    if code == WAF_FINGERPRINT_CODE {
+        return format!(
+            "积分接口被官方网关拦截（code={WAF_FINGERPRINT_CODE}），请稍后重试；若持续出现请更换网络环境"
+        );
+    }
+    format!("积分查询失败（code={code}）")
+}
+
 fn response_error(response: &Value) -> String {
-    let nested = response.get("data").filter(|value| value.is_object());
     let code = response_code(response).unwrap_or(-1);
-    response
+    let nested = response.get("data");
+    let message = response
         .get("message")
         .or_else(|| response.get("msg"))
         .or_else(|| nested.and_then(|value| value.get("message")))
         .or_else(|| nested.and_then(|value| value.get("msg")))
-        .and_then(|value| value.as_str())
-        .filter(|message| !message.trim().is_empty())
-        .map(|message| message.chars().take(160).collect::<String>())
-        .unwrap_or_else(|| format!("积分查询失败（code={code}）"))
+        .and_then(Value::as_str);
+    humanize_error(code, message)
 }
 
 fn response_code(response: &Value) -> Option<i64> {
@@ -1489,5 +1514,22 @@ mod tests {
         // 发三路等于 3×2 个 404，故只对国内版启用。
         assert!(uses_three_endpoint_query(WbVariant::Cn));
         assert!(!uses_three_endpoint_query(WbVariant::Ai));
+    }
+}
+
+#[cfg(test)]
+mod humanize_error_tests {
+    use super::{humanize_error, WAF_FINGERPRINT_CODE};
+
+    #[test]
+    fn uninformative_message_falls_back_to_readable_text() {
+        assert_eq!(humanize_error(0, Some("OK")), "积分查询失败（code=0）");
+        assert_eq!(humanize_error(0, Some("  ")), "积分查询失败（code=0）");
+        assert!(humanize_error(WAF_FINGERPRINT_CODE, None).contains("官方网关拦截"));
+    }
+
+    #[test]
+    fn informative_message_is_kept() {
+        assert_eq!(humanize_error(500, Some("余额服务暂不可用")), "余额服务暂不可用");
     }
 }
