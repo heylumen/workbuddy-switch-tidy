@@ -382,7 +382,7 @@ fn sync_unify_batch_vscode(
         .collect();
     let guard = prepare_editor_window(client, restart, VSCODE_SYNC_RUNNING_HINT, &target_uids)?;
     let editor_prepared = guard.is_some();
-    let mut combined = json!({ "client": client.as_str(), "groupId": group_id, "synced": [], "skipped": [], "errors": [], "needsRecovery": false });
+    let mut combined = json!({ "client": client.as_str(), "groupId": group_id, "synced": [], "skipped": [], "errors": [], "needsRecovery": false, "temporaryFiles": [] });
     for (pair, selection) in prepared {
         match run_pair_sync(client, scope, &pair, &[selection], editor_prepared) {
             Ok(report) => merge_sync_report(&mut combined, report),
@@ -460,7 +460,7 @@ pub fn sync_safe_batch(
                 .map(str::to_string)
         })
         .collect::<Vec<_>>();
-    let mut combined = json!({ "client": client.as_str(), "groupId": group_id, "synced": [], "skipped": [], "errors": [], "needsRecovery": false });
+    let mut combined = json!({ "client": client.as_str(), "groupId": group_id, "synced": [], "skipped": [], "errors": [], "needsRecovery": false, "temporaryFiles": [] });
     // 准备阶段：全部目标的复核与凭据都在关闭编辑器之前完成（复核失败/不再安全快进的项照旧跳过），
     // 避免为注定失败的请求打断用户。
     let mut prepared = Vec::new();
@@ -1329,16 +1329,25 @@ fn parse_selection(
 }
 
 fn merge_sync_report(into: &mut Value, item: Value) {
+    let Value::Object(combined) = into else {
+        return;
+    };
     for key in ["synced", "skipped", "errors", "temporaryFiles"] {
         let values = item
             .get(key)
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        into[key].as_array_mut().unwrap().extend(values);
+        // 汇总对象的初始化 schema 可能与合并键列表漂移：缺键时 IndexMut 只会补成 Null，
+        // 直接 as_array_mut().unwrap() 会 panic。这里把「缺失或不是数组」的槽位补成
+        // 数组再合并 values —— 不 panic，也不丢数据。
+        match combined.entry(key.to_owned()).or_insert_with(|| json!([])) {
+            Value::Array(target) => target.extend(values),
+            slot => *slot = json!(values),
+        }
     }
     if item.get("needsRecovery").and_then(Value::as_bool) == Some(true) {
-        into["needsRecovery"] = json!(true);
+        combined.insert("needsRecovery".to_owned(), json!(true));
     }
 }
 
@@ -2136,6 +2145,9 @@ mod tests {
         let selection = parse_selection("group", "token", "unifyOverwrite").unwrap();
         assert_eq!(selection.mode, SyncMode::UnifyOverwrite);
         assert!(parse_selection("group", "token", "unsupported").is_err());
+        // 会话组统一入口只提交正文模式：只同步归档由切号预览的 archiveAction 表达，
+        // 不在统一入口的模式白名单里，也不影响它对 ahead 的 unifyOverwrite 改写。
+        assert!(parse_selection("group", "token", "statusOnly").is_err());
     }
 
     fn member_view(
@@ -2800,5 +2812,90 @@ mod tests {
         assert_eq!(summary, "behind");
         assert_eq!(views[2].version_status, "stale");
         assert_eq!(views[3].version_status, "superseded");
+    }
+
+    /// 汇总对象初始化形状：与 `sync_safe_batch` / `sync_unify_batch_vscode` 一致。
+    fn combined_report() -> Value {
+        json!({
+            "client": "workbuddy",
+            "groupId": "g-1",
+            "synced": [],
+            "skipped": [],
+            "errors": [],
+            "needsRecovery": false,
+            "temporaryFiles": [],
+        })
+    }
+
+    /// 单个目标项的报告：只给 `key` 灌入一条记录，其余合并键为空。
+    fn sync_report_item(key: &str) -> Value {
+        let mut item = json!({
+            "synced": [],
+            "skipped": [],
+            "errors": [],
+            "temporaryFiles": [],
+        });
+        item[key] = json!([{"targetMemberId": "m-1"}]);
+        item
+    }
+
+    #[test]
+    fn merge_sync_report_merges_every_key_and_propagates_needs_recovery() {
+        let mut combined = combined_report();
+        combined["synced"] = json!([{"targetMemberId": "m-0"}]);
+        combined["temporaryFiles"] = json!([{"targetMemberId": "m-0", "path": "/tmp/first"}]);
+
+        merge_sync_report(
+            &mut combined,
+            json!({
+                "synced": [{"targetMemberId": "m-1"}],
+                "skipped": [{"targetMemberId": "m-1", "reasonCode": "previewStale"}],
+                "errors": [{"error": "m-1：写入失败"}],
+                "needsRecovery": true,
+                "temporaryFiles": [{"targetMemberId": "m-1", "path": "/tmp/second"}],
+            }),
+        );
+
+        assert_eq!(combined["synced"].as_array().map(Vec::len), Some(2));
+        assert_eq!(combined["skipped"].as_array().map(Vec::len), Some(1));
+        assert_eq!(combined["errors"].as_array().map(Vec::len), Some(1));
+        assert_eq!(combined["temporaryFiles"].as_array().map(Vec::len), Some(2));
+        assert_eq!(combined["temporaryFiles"][0]["path"], json!("/tmp/first"));
+        assert_eq!(combined["temporaryFiles"][1]["path"], json!("/tmp/second"));
+        assert_eq!(combined["needsRecovery"], json!(true));
+    }
+
+    #[test]
+    fn merge_sync_report_initializes_missing_key_instead_of_panicking() {
+        for key in ["synced", "skipped", "errors", "temporaryFiles"] {
+            let mut combined = combined_report();
+            combined.as_object_mut().unwrap().remove(key);
+            assert!(combined.get(key).is_none());
+
+            merge_sync_report(&mut combined, sync_report_item(key));
+
+            assert_eq!(
+                combined[key],
+                json!([{"targetMemberId": "m-1"}]),
+                "{key} 缺失时应补成数组并保留合并内容"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_sync_report_replaces_null_key_with_merged_array() {
+        for key in ["synced", "skipped", "errors", "temporaryFiles"] {
+            let mut combined = combined_report();
+            combined[key] = Value::Null;
+            assert!(combined[key].is_null());
+
+            merge_sync_report(&mut combined, sync_report_item(key));
+
+            assert_eq!(
+                combined[key],
+                json!([{"targetMemberId": "m-1"}]),
+                "{key} 为 Null 时应补成数组并保留合并内容"
+            );
+        }
     }
 }

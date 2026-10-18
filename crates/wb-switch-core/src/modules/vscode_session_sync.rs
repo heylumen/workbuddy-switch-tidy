@@ -657,6 +657,10 @@ fn live_preview_binding(
         baseline_total_digest: baseline.ready().map(|record| record.total_digest.clone()),
         baseline_record_count: baseline.ready().map(|record| record.record_count),
         verdict,
+        // VS Code / CN IDE 侧没有 sessions 表，不感知归档状态：永不提供状态同步动作。
+        source_status: None,
+        target_status: None,
+        archive_action: None,
     }
 }
 
@@ -1062,6 +1066,8 @@ fn execute_sync_item(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value,
     match plan.mode {
         SyncMode::FastForward => fast_forward(paths, plan),
         SyncMode::Overwrite | SyncMode::UnifyOverwrite => overwrite(paths, plan),
+        // 插件侧没有 sessions 表、不感知归档状态，永不产生状态同步计划。
+        SyncMode::StatusOnly => Err("当前客户端不支持仅同步归档，已拒绝".to_string()),
     }
 }
 

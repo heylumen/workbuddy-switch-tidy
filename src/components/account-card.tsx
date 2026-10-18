@@ -451,6 +451,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
 
   const statusChips = (
     <>
+      {/* 企业版标注（issue #167）：身份属性优先于状态 chip。
+          紧凑卡片单行头部放不下（会挤掉账号名），徽标改在积分区显示。 */}
+      {!compact && account.isEnterprise && <Badge variant="secondary" className={chipClass}>企业版</Badge>}
       {autoCheckinAllowed === false &&
         statusIconChip({
           icon: <CalendarOff className="size-3.5" />,
@@ -747,9 +750,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             <div className="flex items-baseline gap-x-3 gap-y-1">
               <span className="flex items-center gap-1.5">
                 <Sparkles className="size-4 shrink-0 stroke-[1.75] text-muted-foreground" aria-hidden="true" />
-                <strong className={cn("font-semibold leading-none tabular-nums tracking-[-0.025em]", compact ? "text-[20px]" : "text-[22px]")} style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}>{formatCredits(credit.totalRemaining ?? 0)}</strong>
+                <strong className={cn("font-semibold leading-none tabular-nums tracking-[-0.025em]", compact ? "text-[20px]" : "text-[22px]")} style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}>{credit.unlimited ? "不限量" : formatCredits(credit.totalRemaining ?? 0)}</strong>
+                {/* 紧凑卡片的头部单行放不下企业版徽标（会挤掉账号名），改在大数字旁标注。 */}
+                {compact && account.isEnterprise && <Badge variant="secondary" className={chipClass}>企业版</Badge>}
               </span>
-              <span className={cn("text-muted-foreground", compact ? "text-[11px]" : "text-xs")}>{resources.length} 个积分包</span>
+              <span className={cn("text-muted-foreground", compact ? "text-[11px]" : "text-xs")}>{credit.unlimited || account.isEnterprise ? "企业配额" : `${resources.length} 个积分包`}</span>
               <div className={cn("ml-auto flex items-center gap-1.5 text-muted-foreground", compact ? "text-[11px]" : "text-xs")} title={expiringAmount > 0 ? `${formatCredits(expiringAmount)} 积分将在 7 天内到期` : resources[0]?.expireAt ? `最近到期 ${formatCreditExpiry(resources[0].expireAt)}` : "当前积分长期有效"}>
                 <Clock3 className="size-3.5 shrink-0" />
                 <span className="whitespace-nowrap tabular-nums">{creditUpdatedAt ? `${formatCreditUpdatedAt(creditUpdatedAt)} 更新` : "—"}</span>
@@ -772,21 +777,26 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             {/* 上下间距统一：列表上方与内容区底部 padding 同值（紧凑 12px / 宽松 16px）。
                 否则「标签→首条」比「末条→卡片底」窄，垂直节奏不对称。 */}
             <div className={cn(compact ? "mt-3 space-y-2" : "mt-4 space-y-2.5")}>
-              {[0, 1].map((index) => {
-                const resource = visibleResources[index];
-                // 一条积分都没有时，第一槽位显示空态提示，第二槽位仍是纯占位（不再重复"暂无其他积分包"）
-                if (!resource && index === 0 && visibleResources.length === 0) {
-                  return <div key="credit-empty" className="py-1 text-[11px] text-muted-foreground">暂无可用积分</div>;
-                }
-                return (
-                  <CreditResourceRow
-                    key={resource ? `${resource.packageCode ?? "resource"}-${resource.expireAt ?? "none"}-${index}` : `credit-slot-${index}`}
-                    resource={resource}
-                    compact={compact}
-                    placeholderLabel={visibleResources.length > 0 ? "暂无其他积分包" : undefined}
-                  />
-                );
-              })}
+              {credit.unlimited ? (
+                // 不限量没有积分包可列：用一条「企业配额 · 不限量」行表达（复用占位行样式，不引入新组件）。
+                <CreditResourceRow compact={compact} placeholderLabel="企业配额 · 不限量" />
+              ) : (
+                [0, 1].map((index) => {
+                  const resource = visibleResources[index];
+                  // 一条积分都没有时，第一槽位显示空态提示，第二槽位仍是纯占位（不再重复"暂无其他积分包"）
+                  if (!resource && index === 0 && visibleResources.length === 0) {
+                    return <div key="credit-empty" className="py-1 text-[11px] text-muted-foreground">暂无可用积分</div>;
+                  }
+                  return (
+                    <CreditResourceRow
+                      key={resource ? `${resource.packageCode ?? "resource"}-${resource.expireAt ?? "none"}-${index}` : `credit-slot-${index}`}
+                      resource={resource}
+                      compact={compact}
+                      placeholderLabel={visibleResources.length > 0 ? "暂无其他积分包" : undefined}
+                    />
+                  );
+                })
+              )}
             </div>
           </>
         )}

@@ -142,6 +142,8 @@ pub fn account_meta(acc: &Value) -> Value {
         "createdAt": display_value(acc, "createdAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": display_value(acc, "needs_relogin_reason"),
+        // 企业版标记（issue #167）：读取时判定，供前端展示「企业版」徽标，历史数据零迁移。
+        "isEnterprise": is_enterprise_account(acc),
         // 档位随元数据下发，供宿主按档位过滤列表（缺省国内版，历史数据零迁移）。
         "variant": variant_of(acc).as_str(),
     })
@@ -180,6 +182,25 @@ pub fn secret_value(v: &Value, key: &str) -> Option<Value> {
 /// 账号档位：显式 `variant` 字段优先，缺失时按 `domain` 后缀兜底，缺省国内版。
 pub fn variant_of(acc: &Value) -> WbVariant {
     WbVariant::from_account(acc)
+}
+
+/// 企业 ID 字段读取（兼容 camelCase `enterpriseId` 与 snake_case `enterprise_id`）。
+///
+/// 官方客户端以该字段是否存在分流个人版 / 企业版积分接口（issue #167）；
+/// 请求头（[`build_auth_headers`]）与积分查询共用同一字段口径，不要各写一份。
+pub fn enterprise_id_of(account: &Value) -> Option<String> {
+    get_str(account, "enterpriseId").or_else(|| get_str(account, "enterprise_id"))
+}
+
+/// 是否企业版账号：有企业 ID 直接命中；历史备份可能只带
+/// `type ∈ {ultimate, exclusive}` 而缺 ID（对齐 WorkDaddy 兜底判定），
+/// 这类账号仍需走企业分流，取数前补拉企业 ID。
+pub fn is_enterprise_account(account: &Value) -> bool {
+    enterprise_id_of(account).is_some()
+        || matches!(
+            get_str(account, "type").as_deref(),
+            Some("ultimate" | "exclusive")
+        )
 }
 
 /// 合并采集结果时保留已有档位：已入库的档位不得因再次采集而丢失。
@@ -471,9 +492,7 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
     if let Some(uid) = get_str(account, "uid") {
         headers.insert("X-User-Id".to_string(), uid);
     }
-    if let Some(eid) =
-        get_str(account, "enterpriseId").or_else(|| get_str(account, "enterprise_id"))
-    {
+    if let Some(eid) = enterprise_id_of(account) {
         headers.insert("X-Enterprise-Id".to_string(), eid.clone());
         headers.insert("X-Tenant-Id".to_string(), eid);
     }
@@ -558,6 +577,46 @@ mod tests {
             account_meta(&json!({"id": "a3", "domain": "", "variant": ""}))["variant"],
             "cn"
         );
+    }
+
+    /// 回归 issue #167：企业版判定矩阵（enterpriseId / type 兜底 / 普通账号不命中）。
+    #[test]
+    fn enterprise_account_detection_matrix() {
+        assert!(is_enterprise_account(&json!({"enterpriseId": "e-1"})));
+        assert!(is_enterprise_account(&json!({"enterprise_id": "e-2"})));
+        assert_eq!(
+            enterprise_id_of(&json!({"enterpriseId": "  e-3  "})),
+            Some("e-3".to_string()),
+            "企业 ID 应 trim"
+        );
+        // 老备份可能只带 type 而缺 ID：仍判定为企业版（取数前补拉 ID）。
+        assert!(is_enterprise_account(&json!({"type": "ultimate"})));
+        assert!(is_enterprise_account(&json!({"type": "exclusive"})));
+        // 普通个人版账号不命中。
+        assert!(!is_enterprise_account(&json!({"type": "personal"})));
+        assert!(!is_enterprise_account(&json!({"type": ""})));
+        assert!(!is_enterprise_account(&json!({})));
+        // 空串企业 ID 不算命中。
+        assert!(!is_enterprise_account(&json!({"enterpriseId": "  "})));
+        assert_eq!(enterprise_id_of(&json!({"enterprise_id": ""})), None);
+    }
+
+    /// account_meta 下发企业标记，供前端展示「企业版」徽标。
+    #[test]
+    fn account_meta_exposes_enterprise_flag() {
+        assert_eq!(
+            account_meta(&json!({"id": "a1", "enterpriseId": "e-1"}))["isEnterprise"],
+            true
+        );
+        assert_eq!(
+            account_meta(&json!({"id": "a2", "type": "ultimate"}))["isEnterprise"],
+            true
+        );
+        assert_eq!(
+            account_meta(&json!({"id": "a3", "type": "personal"}))["isEnterprise"],
+            false
+        );
+        assert_eq!(account_meta(&json!({"id": "a4"}))["isEnterprise"], false);
     }
 
     #[test]

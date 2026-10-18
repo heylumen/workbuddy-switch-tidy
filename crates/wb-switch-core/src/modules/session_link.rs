@@ -416,15 +416,22 @@ impl SyncVerdict {
     }
 
     /// 该判定允许的写入模式。unknown 不匹配任何模式——覆盖不能绕过未知。
+    ///
+    /// `StatusOnly` 恒为 false：它不属于任何正文判定，只能由「来源已归档 + 目标处于
+    /// 终态」这一独立资格授权，走 `plan_sync_selection` 的单独分支，不得混进正文门禁。
     pub fn allows(self, mode: SyncMode) -> bool {
         match mode {
             SyncMode::FastForward => self == SyncVerdict::FastForward,
             SyncMode::Overwrite => self == SyncVerdict::Diverge,
             SyncMode::UnifyOverwrite => self == SyncVerdict::Ahead,
+            SyncMode::StatusOnly => false,
         }
     }
 
     /// 前端可选的写入模式（空表示不可勾选）。
+    ///
+    /// 只描述**正文写入**模式；仅同步归档不进这个数组，由预览项的 `archiveAction`
+    /// 单独表达，避免把状态动作误认成正文覆盖权限。
     pub fn available_modes(self) -> Vec<SyncMode> {
         match self {
             SyncVerdict::FastForward => vec![SyncMode::FastForward],
@@ -444,6 +451,10 @@ pub enum SyncMode {
     Overwrite,
     /// 用户选择整组保留来源副本时，明确覆盖仅目标有改动的副本。
     UnifyOverwrite,
+    /// 仅同步会话生命周期状态（把目标对齐为已归档），正文零写入。
+    ///
+    /// 不进 `available_modes`：它的资格来自双方会话行的归档状态，与正文判定无关。
+    StatusOnly,
 }
 
 impl SyncMode {
@@ -452,6 +463,7 @@ impl SyncMode {
             SyncMode::FastForward => "fastForward",
             SyncMode::Overwrite => "overwrite",
             SyncMode::UnifyOverwrite => "unifyOverwrite",
+            SyncMode::StatusOnly => "statusOnly",
         }
     }
 
@@ -461,6 +473,7 @@ impl SyncMode {
             "fastForward" => Ok(SyncMode::FastForward),
             "overwrite" => Ok(SyncMode::Overwrite),
             "unifyOverwrite" => Ok(SyncMode::UnifyOverwrite),
+            "statusOnly" => Ok(SyncMode::StatusOnly),
             other => Err(format!("未知的同步模式：{other}")),
         }
     }
@@ -1288,7 +1301,9 @@ pub fn load_pair_baseline(
 // ---------------------------------------------------------------------------
 
 /// 预览凭据格式版本；读到其它版本一律视为过期。
-pub const PREVIEW_TOKEN_VERSION: u32 = 1;
+///
+/// v2：新增双方会话行的 `status` 与本次归档动作，执行前重新读取并逐项比对。
+pub const PREVIEW_TOKEN_VERSION: u32 = 2;
 /// 每档位保留的历史预览凭据条数（凭据是一次性的，不做长期保留）。
 pub const KEEP_PREVIEW_TOKENS: usize = 200;
 
@@ -1326,6 +1341,17 @@ pub struct PreviewBinding {
     #[serde(default)]
     pub baseline_record_count: Option<usize>,
     pub verdict: SyncVerdict,
+    /// 来源会话行的 `status`（表缺列时为 None，表示不支持状态同步）。
+    #[serde(default)]
+    pub source_status: Option<String>,
+    /// 目标会话行的 `status`（表缺列时为 None，表示不支持状态同步）。
+    #[serde(default)]
+    pub target_status: Option<String>,
+    /// 本次是否授权「仅同步归档」：`"statusOnly"` 或 None。
+    ///
+    /// 预览生成时即固定，不随用户后来是否勾选变化；执行时以绑定为准。
+    #[serde(default)]
+    pub archive_action: Option<String>,
 }
 
 /// 服务端保存的预览凭据。
@@ -1492,6 +1518,13 @@ pub fn verify_preview(preview: &PreviewToken, live: &PreviewBinding) -> Vec<Stri
     }
     if expected.verdict != live.verdict {
         stale.push("检查结果已变化，请重新检查".to_string());
+    }
+    if expected.source_status != live.source_status || expected.target_status != live.target_status
+    {
+        stale.push("会话的归档状态已变化，请重新检查".to_string());
+    }
+    if expected.archive_action != live.archive_action {
+        stale.push("可执行的归档同步已变化，请重新检查".to_string());
     }
     stale
 }
@@ -3108,6 +3141,9 @@ mod tests {
             baseline_total_digest: Some("base-digest".to_string()),
             baseline_record_count: Some(2),
             verdict: SyncVerdict::FastForward,
+            source_status: None,
+            target_status: None,
+            archive_action: None,
         }
     }
 

@@ -23,7 +23,8 @@ interface AccountUsageSeed {
   models: ModelSeed[];
 }
 
-// 演示数据按档位分组：前三行是国内版 fixture，后两行是国际版。
+// 演示数据按档位分组：前三行是国内版 fixture，后两行是国际版；最后一行是企业版
+// （国内）演示账号，只覆盖账号页卡片形态（「企业版」标注 + 企业配额 / 不限量）。
 // 国际版只覆盖账号页（及数据同源的积分统计视图）；Token 统计的 workbuddy-ai 源、
 // 限额台账、签到、旅行、轮换保持原有空态，见 `emptyTokenSource` 与各档位能力函数。
 const intlAccountA: AccountMeta = { id: "demo-account-ai-a", uid: "demo-intl-001", email: "intl-a@example.com", nickname: "国际版 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "ai" };
@@ -32,9 +33,12 @@ const intlAccountB: AccountMeta = { id: "demo-account-ai-b", uid: "demo-intl-002
 const accounts: AccountMeta[] = [
   { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", phoneNumber: "138 0013 8001", note: "主力账号", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
   { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", phoneNumber: "138 0013 8002", note: "备用号", displayField: "note", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
-  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  // 企业版有限配额：卡片应显示「企业版」徽标 + 单条「企业配额」。
+  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn", isEnterprise: true },
   intlAccountA,
   intlAccountB,
+  // 企业版不限量（limitNum=-1）：卡片应显示「不限量」+「企业配额」，无积分包。
+  { id: "demo-account-d", uid: "demo-user-004", email: "test-d@example.com", nickname: "测试 D", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn", isEnterprise: true },
 ];
 
 /** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
@@ -92,15 +96,27 @@ const usageSeeds: AccountUsageSeed[] = [
       { model: "hy3", requestCount: 28, credit: 0 },
     ],
   },
+  // 企业版 D：轻量用量，让统计页的企业版账号也有可读数据。
+  {
+    requestCount: 156,
+    models: [
+      { model: "deepseek-v4-flash", requestCount: 148, credit: 268.4 },
+      { model: "hy3", requestCount: 8, credit: 0 },
+    ],
+  },
 ];
 
+/** 演示积分包种子：[名称, 总量, 剩余, N 天后到期]；与 `accounts` 严格同索引。 */
+type CreditPackageSeed = readonly [packageName: string, total: number, remaining: number, expireDays: number];
+
 /**
- * 演示数据刻意让三个账号的积分包数量不同（1 / 2 / 5），覆盖卡片内容区的三种高度：
- * 1 行、2 行、2 行 + 「查看全部积分包」。这样演示模式能真实暴露「同排卡片因内容长度不同
- * 而高低参差」的布局问题 —— 若三家都给同样多的包，这个问题在演示里永远看不见。
- * 请勿"顺手"改回统一数量。
+ * 演示积分包按账号索引与 `accounts` 严格对应，覆盖卡片内容区的多种形态：
+ * A（1 条）/ B（2 条）为个人版，覆盖 1 行、2 行两种高度；C 为企业版单条
+ * 「企业配额」（企业接口只返回一条配额资源）；D 为企业版不限量，无积分包。
+ * 说明：原先由 C 覆盖的「>2 条 → 查看全部积分包」样例随企业版改造移除，
+ * 如需该样例，应由后续新增的个人版账号承载，而不是改回 C 的个人版数据。
  */
-const creditPackages = [
+const creditPackages: readonly (readonly CreditPackageSeed[])[] = [
   // 账号 A：1 条 → 1 行，无「查看全部积分包」
   [
     ["CodeBuddy 新用户体验包", 800, 386.4, 5],
@@ -110,13 +126,9 @@ const creditPackages = [
     ["CodeBuddy 个人版积分包", 1800, 905.5, 42],
     ["CodeBuddy 签到赠送积分", 240, 174.35, 15],
   ],
-  // 账号 C：5 条 → 2 行 + 「查看全部积分包」
+  // 账号 C（企业版有限配额）：单条「企业配额」，总量 2000 / 剩余 1500 / 30 天重置
   [
-    ["CodeBuddy 个人版国内运营裂变包", 2400, 1680.4, 29],
-    ["CodeBuddy 个人版积分包", 1200, 748.6, 55],
-    ["CodeBuddy 新用户体验包", 360, 214.5, 14],
-    ["CodeBuddy 签到赠送积分", 180, 96.75, 21],
-    ["CodeBuddy 活动奖励积分", 300, 207.9, 38],
+    ["企业配额", 2000, 1500, 30],
   ],
   // 国际版账号：合成码不会命中官方商品码映射，因此展示的就是这里自造的名字；
   // 沿用官方命名口径，覆盖「试用 / 赠送 / 购买」三类国际版语义。
@@ -129,7 +141,9 @@ const creditPackages = [
     ["试用版基础用量", 500, 318.75, 60],
     ["平台奖励积分", 800, 512.4, 90],
   ],
-] as const;
+  // 账号 D（企业版不限量）：无积分包，creditExpiry 返回 unlimited 形态
+  [],
+];
 
 function startOfToday(): Date {
   const date = new Date();
@@ -170,7 +184,8 @@ function hydratedAccounts(): AccountMeta[] {
 function creditExpiry(accountId: string): CreditExpiry {
   const index = Math.max(0, accounts.findIndex((account) => account.id === accountId));
   const account = accounts[index] ?? accounts[0];
-  const resources = creditPackages[index].map(([packageName, total, remaining, expireDays], packageIndex) => ({
+  const packages = creditPackages[index] ?? [];
+  const resources = packages.map(([packageName, total, remaining, expireDays], packageIndex) => ({
     packageCode: `demo-package-${index + 1}-${packageIndex + 1}`,
     packageName,
     total,
@@ -184,12 +199,35 @@ function creditExpiry(accountId: string): CreditExpiry {
   const totalCapacity = resources.reduce((sum, resource) => sum + resource.total, 0);
   const totalRemaining = resources.reduce((sum, resource) => sum + resource.remaining, 0);
   const expiringSoonRemaining = resources.filter((resource) => resource.expiringSoon).reduce((sum, resource) => sum + resource.remaining, 0);
+  const updatedAt = Date.now() - (index + 1) * 4 * 60 * 1000;
+
+  // 企业版（issue #167）：企业配额不在个人版接口里，卡片按企业形态渲染。
+  // 无积分包 = 不限量（limitNum=-1）；有积分包 = 单条「企业配额」有限配额。
+  if (account.isEnterprise && resources.length === 0) {
+    return {
+      ok: true,
+      accountId: account.id,
+      accountName: account.nickname ?? account.email ?? account.id,
+      updatedAt,
+      unlimited: true,
+      totalCapacity: null,
+      totalRemaining: null,
+      expiringSoonRemaining: 0,
+      expiredRemaining: 0,
+      soonestExpireAt: null,
+      expiringSoon: false,
+      expired: false,
+      resources: [],
+    };
+  }
 
   return {
     ok: true,
     accountId: account.id,
     accountName: account.nickname ?? account.email ?? account.id,
-    updatedAt: Date.now() - (index + 1) * 4 * 60 * 1000,
+    updatedAt,
+    // 企业版有限配额显式标记 unlimited=false；个人版不新增字段（保持原有 mock 形态）。
+    ...(account.isEnterprise ? { unlimited: false } : {}),
     totalCapacity,
     totalRemaining: Number(totalRemaining.toFixed(2)),
     expiringSoonRemaining: Number(expiringSoonRemaining.toFixed(2)),
@@ -336,7 +374,9 @@ function buildStatistics(): CreditStatistics {
     generatedAt,
     retentionDays: 90,
     coverageStartAt: atLocalTime(29, 0, 0),
-    summary: { currentRemaining: Number(totalRemaining.toFixed(2)), currentCapacity: totalCapacity, usageToday, usage7Days, usageThisMonth, todayCheckedInAccounts: 3, todaySuccess: 2, todayAlready: 1, todayFailed: 0 },
+    // 签到计数与 `checkinLogs()` / `events` 的构造规则保持一致：
+    // 支持签到的账号共 4 个（国内版 A/B/C/D），其中 B 为 already、其余为 success。
+    summary: { currentRemaining: Number(totalRemaining.toFixed(2)), currentCapacity: totalCapacity, usageToday, usage7Days, usageThisMonth, todayCheckedInAccounts: 4, todaySuccess: 3, todayAlready: 1, todayFailed: 0 },
     daily,
     accounts: demoAccounts.map((account, index) => {
       // 国际版没有签到接口：签到态一律留空，与 `variantSupportsCheckin` 一致。
@@ -461,7 +501,7 @@ function rateLimitHookStatus(): RateLimitHookStatus {
   };
 }
 
-/** 签到日志同样只覆盖支持签到的档位；国内版三账号的索引与条目取值保持不变。 */
+/** 签到日志只覆盖支持签到的档位；A/B/C 的索引与取值不变，企业版 D 追加在国际版之后。 */
 function checkinLogs(): CheckinLog[] {
   return hydratedAccounts().flatMap((account, accountIndex) => variantSupportsCheckin(accountVariant(account))
     ? [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" }))

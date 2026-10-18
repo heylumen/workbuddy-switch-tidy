@@ -9,7 +9,8 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use crate::modules::account::{
-    account_display_name, build_auth_headers, envelope_token_error, variant_of,
+    account_display_name, build_auth_headers, enterprise_id_of, envelope_token_error,
+    is_enterprise_account, variant_of,
 };
 use crate::modules::config::{
     http_request, is_route_missing, load_checkin_config, now_ms, CHECKIN_API_PREFIX,
@@ -25,6 +26,11 @@ const WORKBUDDY_WEB_ENDPOINT: &str = "https://www.workbuddy.cn";
 const RESOURCE_SUMMARY_PATH: &str = "/billing/meter/get-user-resource-summary";
 const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid-packages";
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
+/// 企业配额接口（issue #167）：企业账号不走个人版资源接口，官方按 `enterpriseId`
+/// 分流到该接口；国内版与国际版路径同构（两侧 asar 均已验证）。
+const ENTERPRISE_USAGE_PATH: &str = "/v2/billing/meter/get-enterprise-user-usage";
+/// 企业 ID 补拉接口：`type` 兜底判定为企业版但账号数据缺 ID 时使用（单次尝试）。
+const ENTERPRISE_ACCOUNTS_PATH: &str = "/console/accounts";
 const PRODUCT_CODE: &str = "p_tcaca";
 const EXPIRING_SOON_DAYS: i64 = 7;
 /// DeductionEndTime 比 CycleEndTime 晚超过该天数时，视前者为长期占位
@@ -800,6 +806,23 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
 
     let now = now_ms();
 
+    // 企业版分流（issue #167）：企业配额不在个人版资源接口里。必须放在 cn/ai
+    // 分派之前——官方国内/国际版企业账号都走企业接口（两侧 asar 已验证同构）。
+    if is_enterprise_account(account) {
+        let enterprise_id = match enterprise_id_of(account) {
+            Some(enterprise_id) => Some(enterprise_id),
+            // 兜底判定命中但缺 ID（历史备份）：补拉一次。
+            None => resolve_enterprise_id(account).await,
+        };
+        return match enterprise_id {
+            Some(enterprise_id) => fetch_enterprise_credit(account, &enterprise_id, now).await,
+            // 补不到 ID 时给出可读错误，不得回落个人版接口把企业账号显示成「暂无可用积分」。
+            None => {
+                credit_error_result(account, "企业账号缺少企业 ID，无法查询企业配额".to_string())
+            }
+        };
+    }
+
     if !uses_three_endpoint_query(variant_of(account)) {
         return fetch_legacy_credit(account, now).await;
     }
@@ -867,6 +890,150 @@ fn legacy_credit_result(account: &Value, response: &Value, now: i64) -> Value {
         "accountName": account_display_name(account),
         "error": response_error(response),
     })
+}
+
+// ---------------------------------------------------------------------------
+// 企业版分流（issue #167）：企业配额不在个人版资源接口里，官方按 `enterpriseId`
+// 分流到 `get-enterprise-user-usage`。个人版路径不改动；企业结果输出同一
+// `CreditExpiry` 结构（多一个 `unlimited` 标记）。
+// ---------------------------------------------------------------------------
+
+/// 企业配额用量（企业接口响应解析结果）。
+struct EnterpriseUsage {
+    /// 总量；`-1` 表示不限量。
+    limit_num: f64,
+    /// 已用量。
+    used: f64,
+    /// 周期重置时间（毫秒时间戳）；解析失败为 `None`，不阻塞展示。
+    cycle_reset_at: Option<i64>,
+}
+
+/// 解析企业配额响应（纯函数，便于单测）。
+///
+/// 兼容三种包装形态 `{data:{data:{…}}}` / `{data:{…}}` / 字段直接位于响应顶层；
+/// 字段双命名兼容（官方两处实现分别用 camelCase 与 snake_case，网关真实形态未确证）。
+/// 总量缺失或非有限数字视为解析失败（`None`），由上层给出可读错误。
+fn parse_enterprise_usage(response: &Value) -> Option<EnterpriseUsage> {
+    let data = response.get("data").unwrap_or(&Value::Null);
+    let nested = data.get("data").unwrap_or(&Value::Null);
+    for payload in [nested, data, response] {
+        if !payload.is_object() {
+            continue;
+        }
+        let Some(limit_num) = first_number(payload, &["limitNum", "limit_num"]) else {
+            continue;
+        };
+        if !limit_num.is_finite() {
+            continue;
+        }
+        let used = first_number(payload, &["credit", "used_num"])
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0);
+        let cycle_reset_at =
+            parse_timestamp_ms(first_value(payload, &["cycleResetTime", "CycleResetTime"]));
+        return Some(EnterpriseUsage {
+            limit_num,
+            used,
+            cycle_reset_at,
+        });
+    }
+    None
+}
+
+/// 积分查询失败结果（`ok:false` + 可读错误），与企业判定失败同一形态。
+fn credit_error_result(account: &Value, error: String) -> Value {
+    json!({
+        "ok": false,
+        "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+        "accountName": account_display_name(account),
+        "error": error,
+    })
+}
+
+/// 企业配额响应 → `CreditExpiry`（与个人版同形，多一个 `unlimited` 标记）。
+fn enterprise_credit_result(account: &Value, response: &Value, now: i64) -> Value {
+    if !is_success(response) {
+        return credit_error_result(account, response_error(response));
+    }
+    let Some(usage) = parse_enterprise_usage(response) else {
+        return credit_error_result(account, "企业配额数据无法解析".to_string());
+    };
+    if usage.limit_num == -1.0 {
+        // 不限量：数字字段置 null、资源列表为空；前端按 `unlimited` 分支展示，
+        // 不写积分快照（0/0 快照会把统计页误显示成余额为 0）。
+        return json!({
+            "ok": true,
+            "accountId": account.get("id").cloned().unwrap_or(Value::Null),
+            "accountName": account_display_name(account),
+            "updatedAt": now,
+            "unlimited": true,
+            "totalCapacity": Value::Null,
+            "totalRemaining": Value::Null,
+            "expiringSoonRemaining": 0,
+            "expiredRemaining": 0,
+            "soonestExpireAt": Value::Null,
+            "expiringSoon": false,
+            "expired": false,
+            "resources": [],
+        });
+    }
+    // 企业配额以单条资源（名称「企业配额」）呈现，expireAt 即周期重置时间。
+    let remaining = (usage.limit_num - usage.used).max(0.0);
+    let resource = json!({
+        "packageCode": Value::Null,
+        "packageName": "企业配额",
+        "total": usage.limit_num,
+        "remaining": remaining,
+        "used": usage.used,
+        "status": Value::Null,
+        "expireAt": usage.cycle_reset_at,
+        "expired": false,
+        "expiringSoon": false,
+    });
+    let mut result = credit_result(account, vec![resource], now);
+    if let Some(object) = result.as_object_mut() {
+        object.insert("unlimited".to_string(), Value::Bool(false));
+    }
+    result
+}
+
+/// 企业配额取数：注入企业 ID 后复用 `authenticated_post`（惰性刷新 + 401 重试一次
+/// + 信封短路全部继承），域名沿用 `api_base_for` 的档位分派。
+async fn fetch_enterprise_credit(account: &Value, enterprise_id: &str, now: i64) -> Value {
+    let mut working_account = account.clone();
+    if let Some(object) = working_account.as_object_mut() {
+        // 补拉场景账号数据里没有 enterpriseId：先注入再发请求，
+        // 让既有请求头链路带上 X-Enterprise-Id / X-Tenant-Id。
+        object.insert(
+            "enterpriseId".to_string(),
+            Value::String(enterprise_id.to_string()),
+        );
+    }
+    let url = format!("{}{ENTERPRISE_USAGE_PATH}", api_base_for(&working_account));
+    let response = authenticated_post(&working_account, &url, json!({})).await;
+    enterprise_credit_result(account, &response, now)
+}
+
+/// 从 `/console/accounts` 响应提取第一个账号的企业 ID（纯函数，便于单测）。
+fn enterprise_id_from_accounts(response: &Value) -> Option<String> {
+    if !is_success(response) {
+        return None;
+    }
+    let accounts = value_at_path(response, &["data", "accounts"])
+        .or_else(|| value_at_path(response, &["data", "Accounts"]))
+        .and_then(Value::as_array)?;
+    enterprise_id_of(accounts.first()?)
+}
+
+/// `type` 兜底判定为企业版但账号数据缺 `enterpriseId`（如历史备份）时，
+/// 从 `/console/accounts` 补拉一次（对齐 WorkDaddy `resolveEnterpriseId`）。
+/// 单次尝试、不触发 token 刷新；失败返回 `None`，由调用方给出可读错误。
+async fn resolve_enterprise_id(account: &Value) -> Option<String> {
+    let url = format!("{}{ENTERPRISE_ACCOUNTS_PATH}", api_base_for(account));
+    let headers = build_auth_headers(account);
+    let response = http_request(&url, "GET", None, Some(&headers)).await;
+    enterprise_id_from_accounts(&response)
 }
 
 #[cfg(test)]
@@ -1514,6 +1681,225 @@ mod tests {
         // 发三路等于 3×2 个 404，故只对国内版启用。
         assert!(uses_three_endpoint_query(WbVariant::Cn));
         assert!(!uses_three_endpoint_query(WbVariant::Ai));
+    }
+
+    // -----------------------------------------------------------------------
+    // 企业版分流（issue #167）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parses_enterprise_usage_wrappers_and_field_cases() {
+        // {data:{…}} 形态 + camelCase + 本地时间字符串
+        let expected = Local
+            .with_ymd_and_hms(2026, 11, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let usage = parse_enterprise_usage(&json!({
+            "code": 0,
+            "data": {"credit": 500, "limitNum": 2000, "cycleResetTime": "2026-11-01 00:00:00"}
+        }))
+        .expect("正常企业响应应解析成功");
+        assert_eq!(usage.limit_num, 2000.0);
+        assert_eq!(usage.used, 500.0);
+        assert_eq!(usage.cycle_reset_at, Some(expected));
+
+        // {data:{data:{…}}} 形态 + snake_case；重置时间缺失置 None
+        let usage = parse_enterprise_usage(&json!({
+            "data": {"data": {"used_num": "12.5", "limit_num": "100"}}
+        }))
+        .expect("嵌套包装与 snake_case 应兼容");
+        assert_eq!(usage.limit_num, 100.0);
+        assert_eq!(usage.used, 12.5);
+        assert_eq!(usage.cycle_reset_at, None, "缺重置时间不阻塞展示");
+
+        // 字段直接位于响应顶层
+        let usage =
+            parse_enterprise_usage(&json!({"limitNum": 50, "credit": 10})).expect("顶层字段应兼容");
+        assert_eq!(usage.limit_num, 50.0);
+        assert_eq!(usage.used, 10.0);
+
+        // CycleResetTime（PascalCase）与非法字符串：解析失败置 None，不阻塞展示
+        let usage = parse_enterprise_usage(&json!({
+            "data": {
+                "credit": 1,
+                "limitNum": 10,
+                "CycleResetTime": "2026-11-01 00:00:00"
+            }
+        }))
+        .expect("PascalCase 重置时间字段应兼容");
+        assert_eq!(usage.cycle_reset_at, Some(expected));
+
+        let usage = parse_enterprise_usage(&json!({
+            "data": {"credit": 1, "limitNum": 10, "cycleResetTime": "not-a-date"}
+        }))
+        .expect("重置时间解析失败不阻塞展示");
+        assert_eq!(usage.cycle_reset_at, None);
+        assert_eq!(usage.limit_num, 10.0);
+    }
+
+    #[test]
+    fn parses_enterprise_usage_unlimited_marker() {
+        let usage = parse_enterprise_usage(&json!({
+            "code": 0,
+            "data": {"credit": 0, "limitNum": -1}
+        }))
+        .expect("limitNum=-1 应解析为不限量");
+        assert_eq!(usage.limit_num, -1.0);
+    }
+
+    #[test]
+    fn parse_enterprise_usage_rejects_malformed_payloads() {
+        assert!(parse_enterprise_usage(&Value::Null).is_none());
+        assert!(parse_enterprise_usage(&json!({"code": 0, "data": {}})).is_none());
+        assert!(parse_enterprise_usage(&json!({"data": {"limitNum": "abc"}})).is_none());
+        assert!(
+            parse_enterprise_usage(&json!({"data": {"limitNum": "inf"}})).is_none(),
+            "非有限数字应判解析失败"
+        );
+        assert!(parse_enterprise_usage(&json!({"data": {"limitNum": null}})).is_none());
+        // 字符串数字仍可解析
+        assert_eq!(
+            parse_enterprise_usage(&json!({"data": {"limitNum": "2000"}})).map(|u| u.limit_num),
+            Some(2000.0)
+        );
+    }
+
+    #[test]
+    fn enterprise_limited_result_maps_to_single_quota_resource() {
+        let now = 1_800_000_000_000_i64;
+        let cycle_reset_at = now + 30 * 24 * 3600 * 1000;
+        // 不带 id：跳过积分快照落盘（单测不写用户数据目录）。
+        let account = json!({"uid": "u-1", "enterpriseId": "e-1"});
+        let result = enterprise_credit_result(
+            &account,
+            &json!({
+                "code": 0,
+                "data": {"credit": 500, "limitNum": 2000, "cycleResetTime": cycle_reset_at}
+            }),
+            now,
+        );
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["unlimited"], false);
+        assert_eq!(result["totalCapacity"], 2000.0);
+        assert_eq!(result["totalRemaining"], 1500.0);
+        assert_eq!(result["soonestExpireAt"].as_i64(), Some(cycle_reset_at));
+        assert_eq!(result["expiringSoon"], false);
+        assert_eq!(result["expired"], false);
+        let resources = result["resources"].as_array().expect("resources 应为数组");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["packageName"], "企业配额");
+        assert_eq!(resources[0]["total"], 2000.0);
+        assert_eq!(resources[0]["remaining"], 1500.0);
+        assert_eq!(resources[0]["used"], 500.0);
+        assert_eq!(resources[0]["expireAt"].as_i64(), Some(cycle_reset_at));
+    }
+
+    #[test]
+    fn enterprise_unlimited_result_uses_null_balance_and_empty_resources() {
+        let account = json!({"uid": "u-1", "enterpriseId": "e-1"});
+        let result = enterprise_credit_result(
+            &account,
+            &json!({"code": 0, "data": {"credit": 0, "limitNum": -1}}),
+            1_800_000_000_000,
+        );
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["unlimited"], true);
+        assert!(result["totalCapacity"].is_null(), "不限量不把 null 当 0");
+        assert!(result["totalRemaining"].is_null());
+        assert_eq!(result["soonestExpireAt"], Value::Null);
+        assert_eq!(result["resources"], json!([]));
+    }
+
+    #[test]
+    fn enterprise_exhausted_quota_clamps_remaining_to_zero() {
+        let result = enterprise_credit_result(
+            &json!({"uid": "u-1"}),
+            &json!({"code": 0, "data": {"credit": 2500, "limitNum": 2000}}),
+            1_800_000_000_000,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["unlimited"], false);
+        assert_eq!(result["totalRemaining"], 0.0);
+        assert_eq!(result["resources"][0]["remaining"], 0.0);
+        assert_eq!(result["resources"][0]["packageName"], "企业配额");
+    }
+
+    #[test]
+    fn enterprise_zero_limit_is_limited_quota_not_unlimited() {
+        // limitNum=0 是有限配额用尽，不是解析失败，也不是不限量。
+        let usage = parse_enterprise_usage(&json!({"data": {"credit": 0, "limitNum": 0}}))
+            .expect("limitNum=0 应解析为有限配额");
+        assert_eq!(usage.limit_num, 0.0);
+
+        let result = enterprise_credit_result(
+            &json!({"uid": "u-1"}),
+            &json!({"code": 0, "data": {"credit": 0, "limitNum": 0}}),
+            1_800_000_000_000,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["unlimited"], false);
+        assert_eq!(result["totalCapacity"], 0.0);
+        assert_eq!(result["totalRemaining"], 0.0);
+        assert_eq!(
+            result["resources"].as_array().map(|rows| rows.len()),
+            Some(1)
+        );
+        assert_eq!(result["resources"][0]["packageName"], "企业配额");
+        assert_eq!(result["resources"][0]["remaining"], 0.0);
+    }
+
+    #[test]
+    fn enterprise_error_and_malformed_responses_return_readable_errors() {
+        let account = json!({"id": "acc-1", "enterpriseId": "e-1"});
+        let upstream = enterprise_credit_result(
+            &account,
+            &json!({"code": 500, "message": "企业配额服务异常"}),
+            1_800_000_000_000,
+        );
+        assert_eq!(upstream["ok"], false);
+        assert_eq!(upstream["accountId"], "acc-1");
+        assert_eq!(upstream["error"], "企业配额服务异常");
+
+        // 成功但 payload 不可解析：给出可读错误，而不是空态或 0。
+        let malformed =
+            enterprise_credit_result(&account, &json!({"code": 0, "data": {}}), 1_800_000_000_000);
+        assert_eq!(malformed["ok"], false);
+        let message = malformed["error"].as_str().expect("error 应为字符串");
+        assert!(message.contains("企业配额"), "错误文案应可读：{message}");
+    }
+
+    #[test]
+    fn resolves_enterprise_id_from_console_accounts_payload() {
+        let hit = json!({
+            "code": 0,
+            "data": {"accounts": [{"uid": "u-1", "enterpriseId": "e-9"}, {"enterpriseId": "e-2"}]}
+        });
+        assert_eq!(enterprise_id_from_accounts(&hit), Some("e-9".to_string()));
+
+        // 大写容器名与 snake_case 字段兜底
+        assert_eq!(
+            enterprise_id_from_accounts(
+                &json!({"code": 0, "data": {"Accounts": [{"enterprise_id": "e-3"}]}})
+            ),
+            Some("e-3".to_string())
+        );
+        // 空列表 / 无企业 ID / 失败响应都返回 None（补拉失败走可读错误）
+        assert_eq!(
+            enterprise_id_from_accounts(&json!({"code": 0, "data": {"accounts": []}})),
+            None
+        );
+        assert_eq!(
+            enterprise_id_from_accounts(
+                &json!({"code": 0, "data": {"accounts": [{"uid": "u-1"}]}})
+            ),
+            None
+        );
+        assert_eq!(
+            enterprise_id_from_accounts(&json!({"code": 401, "message": "unauthorized"})),
+            None
+        );
     }
 }
 

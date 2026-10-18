@@ -32,6 +32,11 @@ export interface AccountMeta {
   needsReloginReason: string | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
   variant?: WbVariant;
+  /**
+   * 企业版账号（有 enterpriseId，或 type 为 ultimate/exclusive）；
+   * 缺省（旧后端/历史账号）按非企业处理。
+   */
+  isEnterprise?: boolean;
 }
 
 export interface AppStatus {
@@ -181,7 +186,7 @@ export interface SessionRecoveryReport {
 export type SessionSyncVerdict = "identical" | "fastForward" | "ahead" | "diverge" | "unknown";
 
 /** 同步写入模式：只有后端 `availableModes` 里给出的模式才允许提交。 */
-export type SessionSyncMode = "fastForward" | "overwrite" | "unifyOverwrite";
+export type SessionSyncMode = "fastForward" | "overwrite" | "unifyOverwrite" | "statusOnly";
 
 /** 关联组成员（不含正文）：`state` 为 active 时才算该账号的有效成员。 */
 export interface SessionLinkMember {
@@ -204,9 +209,17 @@ export interface SessionLinkPreviewGroup {
   extraB: number;
   common: number;
   defaultChecked: boolean;
-  /** 为空表示该项不可勾选（identical / ahead / unknown / 预览凭据不可用）。 */
+  /**
+   * 正文写入模式；为空且没有 `archiveAction` 时才不可勾选
+   * （identical / ahead / unknown / 预览凭据不可用，但仅同步归档仍可勾选）。
+   */
   availableModes: SessionSyncMode[];
   reason: string;
+  /**
+   * 仅同步生命周期状态（把目标对齐为已归档），正文零写入。
+   * 由后端在生成预览时给出，不随用户勾选变化。
+   */
+  archiveAction?: "statusOnly";
   /** 记录数（不是消息数）：不可验证时 source/target 为 0、baseline 为 null。 */
   recordCount: { source: number; target: number; baseline: number | null };
   source: SessionLinkMember | null;
@@ -574,14 +587,18 @@ export interface CreditExpiry {
   accountId?: string | null;
   accountName?: string;
   updatedAt?: number;
-  totalCapacity?: number;
-  totalRemaining?: number;
+  /** 企业版不限量（limitNum=-1）时为 null，展示按 `unlimited` 分支。 */
+  totalCapacity?: number | null;
+  /** 企业版不限量（limitNum=-1）时为 null，展示按 `unlimited` 分支。 */
+  totalRemaining?: number | null;
   expiringSoonRemaining?: number;
   expiredRemaining?: number;
   soonestExpireAt?: number | null;
   expiringSoon?: boolean;
   expired?: boolean;
   resources?: CreditResource[];
+  /** 企业配额不限量：数字字段为 null、资源列表为空，不当作 0 展示。 */
+  unlimited?: boolean;
   error?: string;
 }
 
