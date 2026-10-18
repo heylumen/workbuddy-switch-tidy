@@ -56,6 +56,11 @@ function formatDuration(ms: number): string {
  * 这里按 id → uid → 前缀 依次匹配，命中后统一走 `displayName()`（对齐上游实现），
  * 保证台账、账号卡片、切换弹窗显示一致。
  */
+/** 账号标识归一化：忽略大小写与分隔符，便于跨来源（日志 / 账号库）比对。 */
+function normalizeAccountKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 function accountName(
   accountId: string | null | undefined,
   accounts: AccountMeta[],
@@ -69,7 +74,28 @@ function accountName(
       (account) =>
         account.id.startsWith(key) || (account.uid ?? "").startsWith(key),
     );
-  return match ? displayName(match) : key.slice(0, 8);
+  if (match) return displayName(match);
+
+  // 放宽：忽略大小写/分隔符后比 uid、id 与 email 前缀（台账标识与账号库可能格式不同）。
+  const normalized = normalizeAccountKey(key);
+  if (normalized) {
+    const fuzzy = accounts.find((account) => {
+      const candidates = [account.uid ?? "", account.id ?? "", account.email ?? ""]
+        .filter(Boolean)
+        .map(normalizeAccountKey);
+      return candidates.some(
+        (candidate) =>
+          candidate === normalized ||
+          candidate.startsWith(normalized) ||
+          normalized.startsWith(candidate),
+      );
+    });
+    if (fuzzy) return displayName(fuzzy);
+  }
+
+  // 都匹配不到（账号已删除/改名，或该标识来自别的数据集）：给可读文案，
+  // 完整标识由单元格 title 承载，避免表格里出现无意义的 8 位十六进制。
+  return "未命名账号";
 }
 
 function LimitRow({
@@ -88,7 +114,7 @@ function LimitRow({
       <td className="px-3 py-2.5 text-xs tabular-nums text-muted-foreground">
         {formatDateTime(event.occurredAt)}
       </td>
-      <td className="px-3 py-2.5 text-xs font-medium truncate" title={accountName(event.accountUid, accounts)}>
+      <td className="px-3 py-2.5 text-xs font-medium truncate" title={event.accountUid ? `${accountName(event.accountUid, accounts)}（${event.accountUid}）` : undefined}>
         {accountName(event.accountUid, accounts)}
       </td>
       <td className="px-3 py-2.5 text-xs truncate" title={event.model ?? "未知模型"}>

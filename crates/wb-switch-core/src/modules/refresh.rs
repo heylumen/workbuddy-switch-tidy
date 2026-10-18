@@ -6,11 +6,102 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use crate::modules::account::{build_auth_headers, upsert_account};
 use crate::modules::config::{http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard};
+use crate::modules::error_log;
 
 static KEEPALIVE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 「残留标记复核」的冷却时间：同一账号最多每 60 秒复查一次（对应上游 #190/#191）。
+const RELOGIN_RECHECK_COOLDOWN_MS: i64 = 60_000;
+
+/// 是否该对「带 needs_relogin 标记、但 access token 仍有效」的账号做一次续期复核。
+///
+/// 场景（上游 #190）：账号曾刷新失败被标记，之后认证恢复、资源请求已正常，但旧标记
+/// 一直残留，界面持续显示「需重新登录」。这里只在**凭据仍可用**且**冷却已过**时复查，
+/// 复核成功才会清标记（由 refresh_account_token 成功后统一清理）。
+fn should_recheck_relogin(account: &Value, now: i64) -> bool {
+    if account.get("needs_relogin").and_then(|v| v.as_bool()) != Some(true) {
+        return false;
+    }
+    let has_rt = !account.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").is_empty();
+    if !has_rt {
+        return false;
+    }
+    let at_valid = account
+        .get("expiresAt")
+        .and_then(|v| v.as_i64())
+        .map(|e| e > now)
+        .unwrap_or(false);
+    if !at_valid {
+        return false;
+    }
+    let last = account.get("relogin_recheck_at").and_then(|v| v.as_i64()).unwrap_or(0);
+    now.saturating_sub(last) >= RELOGIN_RECHECK_COOLDOWN_MS
+}
+
+/// 刷新失败的类别：决定「标记需要重新登录」还是「只记录临时失败」。
+///
+/// 背景（上游 issue #189）：官方服务端曾出现大范围 token 失效，同时也有大量用户
+/// 只是网络/代理抖动。若把后者也标成「需要重新登录」，用户会白跑一次扫码。
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshFailure {
+    /// 鉴权被拒：refresh token 被吊销或已失效 → 需要重新登录
+    Auth,
+    /// 传输层或服务端临时故障（网络/代理/5xx/风控）→ 保留凭据，稍后重试
+    Transient,
+}
+
+/// 判定刷新失败类别。口径与 `checkin::is_unauthorized` 对齐，但**不把一切非 0/200
+/// 都当成鉴权失败**：只认明确的吊销信号，其余按临时故障处理。
+fn classify_refresh_failure(resp: &Value) -> RefreshFailure {
+    let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    // code = -1 是 http_request 包装的传输层失败（连接/代理/超时）
+    if code < 0 || (500..=599).contains(&code) {
+        return RefreshFailure::Transient;
+    }
+    // 12153 = Session doesn't have required client（官方刷新会话被清理）
+    if code == 401 || code == 403 || code == 12153 {
+        return RefreshFailure::Auth;
+    }
+    let msg = resp
+        .get("message")
+        .or_else(|| resp.get("msg"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    const AUTH_HINTS: [&str; 8] = [
+        "invalid_grant",
+        "invalid_token",
+        "unauthorized",
+        "token has expired",
+        "refresh token",
+        "会话已失效",
+        "登录已过期",
+        "请重新登录",
+    ];
+    if AUTH_HINTS.iter().any(|hint| msg.contains(hint)) {
+        RefreshFailure::Auth
+    } else {
+        RefreshFailure::Transient
+    }
+}
+
+/// 保活是否应因「距上次太近」而跳过（按持久化的 last_keepalive_at 判断）。
+///
+/// 只存在内存里的日切标记会在应用频繁重启时被反复重置，导致每启动一次就全量刷新
+/// 所有账号——这种「同一台机器短时间内多轮刷新」对风控最不友好，因此改为持久化节流。
+fn should_skip_keepalive(last_at_ms: Option<i64>, now: i64, min_hours: i64) -> bool {
+    if min_hours <= 0 {
+        return false;
+    }
+    match last_at_ms {
+        Some(t) if t > 0 => now.saturating_sub(t) < min_hours * 3600 * 1000,
+        _ => false,
+    }
+}
 
 /// 刷新接口 URL：域名与路径前缀都按账号自身档位选（缺档位字段 → 国内版，零回归）。
 fn refresh_url(account: &Value) -> String {
@@ -61,14 +152,26 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
-        account["needs_relogin"] = json!(true);
-        account["needs_relogin_reason"] = json!(format!(
+        let reason = format!(
             "刷新失败(code={code}): {}",
             resp.get("message")
                 .or_else(|| resp.get("msg"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("未知错误")
-        ));
+        );
+        match classify_refresh_failure(&resp) {
+            RefreshFailure::Auth => {
+                account["needs_relogin"] = json!(true);
+                account["needs_relogin_reason"] = json!(reason);
+                error_log::record("refresh", "刷新鉴权失败（标记需重新登录）", &reason);
+            }
+            RefreshFailure::Transient => {
+                // 临时故障不动 needs_relogin：用户不必为此重新扫码，下次保活/惰性刷新会重试。
+                account["last_refresh_error"] = json!(reason);
+                account["last_refresh_error_at"] = json!(now_ms());
+                error_log::record("refresh", "刷新临时失败（未标记需重新登录）", &reason);
+            }
+        }
         let _ = upsert_account(&account);
         return account;
     }
@@ -132,6 +235,9 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
     let map = account.as_object_mut().unwrap();
     map.remove("needs_relogin");
     map.remove("needs_relogin_reason");
+    map.remove("last_refresh_error");
+    map.remove("last_refresh_error_at");
+    map.remove("relogin_recheck_at");
     let _ = upsert_account(&account);
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否
@@ -163,6 +269,13 @@ pub async fn ensure_fresh_token(mut account: Value, cfg: &Value) -> Value {
         .is_empty();
     if stale && has_rt {
         account = refresh_account_token(account).await;
+    } else if should_recheck_relogin(&account, now_ms()) {
+        // 凭据仍可用但残留了「需重新登录」标记：做一次冷却受控的续期复核，成功即自愈。
+        if let Some(map) = account.as_object_mut() {
+            map.insert("relogin_recheck_at".to_string(), json!(now_ms()));
+        }
+        let _ = upsert_account(&account);
+        account = refresh_account_token(account).await;
     }
     account
 }
@@ -182,10 +295,23 @@ pub async fn run_keepalive_cycle() -> Value {
         .get("keepalive_days")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    let min_interval_h = cfg
+        .get("keepalive_min_interval_hours")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(12);
+    let last_at = cfg.get("last_keepalive_at").and_then(|v| v.as_i64());
+    if should_skip_keepalive(last_at, now_ms(), min_interval_h) {
+        return json!({"skipped": "too_soon", "min_interval_hours": min_interval_h});
+    }
     let accounts = crate::modules::account::load_accounts();
     let total = accounts.len();
     let mut results: Vec<Value> = Vec::new();
-    for mut acc in accounts {
+    let mut transient_failures = 0usize;
+    for (idx, mut acc) in accounts.into_iter().enumerate() {
+        // 账号之间插入确定性抖动（300–800ms），避免「同一秒内 N 个刷新」的风控特征。
+        if idx > 0 {
+            tokio::time::sleep(Duration::from_millis(300 + ((idx as u64 * 137) % 500))).await;
+        }
         let exp = acc.get("expiresAt").and_then(|v| v.as_i64());
         let stale = keep_days <= 0
             || match exp {
@@ -212,6 +338,9 @@ pub async fn run_keepalive_cycle() -> Value {
         }
         let fresh = refresh_account_token(acc).await;
         let failed = fresh.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true);
+        if !failed && fresh.get("last_refresh_error").is_some() {
+            transient_failures += 1;
+        }
         results.push(json!({
             "email": crate::modules::account::account_display_name(&fresh),
             "status": if failed { "failed" } else { "ok" },
@@ -222,7 +351,16 @@ pub async fn run_keepalive_cycle() -> Value {
             },
         }));
     }
-    json!({"checked": total, "refreshed": results})
+    let mut saved = load_checkin_config();
+    if let Some(map) = saved.as_object_mut() {
+        map.insert("last_keepalive_at".to_string(), json!(now_ms()));
+    }
+    let _ = crate::modules::config::save_checkin_config(&saved);
+    json!({
+        "checked": total,
+        "refreshed": results,
+        "transientFailures": transient_failures,
+    })
 }
 
 #[cfg(test)]
@@ -284,5 +422,56 @@ mod tests {
             // 刷新不带 platform 查询参数/头：官方刷新同样不带（research §2 已推翻旧假设）。
             assert!(!headers.contains_key("platform"));
         }
+    }
+
+    #[test]
+    fn classify_refresh_failure_treats_transient_as_retryable() {
+        // 传输层失败 / 5xx / 未知业务码 → 临时故障，不应要求重新登录
+        assert_eq!(classify_refresh_failure(&json!({"code": -1})), RefreshFailure::Transient);
+        assert_eq!(classify_refresh_failure(&json!({"code": 502})), RefreshFailure::Transient);
+        assert_eq!(classify_refresh_failure(&json!({"code": 10085})), RefreshFailure::Transient);
+    }
+
+    #[test]
+    fn classify_refresh_failure_detects_revoked_token() {
+        assert_eq!(classify_refresh_failure(&json!({"code": 401})), RefreshFailure::Auth);
+        assert_eq!(classify_refresh_failure(&json!({"code": 403})), RefreshFailure::Auth);
+        assert_eq!(classify_refresh_failure(&json!({"code": 12153})), RefreshFailure::Auth);
+        assert_eq!(
+            classify_refresh_failure(&json!({"code": 400, "message": "invalid_grant: Invalid refresh token"})),
+            RefreshFailure::Auth
+        );
+    }
+
+    #[test]
+    fn keepalive_skips_when_too_soon() {
+        let now = 1_700_000_000_000i64;
+        assert!(should_skip_keepalive(Some(now - 3600 * 1000), now, 12));
+        assert!(!should_skip_keepalive(Some(now - 13 * 3600 * 1000), now, 12));
+        assert!(!should_skip_keepalive(None, now, 12));
+        assert!(!should_skip_keepalive(Some(now), now, 0));
+    }
+
+    #[test]
+    fn recheck_only_when_marked_and_token_still_valid() {
+        let now = 1_700_000_000_000i64;
+        let mut acc = json!({"needs_relogin": true, "refresh_token": "rt", "expiresAt": now + 3600_000});
+        assert!(should_recheck_relogin(&acc, now));
+        // 冷却未过 → 不重复复核
+        acc["relogin_recheck_at"] = json!(now - 30_000);
+        assert!(!should_recheck_relogin(&acc, now));
+        // 冷却已过 → 允许
+        acc["relogin_recheck_at"] = json!(now - 90_000);
+        assert!(should_recheck_relogin(&acc, now));
+        // access token 已过期 → 交给普通刷新路径
+        acc["expiresAt"] = json!(now - 1000);
+        assert!(!should_recheck_relogin(&acc, now));
+        // 未标记 / 无 RT → 不复核
+        acc["expiresAt"] = json!(now + 3600_000);
+        acc["needs_relogin"] = json!(false);
+        assert!(!should_recheck_relogin(&acc, now));
+        acc["needs_relogin"] = json!(true);
+        acc["refresh_token"] = json!("");
+        assert!(!should_recheck_relogin(&acc, now));
     }
 }

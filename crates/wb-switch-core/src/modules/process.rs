@@ -373,12 +373,26 @@ fn persist_workbuddy_exe(path: &Path, variant: WbVariant) {
     let _ = config::save_workbuddy_exe_cache(variant, path);
 }
 
-/// Windows：执行 PowerShell 并取 stdout。
+/// 让 Windows PowerShell 按 UTF-8 写 stdout。
+///
+/// 不这么做时它按**控制台代码页**（简体中文环境是 GBK）输出，而我们按 UTF-8 解码，路径里的
+/// 非 ASCII 字符（例如用户目录 `C:\Users\丁昊`）会变成替换字符 `\u{fffd}`，之后拿它去
+/// spawn 只会得到「系统找不到指定的路径」(os error 3)。
+#[cfg(target_os = "windows")]
+pub(crate) fn utf8_script(script: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
+         $OutputEncoding = [System.Text.Encoding]::UTF8; {script}"
+    )
+}
+
+/// Windows：执行 PowerShell 并取 stdout（强制 UTF-8，见 [`utf8_script`]）。
 #[cfg(target_os = "windows")]
 pub(crate) fn ps_output(script: &str, timeout_secs: u64) -> Option<String> {
+    let script = utf8_script(script);
     let out = run_cmd_timeout(
         "powershell",
-        &["-NoProfile", "-NonInteractive", "-Command", script],
+        &["-NoProfile", "-NonInteractive", "-Command", script.as_str()],
         timeout_secs,
     )?;
     Some(String::from_utf8_lossy(&out.stdout).to_string())
@@ -1707,6 +1721,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     /// （带 `,0` 图标索引形态）。
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "依赖本机 reg.exe 读取注册表；沙箱/受限环境会失败，需时用 --ignored 手动运行"]
     fn windows_registry_probe_resolves_custom_dir_uninstall_entry() {
         let _guard = REGISTRY_PROBE_LOCK
             .lock()
@@ -1732,6 +1747,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     /// App Paths 分支：默认值指向自定义目录 exe。
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "依赖本机 reg.exe 读取注册表；沙箱/受限环境会失败，需时用 --ignored 手动运行"]
     fn windows_registry_probe_resolves_custom_dir_app_paths_entry() {
         let _guard = REGISTRY_PROBE_LOCK
             .lock()
@@ -1753,6 +1769,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     /// 档位隔离：CN/AI 合成项并存时互不串档。
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "依赖本机 reg.exe 读取注册表；沙箱/受限环境会失败，需时用 --ignored 手动运行"]
     fn windows_registry_probe_isolates_variants() {
         let _guard = REGISTRY_PROBE_LOCK
             .lock()
@@ -1802,6 +1819,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
     /// 自排除：指向 workbuddy-switch.exe 的条目不得被命中。
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "依赖本机 reg.exe 读取注册表；沙箱/受限环境会失败，需时用 --ignored 手动运行"]
     fn windows_registry_probe_excludes_self_entries() {
         let _guard = REGISTRY_PROBE_LOCK
             .lock()

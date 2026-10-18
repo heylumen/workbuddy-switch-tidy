@@ -47,7 +47,7 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // 路径
 // ---------------------------------------------------------------------------
 
-/// 测试专用的 **线程局部** 数据根覆盖。
+// 测试专用的 **线程局部** 数据根覆盖（普通注释：下面紧跟的是属性宏而非条目）。
 ///
 /// 为什么不用环境变量：Rust 的测试在同一进程内多线程并行，
 /// 是进程级的，会污染其他模块的测试夹具（实测导致上游 token_stats 三条用例失败）。
@@ -328,6 +328,10 @@ fn checkin_config_with_enabled(enabled: bool) -> Value {
         "end_hour": 12,
         "keepalive_days": 0,
         "lazy_refresh_hours": 24,
+        // 保活最小间隔（小时）：默认 12，避免频繁重启触发多轮全量刷新。
+        "keepalive_min_interval_hours": 12,
+        // 上次保活完成时间（毫秒）；0 表示从未跑过，允许立即执行一次。
+        "last_keepalive_at": 0,
     })
 }
 
@@ -373,6 +377,10 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
         "end_hour",
         "keepalive_days",
         "lazy_refresh_hours",
+        "keepalive_min_interval_hours",
+        // 保活节流时间戳：属于运行期状态，但必须与配置一同持久化，否则每次重启
+        // 都会判定「距上次过久」而全量刷新所有账号（实测踩过：字段被白名单丢弃）。
+        "last_keepalive_at",
     ] {
         if let Some(value) = map.get(key).and_then(Value::as_i64) {
             merged[key] = json!(value);
@@ -2183,5 +2191,55 @@ mod tests {
         assert!(!path.exists());
         assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn checkin_config_round_trips_last_keepalive_at() {
+        // 回归：save_checkin_config 走白名单合并，曾把运行期时间戳丢掉，
+        // 导致保活节流失效、每次重启全量刷新。
+        let merged = merge_checkin_config(&json!({"last_keepalive_at": 1_700_000_000_000i64}));
+        assert_eq!(merged["last_keepalive_at"], json!(1_700_000_000_000i64));
+        // 同时确认既有键仍然正常保留
+        let merged2 = merge_checkin_config(&json!({"keepalive_min_interval_hours": 6}));
+        assert_eq!(merged2["keepalive_min_interval_hours"], json!(6));
+    }
+
+    /// 守卫：`save_checkin_config` 走白名单合并，**任何**已知键都不得被静默丢弃。
+    ///
+    /// 背景：`last_keepalive_at` 曾因不在白名单里而被丢弃，导致保活节流失效
+    /// （编译与单测都不会报错，只有看落盘文件才能发现）。新增字段时若忘记同步白名单，
+    /// 这条测试会立刻失败。
+    #[test]
+    fn checkin_config_whitelist_covers_all_known_keys() {
+        let sentinel = json!({
+            "enabled": true,
+            "excluded_account_ids": ["acc-1"],
+            "checkin_start": "09:00",
+            "checkin_end": "10:30",
+            "start_hour": 7,
+            "end_hour": 8,
+            "keepalive_days": 3,
+            "lazy_refresh_hours": 5,
+            "keepalive_min_interval_hours": 6,
+            "last_keepalive_at": 1_700_000_000_000i64
+        });
+        let merged = merge_checkin_config(&sentinel);
+        for key in [
+            "enabled",
+            "excluded_account_ids",
+            "checkin_start",
+            "checkin_end",
+            "start_hour",
+            "end_hour",
+            "keepalive_days",
+            "lazy_refresh_hours",
+            "keepalive_min_interval_hours",
+            "last_keepalive_at",
+        ] {
+            assert!(
+                merged.get(key).is_some(),
+                "字段 {key} 未进入白名单，保存时会被静默丢弃"
+            );
+        }
     }
 }

@@ -2095,7 +2095,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "扫描真实用户数据，耗时不可控；用 --ignored 手动运行"]
     fn get_statistics_returns_four_isolated_sources() {
+        // 注意：get_statistics 会扫描真实数据根（~/.workbuddy、~/.workbuddy-ai、
+        // ~/.codebuddy 与扩展目录）。在数据量大的机器上耗时可达成分钟级，且结果随本机
+        // 数据漂移——因此这条用例默认跳过，仅在需要端到端核对时手动运行：
+        //   cargo test -p wb-switch-core --lib -- --ignored get_statistics_returns_four_isolated_sources
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources

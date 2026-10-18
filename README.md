@@ -57,7 +57,6 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 | 插件会话复制 | 切换插件账号时，可把当前插件账号的会话复制给目标账号（加法，源账号不变） |
 | 自动轮换 | 后台把积分最紧迫的账号设为 CodeBuddy CLI 后续启动账号；检测到 CLI 会话运行时会跳过 |
 | 自动更新 | 从 GitHub Releases 检查新版本，整包更新经签名校验 |
-| 会话悬浮窗 | 桌面版内置 Agent Companion 悬浮栏，在桌面集中显示 Codex / WorkBuddy / CodeBuddy / Codeg 会话的运行中 / 待确认 / 已完成状态；悬停查看详情，支持跳转时点击回到原会话，托盘可临时隐藏 |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
 
 ## 支持的工具
@@ -73,27 +72,6 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 ✅ 表示支持，— 表示不支持。设置 →「支持工具」可按客户端逐个开启 / 关闭入口；关闭后该端入口与状态轮询一并隐藏，不影响账号库与其它端；JetBrains 端默认关闭，可在设置中随时打开。
 
 CodeBuddy CLI 切换时会先关闭正在运行的 CLI，当前会话会中断且不会自动重开；其余各端可在客户端运行时自动完成切换。
-
-### 会话悬浮窗（Agent Companion）
-
-桌面版内置 [Agent Companion](https://github.com/changexbc/agent-companion) 悬浮栏：把各 AI Agent 的任务状态集中到桌面，一眼看出谁还在运行、谁需要你确认，支持跳转时点击即可回到原会话；悬浮栏可拖动调整位置，托盘可随时显示 / 隐藏。
-
-| 监听来源 | 跳转到指定会话 | 点击后的行为 |
-| --- | :---: | --- |
-| Codex（Desktop / CLI） | ✅ | 打开 Codex Desktop 中的指定任务 |
-| WorkBuddy（国内版 / 国际版） | ✅ | 打开对应版本中的指定对话 |
-| CodeBuddy IDE（国内版 / 国际版） | — | 有工程路径时打开工程，否则只唤起 CodeBuddy |
-| CodeBuddy VS Code 插件 | — | 尝试打开会话所属的 VS Code 工程，无法确定时只唤起 VS Code |
-| Codeg | ✅ | 打开 Codeg 中的指定聊天会话 |
-
-各来源都会显示运行中 / 待确认 / 已完成状态；CodeBuddy CLI 与 JetBrains 插件不在监听范围内。开启方式：左下角悬浮窗图标，或设置 → Agent Companion；首次使用在「悬浮窗设置」中完成接入（依赖对应客户端的 Hooks / Webhook），监听来源与外观样式也在那里调整。
-
-网页演示里的悬浮栏：一个已完成的 Codex 会话与一个失败的 WorkBuddy 会话，各自弹出信息卡（截自[在线演示](https://changexbc.github.io/agent-companion/)，数据为虚构）。
-
-![Agent Companion 悬浮栏演示：已完成与失败两种状态各自弹出信息卡](docs/images/agent-companion-demo-rail.png)
-
-更多说明与独立版见 [Agent Companion 仓库](https://github.com/changexbc/agent-companion) · [在线演示](https://changexbc.github.io/agent-companion/)
-
 ## 使用
 
 1. **添加与导出账号**：账号页 →「OAuth 扫码登录」「导入备份」；「导出」可将勾选账号备份为 JSON
@@ -157,15 +135,13 @@ workbuddy-switch status       # 终端查看当前账号
 
 ## 更新日志
 
-### v1.0.10（最新）
+### v1.0.11（最新）
 
-同步上游 0.1.47 → 0.1.58。新增 JetBrains IDE（IDEA/PyCharm）CodeBuddy 插件账号切换、CodeBuddy IDE 切号会话复制、账号信息弹框与卡片显示字段、积分明细排序分页、签到时间段遵守与账号级开关；修复切号导致的 Token 用量重复统计、账号异常重复、切号退出标记与进程判断、IDE 只读探测副作用、CLI 保活误报、备份导入凭据处理。本版不含「会话悬浮窗」；保留本 fork 定制：会话整理、限额台账独立页、hook 默认关闭。
+同步上游 0.1.58 → 0.1.62（企业版积分、会话归档同步等）；限额台账纳入插件宿主日志、账号页限额标记更稳；VS Code 关闭/重开更可靠并修复中文路径乱码；刷新失败区分"需重新登录"与"临时故障"并自愈残留提示；保活加最小间隔与抖动；彻底移除会话悬浮窗。
 
-### v1.0.9
+### v1.0.10
 
-限额台账「账号」列改为显示账号名（手机号/昵称），不再显示 ID 片段；修复刷新全部账号积分时部分账号不显示结果的问题，失败提示更明确。
-
----
+同步上游 0.1.40 → 0.1.47 并保留本 fork 全部定制；复制会话前内容级去重；检查更新多源并发竞速与超时总预算。
 
 ## 致谢
 

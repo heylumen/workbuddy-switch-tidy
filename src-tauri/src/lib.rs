@@ -1,6 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
-mod companion;
 #[cfg(target_os = "macos")]
 mod instance_lock;
 #[cfg(desktop)]
@@ -302,9 +301,6 @@ pub fn run() {
             commands::log_error,
             commands::get_error_log_path,
             commands::reveal_error_log,
-            companion::get_companion_enabled,
-            companion::set_companion_enabled,
-            companion::open_companion_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -139,6 +139,9 @@ pub fn account_meta(acc: &Value) -> Value {
         "expiresAt": display_value(acc, "expiresAt"),
         "refreshExpiresAt": display_value(acc, "refreshExpiresAt"),
         "refreshedAt": display_value(acc, "refreshedAt"),
+        // 临时刷新失败（网络/代理/5xx）：与 needs_relogin 区分，提示"稍后重试"而非重新登录。
+        "last_refresh_error": display_value(acc, "last_refresh_error"),
+        "last_refresh_error_at": display_value(acc, "last_refresh_error_at"),
         "createdAt": display_value(acc, "createdAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": display_value(acc, "needs_relogin_reason"),

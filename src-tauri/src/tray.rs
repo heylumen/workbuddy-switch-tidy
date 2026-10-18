@@ -62,8 +62,6 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
             "update-now" => start_update_download(app),
             "update-restart" => start_update_restart(app),
             "lightweight-mode" => toggle_lightweight(app),
-            "companion-toggle" => crate::companion::toggle_rail(app),
-            "companion-settings" => crate::companion::open_settings_from_tray(app),
             "quit-app" => app.exit(0),
             _ => {}
         })
@@ -885,8 +883,8 @@ fn format_checkin_tooltip(value: &Value) -> String {
 mod tests {
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
-        MouseButtonState, TrayIconVariant,
+        should_keep_tray_alive, should_wake_main_window, taskbar_uses_light_theme,
+        tray_icon_variant, MouseButton, MouseButtonState, TrayIconVariant,
     };
     use serde_json::json;
 
