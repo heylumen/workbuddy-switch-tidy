@@ -48,9 +48,9 @@ pub const DEFAULT_HTTP_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS 
 // ---------------------------------------------------------------------------
 
 // 测试专用的 **线程局部** 数据根覆盖（普通注释：下面紧跟的是属性宏而非条目）。
-///
-/// 为什么不用环境变量：Rust 的测试在同一进程内多线程并行，
-/// 是进程级的，会污染其他模块的测试夹具（实测导致上游 token_stats 三条用例失败）。
+//
+// 为什么不用环境变量：Rust 的测试在同一进程内多线程并行，
+// 是进程级的，会污染其他模块的测试夹具（实测导致上游 token_stats 三条用例失败）。
 #[cfg(test)]
 thread_local! {
     static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
