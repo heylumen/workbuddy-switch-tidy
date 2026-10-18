@@ -455,7 +455,7 @@ mod tests {
     #[test]
     fn recheck_only_when_marked_and_token_still_valid() {
         let now = 1_700_000_000_000i64;
-        let mut acc = json!({"needs_relogin": true, "refresh_token": "rt", "expiresAt": now + 3600_000});
+        let mut acc = json!({"needs_relogin": true, "refresh_token": "rt", "expiresAt": now + 3_600_000});
         assert!(should_recheck_relogin(&acc, now));
         // 冷却未过 → 不重复复核
         acc["relogin_recheck_at"] = json!(now - 30_000);
@@ -467,7 +467,7 @@ mod tests {
         acc["expiresAt"] = json!(now - 1000);
         assert!(!should_recheck_relogin(&acc, now));
         // 未标记 / 无 RT → 不复核
-        acc["expiresAt"] = json!(now + 3600_000);
+        acc["expiresAt"] = json!(now + 3_600_000);
         acc["needs_relogin"] = json!(false);
         assert!(!should_recheck_relogin(&acc, now));
         acc["needs_relogin"] = json!(true);

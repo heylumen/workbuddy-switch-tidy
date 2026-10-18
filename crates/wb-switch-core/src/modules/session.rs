@@ -471,6 +471,7 @@ fn delete_edge_sync_mappings(db_path: &Path, cids: &[String]) {
 /// 仅在目标也无正文时才跳过，避免误跳正常会话。
 ///
 /// 读取失败（如 WorkBuddy 占用锁）时返回 `None`，即「不跳过」，保持包容行为。
+#[allow(clippy::too_many_arguments)]  // 参数语义独立；抽结构体会牵动全部调用点
 fn target_has_equivalent_session(
     db: &Path,
     _source_cid: &str,
@@ -481,9 +482,7 @@ fn target_has_equivalent_session(
     source_jsonl_norm: &str,
     source_has_jsonl: bool,
 ) -> Option<String> {
-    let Some(conn) = open_db(db, true) else {
-        return None;
-    };
+    let conn = open_db(db, true)?;
     if !table_exists(&conn, "sessions") {
         return None;
     }
@@ -524,11 +523,10 @@ fn target_has_equivalent_session(
                     }
                 }
             }
-        } else if !source_has_jsonl && !target_has_jsonl {
-            if session_display_title(title, custom_title) == source_title {
+        } else if !source_has_jsonl && !target_has_jsonl
+            && session_display_title(title, custom_title) == source_title {
                 return Some(cid.clone());
             }
-        }
     }
     None
 }
@@ -599,9 +597,7 @@ fn find_target_session_by_cwd_title(
     norm_cwd: &str,
     display_title: &str,
 ) -> Option<(String, i64)> {
-    let Some(conn) = open_db(db, true) else {
-        return None;
-    };
+    let conn = open_db(db, true)?;
     if !table_exists(&conn, "sessions") {
         return None;
     }
@@ -681,10 +677,8 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
 
     let index = index_project_jsonls();
     // key = (归一化 cwd, 归一化正文) -> 成员列表 (cid, updated_at, jsonl 路径)
-    let mut groups: std::collections::HashMap<
-        (String, String),
-        Vec<(String, i64, Option<PathBuf>)>,
-    > = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<(String, String), Vec<SessionGroupMember>> =
+        std::collections::HashMap::new();
     for r in rows.flatten() {
         let (cid, cwd, updated_at) = r;
         let cid = cid.unwrap_or_default();
@@ -718,7 +712,7 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
             continue;
         }
         // 保留 updated_at 最大的一条（并列时取遇到的第一条）
-        members.sort_by(|a, b| b.1.cmp(&a.1));
+        members.sort_by_key(|member| std::cmp::Reverse(member.1));
         let _keep = members.remove(0);
         for (cid, _ua, jsonl_path) in members {
             if let Err(e) = conn.execute(
@@ -758,11 +752,15 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
 /// 每组保留 `updated_at` 最新一条，其余仅置 `deleted_at` 软隐藏（**不删 jsonl 正文**，
 /// 记忆全部留盘、以后可恢复），并清理其孤儿云端映射。
 ///
+/// 清理重复会话的分组成员：(会话 id, updated_at, jsonl 路径)。
+type SessionGroupMember = (String, i64, Option<PathBuf>);
+
 /// 与 `dedup_sessions_for_user` 的区别（两者风险等级不同，故判定口径不同）：
 /// - `dedup_sessions_for_user`（清理重复会话）：按「正文逐字一致」合并，且会
 ///   `remove_file` **删除 jsonl 正文**，不可恢复 → 保持严格口径，杜绝误删。
 /// - 本函数（折叠同名会话）：仅软隐藏，正文留盘可恢复 → 放宽为「同工作区 + 同标题」
 ///   即可收起，用于消除切换账号反复复制产生的同名冗余。
+///
 /// 请在 WorkBuddy 关闭后执行。
 pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     let db = workbuddy_db_path(variant);
@@ -829,7 +827,7 @@ pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
             continue;
         }
         // 保留 updated_at 最大的一条（并列时取遇到的第一条），其余软隐藏。
-        members.sort_by(|a, b| b.1.cmp(&a.1));
+        members.sort_by_key(|member| std::cmp::Reverse(member.1));
         let _keep = members.remove(0);
         for (cid, _ua) in members {
             if let Err(e) = conn.execute(
