@@ -22,8 +22,7 @@ use crate::modules::session::{SessionPaths, SyncSelection, REASON_PREVIEW_STALE}
 use crate::modules::session_backup;
 use crate::modules::session_link::{
     self, BaselineState, ContentSnapshot, ContentState, LinkGroup, LinkMember, LinkStore,
-    MemberState, PreviewBinding, PreviewMemberBinding, StoreState, SyncMode, SyncVerdict,
-    NORMALIZATION_VERSION,
+    MemberState, PreviewBinding, StoreState, SyncMode, SyncVerdict, NORMALIZATION_VERSION,
 };
 use crate::modules::variant::WbVariant;
 use crate::modules::vscode_ext;
@@ -611,27 +610,6 @@ fn member_summary(member: Option<&LinkMember>) -> Value {
     }
 }
 
-/// 成员在预览时刻的内容绑定（不可验证时摘要留空，判定必然为 unknown）。
-fn member_binding(member: &LinkMember, content: &ContentState) -> PreviewMemberBinding {
-    let (raw_digest, normalized_digest, record_count) = match content {
-        ContentState::Ready(snapshot) => (
-            snapshot.full_digest.clone(),
-            snapshot.normalized.total_digest.clone(),
-            snapshot.normalized.record_count,
-        ),
-        _ => (String::new(), String::new(), 0),
-    };
-    PreviewMemberBinding {
-        member_id: member.member_id.clone(),
-        account_id: member.account_id.clone(),
-        uid: member.uid.clone(),
-        session_id: member.session_id.clone(),
-        raw_digest,
-        normalized_digest,
-        record_count,
-    }
-}
-
 /// 由实时状态组装预览绑定（预览与执行前核对共用同一份装配逻辑）。
 fn live_preview_binding(
     group: &LinkGroup,
@@ -646,8 +624,8 @@ fn live_preview_binding(
         variant: group.variant,
         group_id: group.id.clone(),
         group_fingerprint: session_link::group_fingerprint(group),
-        source: member_binding(source_member, source_content),
-        target: member_binding(target_member, target_content),
+        source: session_link::preview_member_binding(source_member, source_content),
+        target: session_link::preview_member_binding(target_member, target_content),
         baseline_ref: session_link::find_pair_base(
             group,
             &source_member.member_id,

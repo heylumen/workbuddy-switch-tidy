@@ -19,8 +19,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::modules::config::{
-    atomic_write, http_request_raw_timeout, http_request_with_proxy_timeout, now_secs, store_dir,
+    atomic_write, http_request_raw_timeout, http_request_with_proxy_timeout, lock_unpoison,
+    now_secs, store_dir,
 };
+use crate::modules::error_log;
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,8 +30,8 @@ pub const GITHUB_OWNER: &str = "heylumen";
 pub const GITHUB_REPO: &str = "workbuddy-switch-tidy";
 
 /// 默认国内镜像加速前缀：以「前缀 + 完整 GitHub URL」形式代理 release 资产下载。
-/// 可在 github_config.json 的 `mirrors` 字段（字符串数组）中自定义覆盖；
-/// 缺省或为空时使用该默认值。
+/// `github_config.json` 的 `mirrors` 只允许这些内置项，外部自定义镜像一律忽略：
+/// 任意镜像都能返回伪造 manifest，属供应链投毒入口。
 pub const DEFAULT_MIRRORS: &[&str] = &["https://gh-proxy.com/", "https://ghproxy.net/"];
 
 /// jsDelivr CDN 主机（多域名互为备用，国内网络一般可达）。
@@ -62,6 +64,24 @@ pub fn github_config_file() -> PathBuf {
     store_dir().join("github_config.json")
 }
 
+/// 更新源只允许本 fork 的官方仓库；GitHub owner/repo 大小写不敏感。
+///
+/// 共享数据目录里的 `github_config.json` 可被同族应用改写，若不校验就能把用户
+/// 引向任意第三方构建——这是上游 issue #92 的供应链劫持路径。
+fn is_trusted_update_source(owner: &str, repo: &str) -> bool {
+    owner.trim().eq_ignore_ascii_case(GITHUB_OWNER) && repo.trim().eq_ignore_ascii_case(GITHUB_REPO)
+}
+
+/// 日志里只保留安全字符，避免把配置中的换行/控制字符写进日志。
+fn safe_source_label(owner: &str, repo: &str) -> String {
+    let label = format!("{}/{}", owner.trim(), repo.trim());
+    label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+        .take(120)
+        .collect()
+}
+
 /// 规范镜像前缀：仅接受 `https://` 开头的地址（更新检查不向非加密源发请求），
 /// 去空白并确保以 `/` 结尾；不合法返回空串（调用方丢弃该条目；
 /// 若配置列表全部非法则回退内置默认镜像）。
@@ -83,6 +103,7 @@ fn default_mirrors() -> Vec<String> {
 
 /// 从配置 JSON 的 `mirrors` 字段解析镜像前缀列表（空/非法时回退默认值）。
 fn mirrors_from_config(cfg: &Value) -> Vec<String> {
+    let allowed = default_mirrors();
     let parsed: Vec<String> = cfg
         .get("mirrors")
         .and_then(|v| v.as_array())
@@ -90,12 +111,12 @@ fn mirrors_from_config(cfg: &Value) -> Vec<String> {
             list.iter()
                 .filter_map(|m| m.as_str())
                 .map(normalize_mirror)
-                .filter(|m| !m.is_empty())
+                .filter(|m| allowed.iter().any(|known| known == m))
                 .collect()
         })
         .unwrap_or_default();
     if parsed.is_empty() {
-        default_mirrors()
+        allowed
     } else {
         parsed
     }
@@ -122,20 +143,30 @@ pub fn load_github_config() -> Value {
                         repo = value.to_string();
                     }
                 }
+                if !is_trusted_update_source(&owner, &repo) {
+                    error_log::record(
+                        "update",
+                        "已拒绝非官方更新源",
+                        &format!(
+                            "{} -> {}/{}",
+                            safe_source_label(&owner, &repo),
+                            GITHUB_OWNER,
+                            GITHUB_REPO
+                        ),
+                    );
+                    owner = GITHUB_OWNER.to_string();
+                    repo = GITHUB_REPO.to_string();
+                    should_normalize = true;
+                }
                 if let Some(value) = v.get("proxy").and_then(|v| v.as_str()) {
                     proxy = value.trim().to_string();
                 }
                 if v.get("mirrors").is_some() {
                     mirrors = mirrors_from_config(&v);
                 }
-                should_normalize = v.get("token").is_some();
+                should_normalize = should_normalize || v.get("token").is_some();
             }
         }
-    }
-    // 旧版本截图/配置曾使用 changexbc/wb-switch；迁移到实际公开仓库。
-    if owner == "changexbc" && repo == "wb-switch" {
-        repo = GITHUB_REPO.to_string();
-        should_normalize = true;
     }
     let normalized = json!({"owner": owner, "repo": repo, "proxy": proxy, "mirrors": mirrors});
     if should_normalize {
@@ -159,6 +190,14 @@ pub fn save_github_config(cfg: &Value) -> std::io::Result<()> {
         .and_then(|v| v.as_str())
         .filter(|v| !v.trim().is_empty())
         .unwrap_or(GITHUB_REPO);
+    if !is_trusted_update_source(owner, repo) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("更新源已锁定为 {GITHUB_OWNER}/{GITHUB_REPO}，拒绝保存其他来源"),
+        ));
+    }
+    let owner = GITHUB_OWNER;
+    let repo = GITHUB_REPO;
     let proxy = cfg
         .get("proxy")
         .and_then(|v| v.as_str())
@@ -239,15 +278,11 @@ async fn fetch_manifest_version(
     headers.insert("User-Agent".to_string(), "wb-switch".to_string());
     // 并发竞速：所有候选（manifests × 直连/镜像）同时发起，**谁先拿到有效 version 用谁**。
     // 串行实现的最坏耗时 ≈ Σ(每候选超时 × 重试)，实测被墙时可达数十秒；竞速的总耗时 ≈ 最快的那个候选。
-    let urls: Vec<String> = updater_manifest_urls(
-        owner,
-        repo,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    )
-    .iter()
-    .flat_map(|u| candidate_urls(u, mirrors))
-    .collect();
+    let urls: Vec<String> =
+        updater_manifest_urls(owner, repo, std::env::consts::OS, std::env::consts::ARCH)
+            .iter()
+            .flat_map(|u| candidate_urls(u, mirrors))
+            .collect();
 
     let mut set = tokio::task::JoinSet::new();
     for url in urls {
@@ -397,9 +432,13 @@ async fn fetch_jsdelivr_version(
 /// 不发网络请求。三个更新源按优先级逐级降级；全部失败时返回明确的降级提示。
 pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
     // 缓存策略：非 force 走 10 分钟 TTL；force 时若 60 秒内刚查过也直接复用，避免连点重复请求。
-    if let Some(cached) = CACHE.lock().unwrap().as_ref() {
+    if let Some(cached) = lock_unpoison(&CACHE).as_ref() {
         let age = now_secs() - cached.checked_at;
-        let ttl = if force { FORCE_MIN_INTERVAL_SECS } else { CACHE_TTL_SECS };
+        let ttl = if force {
+            FORCE_MIN_INTERVAL_SECS
+        } else {
+            CACHE_TTL_SECS
+        };
         if age < ttl {
             return cached.value.clone();
         }
@@ -429,79 +468,76 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
 
     // 三层（manifest / release 跳转 / jsDelivr）整体受 TOTAL_BUDGET_SECS 约束：
     // 到点即返回降级结果，绝不无限等待。
-    let budgeted = tokio::time::timeout(
-        std::time::Duration::from_secs(TOTAL_BUDGET_SECS),
-        async {
-    // 层 1：updater manifest（GitHub 直连 + 国内镜像加速，资产下载不计 API 配额）。
-    match fetch_manifest_version(&owner, &repo, proxy, &mirrors).await {
-        Ok((manifest, via)) => {
-            let version = manifest
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim();
-            let latest = version.strip_prefix('v').unwrap_or(version).to_string();
-            let tag = format!("v{latest}");
-            let release_name = manifest
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&tag)
-                .to_string();
-            let published_at = manifest
-                .get("pub_date")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let value = json!({
-                "ok": true,
-                "current": current,
-                "latest": latest,
-                "latestTag": tag,
-                "hasUpdate": compare_versions(&latest, &current) > 0,
-                "releaseName": release_name,
-                "releaseUrl": release_url,
-                "publishedAt": published_at,
-                "source": via,
-                "checkedAt": now_secs(),
-            });
-            *CACHE.lock().unwrap() = Some(CachedCheck {
-                checked_at: now_secs(),
-                value: value.clone(),
-            });
-            return value;
+    let budgeted = tokio::time::timeout(std::time::Duration::from_secs(TOTAL_BUDGET_SECS), async {
+        // 层 1：updater manifest（GitHub 直连 + 国内镜像加速，资产下载不计 API 配额）。
+        match fetch_manifest_version(&owner, &repo, proxy, &mirrors).await {
+            Ok((manifest, via)) => {
+                let version = manifest
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                let latest = version.strip_prefix('v').unwrap_or(version).to_string();
+                let tag = format!("v{latest}");
+                let release_name = manifest
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&tag)
+                    .to_string();
+                let published_at = manifest
+                    .get("pub_date")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let value = json!({
+                    "ok": true,
+                    "current": current,
+                    "latest": latest,
+                    "latestTag": tag,
+                    "hasUpdate": compare_versions(&latest, &current) > 0,
+                    "releaseName": release_name,
+                    "releaseUrl": release_url,
+                    "publishedAt": published_at,
+                    "source": via,
+                    "checkedAt": now_secs(),
+                });
+                *lock_unpoison(&CACHE) = Some(CachedCheck {
+                    checked_at: now_secs(),
+                    value: value.clone(),
+                });
+                return value;
+            }
+            Err(err) => failures.push(format!("更新清单（直连+镜像）: {err}")),
         }
-        Err(err) => failures.push(format!("更新清单（直连+镜像）: {err}")),
-    }
 
-    // 层 2：`/releases/latest` 的 302 Location 头解析 tag（仅 GitHub 直连，VPN 场景）。
-    match fetch_latest_tag(&owner, &repo, proxy).await {
-        Ok(tag) => {
-            let latest = tag.strip_prefix('v').unwrap_or(&tag).to_string();
-            let value = json!({
-                "ok": true,
-                "current": current,
-                "latest": latest,
-                "latestTag": tag,
-                "hasUpdate": compare_versions(&latest, &current) > 0,
-                "releaseName": tag.clone(),
-                "releaseUrl": release_url,
-                "source": "release-redirect",
-                "checkedAt": now_secs(),
-            });
-            *CACHE.lock().unwrap() = Some(CachedCheck {
-                checked_at: now_secs(),
-                value: value.clone(),
-            });
-            value
+        // 层 2：`/releases/latest` 的 302 Location 头解析 tag（仅 GitHub 直连，VPN 场景）。
+        match fetch_latest_tag(&owner, &repo, proxy).await {
+            Ok(tag) => {
+                let latest = tag.strip_prefix('v').unwrap_or(&tag).to_string();
+                let value = json!({
+                    "ok": true,
+                    "current": current,
+                    "latest": latest,
+                    "latestTag": tag,
+                    "hasUpdate": compare_versions(&latest, &current) > 0,
+                    "releaseName": tag.clone(),
+                    "releaseUrl": release_url,
+                    "source": "release-redirect",
+                    "checkedAt": now_secs(),
+                });
+                *lock_unpoison(&CACHE) = Some(CachedCheck {
+                    checked_at: now_secs(),
+                    value: value.clone(),
+                });
+                value
+            }
+            Err((msg, code)) => {
+                failures.push(format!("release 页跳转: {msg}（code={code}）"));
+                // 继续走层 3。
+                check_jsdelivr_fallback(&owner, &repo, proxy, &current, &release_url, &mut failures)
+                    .await
+            }
         }
-        Err((msg, code)) => {
-            failures.push(format!("release 页跳转: {msg}（code={code}）"));
-            // 继续走层 3。
-            check_jsdelivr_fallback(&owner, &repo, proxy, &current, &release_url, &mut failures)
-                .await
-        }
-    }
-        },
-    )
+    })
     .await;
 
     match budgeted {
@@ -541,7 +577,7 @@ async fn check_jsdelivr_fallback(
                 "source": "jsdelivr-cdn",
                 "checkedAt": now_secs(),
             });
-            *CACHE.lock().unwrap() = Some(CachedCheck {
+            *lock_unpoison(&CACHE) = Some(CachedCheck {
                 checked_at: now_secs(),
                 value: value.clone(),
             });
@@ -568,6 +604,26 @@ async fn check_jsdelivr_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_source_is_locked_to_official_repo() {
+        assert!(is_trusted_update_source(
+            "heylumen",
+            "workbuddy-switch-tidy"
+        ));
+        assert!(is_trusted_update_source(
+            " HeyLumen ",
+            "WorkBuddy-Switch-Tidy"
+        ));
+        assert!(!is_trusted_update_source("changexbc", "workbuddy-switch"));
+        assert!(!is_trusted_update_source("heylumen", "workbuddy-switch"));
+        assert!(!is_trusted_update_source("evil", "workbuddy-switch-tidy"));
+        assert!(!is_trusted_update_source("", ""));
+        // 日志标签必须剔除换行/控制字符，避免污染错误日志。
+        let label = safe_source_label("evil\nowner", "repo");
+        assert!(!label.contains('\n'));
+        assert!(label.len() <= 120);
+    }
 
     #[test]
     fn updater_manifest_urls_macos_skips_duplicate_fallback() {
@@ -649,8 +705,13 @@ mod tests {
         );
         assert_eq!(
             mirrors_from_config(&json!({"mirrors": ["https://my-mirror.example"]})),
-            vec!["https://my-mirror.example/".to_string()],
-            "自定义镜像应去空白并补全尾部斜杠"
+            default_mirrors(),
+            "外部自定义镜像必须忽略（防伪造 manifest），回退内置镜像"
+        );
+        assert_eq!(
+            mirrors_from_config(&json!({"mirrors": ["https://gh-proxy.com"]})),
+            vec!["https://gh-proxy.com/".to_string()],
+            "允许列表内的镜像可正常使用并补全尾部斜杠"
         );
     }
 }

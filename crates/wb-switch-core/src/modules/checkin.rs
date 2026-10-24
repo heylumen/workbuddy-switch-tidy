@@ -35,6 +35,7 @@ use crate::modules::config::{
     add_checkin_log, http_request, is_route_missing, load_checkin_config, load_checkin_logs,
     now_ms, parse_clock, RunFlagGuard, CHECKIN_API_PREFIX,
 };
+use crate::modules::http_response::is_unauthorized;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 use crate::modules::variant::WbVariant;
 
@@ -102,23 +103,6 @@ impl Drop for AccountRunGuard {
             running.lock().unwrap().remove(&self.key);
         }
     }
-}
-
-/// 判断是否因 token 失效被拒（用于触发刷新重试）。
-fn is_unauthorized(resp: &Value) -> bool {
-    let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code == 401 || code == 403 {
-        return true;
-    }
-    let msg = resp
-        .get("message")
-        .or_else(|| resp.get("msg"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
-    ["unauthorized", "401", "登录", "失效", "过期", "token"]
-        .iter()
-        .any(|k| msg.contains(k))
 }
 
 /// 该响应是否应在刷新/重试判定**之前**原样返回（国际版「未开启 / 未开放 / 已过期」类业务码）。

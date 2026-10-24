@@ -6,6 +6,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import {
   buildSelections,
   isActionable,
+  isArchiveOnlySyncable,
   isDirectlySyncable,
   LinksSkeleton,
   LIST_MIN_H,
@@ -33,7 +34,10 @@ interface Props {
   /** 插件是否已登录：未登录时渲染专属空态，不发预览请求 */
   loggedIn: boolean;
   /** 勾选结果变化：父组件据此提交 `syncSelections`，并用于结果反馈里回显会话名 */
-  onChange: (state: { selections: SessionSyncSelection[]; groups: SessionLinkPreviewGroup[] }) => void;
+  onChange: (state: {
+    selections: SessionSyncSelection[];
+    groups: SessionLinkPreviewGroup[];
+  }) => void;
   /** 预览状态上报：父组件用于 tab 徽标 */
   onMetaChange?: (meta: SessionLinksMeta) => void;
   /**
@@ -88,10 +92,15 @@ export function VscodeSessionSyncSection({
         setPreview(res);
         // 默认勾选值来自后端 defaultChecked，前端不扩大权限。
         const defaults = new Set(
-          res.groups.filter((group) => group.defaultChecked && isActionable(group)).map((g) => g.groupId),
+          res.groups
+            .filter((group) => group.defaultChecked && isActionable(group))
+            .map((g) => g.groupId),
         );
         setChecked(defaults);
-        onChange({ selections: buildSelections(res.groups, defaults), groups: res.groups });
+        onChange({
+          selections: buildSelections(res.groups, defaults),
+          groups: res.groups,
+        });
       })
       .catch((e) => {
         if (cancelled) return;
@@ -111,7 +120,9 @@ export function VscodeSessionSyncSection({
 
   const groups = preview?.groups ?? [];
   // 插件侧没有档位能力探测，正常不会出现 supported=false；保留兜底以免渲染空 tab。
-  const unsupported = Boolean(preview && (!preview.supported || preview.storeStatus === "unsupported"));
+  const unsupported = Boolean(
+    preview && (!preview.supported || preview.storeStatus === "unsupported"),
+  );
   const targetLabel = account ? displayName(account) : "目标账号";
 
   // 状态上报：父组件据此渲染 tab 徽标。
@@ -124,18 +135,47 @@ export function VscodeSessionSyncSection({
       storeError: preview?.storeError ?? "",
     });
     // onMetaChange 只做状态回写，不进依赖。
-  }, [unsupported, groups.length, error, preview?.storeStatus, preview?.storeError]);
+  }, [
+    unsupported,
+    groups.length,
+    error,
+    preview?.storeStatus,
+    preview?.storeError,
+  ]);
 
   const syncable = groups.filter(isDirectlySyncable);
-  const selectedCount = groups.filter((group) => isActionable(group) && checked.has(group.groupId)).length;
-  const selectedSyncableCount = syncable.filter((group) => checked.has(group.groupId)).length;
-  const allSyncableSelected = syncable.length > 0 && selectedSyncableCount === syncable.length;
+  const archiveOnlyItems = groups.filter(isArchiveOnlySyncable);
+  const selectedCount = groups.filter(
+    (group) => isActionable(group) && checked.has(group.groupId),
+  ).length;
+  const selectedSyncableCount = syncable.filter((group) =>
+    checked.has(group.groupId),
+  ).length;
+  const allSyncableSelected =
+    syncable.length > 0 && selectedSyncableCount === syncable.length;
+  const selectedArchiveCount = archiveOnlyItems.filter((group) =>
+    checked.has(group.groupId),
+  ).length;
+  const allArchiveSelected =
+    archiveOnlyItems.length > 0 &&
+    selectedArchiveCount === archiveOnlyItems.length;
 
   /** 全选/取消全选：只作用于可直接同步的会话；覆盖项必须单独勾选。 */
   function toggleAllSyncable() {
     const updated = new Set(checked);
-    if (allSyncableSelected) syncable.forEach((group) => updated.delete(group.groupId));
+    if (allSyncableSelected)
+      syncable.forEach((group) => updated.delete(group.groupId));
     else syncable.forEach((group) => updated.add(group.groupId));
+    setChecked(updated);
+    onChange({ selections: buildSelections(groups, updated), groups });
+  }
+
+  /** 全选/取消全选「仅同步归档」：不触碰正文快进与覆盖项。 */
+  function toggleAllArchiveOnly() {
+    const updated = new Set(checked);
+    if (allArchiveSelected)
+      archiveOnlyItems.forEach((group) => updated.delete(group.groupId));
+    else archiveOnlyItems.forEach((group) => updated.add(group.groupId));
     setChecked(updated);
     onChange({ selections: buildSelections(groups, updated), groups });
   }
@@ -176,7 +216,9 @@ export function VscodeSessionSyncSection({
             STATUS_MIN_H,
           )}
         >
-          <p className="text-center text-xs text-muted-foreground">{loggedOutHint}</p>
+          <p className="text-center text-xs text-muted-foreground">
+            {loggedOutHint}
+          </p>
         </div>
       )}
 
@@ -188,7 +230,9 @@ export function VscodeSessionSyncSection({
           )}
         >
           <span className="min-w-0 flex-1 text-xs text-muted-foreground">
-            {error ? "暂时无法检查会话，本次不能同步" : "同步记录不可用，本次不会同步"}
+            {error
+              ? "暂时无法检查会话，本次不能同步"
+              : "同步记录不可用，本次不会同步"}
           </span>
           <Button
             variant="outline"
@@ -216,33 +260,68 @@ export function VscodeSessionSyncSection({
         </div>
       )}
 
-      {!pending && loggedIn && !error && !storeUnavailable && preview?.storeStatus === "ready" && groups.length === 0 && (
-        <div
-          className={cn(
-            "flex items-center justify-center rounded-md border px-3 py-2.5",
-            STATUS_MIN_H,
-          )}
-        >
-          <p className="text-center text-xs text-muted-foreground">
-            这两个账号还没有共同复制过的会话（只处理双方都有的，不涉及其他账号）。
-          </p>
-        </div>
-      )}
+      {!pending &&
+        loggedIn &&
+        !error &&
+        !storeUnavailable &&
+        preview?.storeStatus === "ready" &&
+        groups.length === 0 && (
+          <div
+            className={cn(
+              "flex items-center justify-center rounded-md border px-3 py-2.5",
+              STATUS_MIN_H,
+            )}
+          >
+            <p className="text-center text-xs text-muted-foreground">
+              这两个账号还没有共同复制过的会话（只处理双方都有的，不涉及其他账号）。
+            </p>
+          </div>
+        )}
 
       {!pending && loggedIn && !error && groups.length > 0 && (
         <div className="space-y-2">
           <div className="flex items-center gap-2.5 px-1">
             <Checkbox
-              checked={allSyncableSelected ? true : selectedSyncableCount > 0 ? "indeterminate" : false}
+              checked={
+                allSyncableSelected
+                  ? true
+                  : selectedSyncableCount > 0
+                    ? "indeterminate"
+                    : false
+              }
               disabled={disabled || syncable.length === 0}
               onCheckedChange={() => toggleAllSyncable()}
               aria-label="全选可直接同步的会话"
             />
-            <span className="min-w-0 flex-1 text-sm font-medium">全选可直接同步的会话</span>
+            <span className="min-w-0 flex-1 text-sm font-medium">
+              全选可直接同步的会话
+            </span>
             <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
               {`已选 ${selectedCount} / ${groups.length}`}
             </span>
           </div>
+          {archiveOnlyItems.length > 0 && (
+            <div className="flex items-center gap-2.5 px-1">
+              <Checkbox
+                checked={
+                  allArchiveSelected
+                    ? true
+                    : selectedArchiveCount > 0
+                      ? "indeterminate"
+                      : false
+                }
+                disabled={disabled}
+                onCheckedChange={() => toggleAllArchiveOnly()}
+                aria-label="全选仅同步归档的会话"
+              />
+              <span className="min-w-0 flex-1 text-sm font-medium">
+                {`全选仅同步归档 (${archiveOnlyItems.length})`}
+              </span>
+              <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                {`已选 ${selectedArchiveCount} / ${archiveOnlyItems.length}`}
+              </span>
+            </div>
+          )}
           <div
             className={cn(
               "max-h-[min(24rem,50vh)] divide-y overflow-y-auto rounded-md border",
@@ -260,7 +339,9 @@ export function VscodeSessionSyncSection({
               />
             ))}
           </div>
-          <p className="px-1 text-xs text-muted-foreground">全选仅包含可直接同步的会话，覆盖需单独勾选。</p>
+          <p className="px-1 text-xs text-muted-foreground">
+            全选正文只包含可直接同步的会话；仅归档项可用第二个全选；覆盖仍需单独勾选。
+          </p>
         </div>
       )}
     </section>

@@ -317,18 +317,26 @@ fn sync_unify_batch_workbuddy(
                 }
             }
             Err(error) => {
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}：{error}", pair.target.uid),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}：{error}", pair.target.uid),
+                    }),
+                );
                 break;
             }
         }
     }
 
     if combined["needsRecovery"] == true {
-        combined["errors"].as_array_mut().unwrap().push(json!({
-            "error": "会话写入待恢复，已暂停重新打开客户端；请先处理恢复提示",
-        }));
+        push_report_item(
+            &mut combined,
+            "errors",
+            json!({
+                "error": "会话写入待恢复，已暂停重新打开客户端；请先处理恢复提示",
+            }),
+        );
         return Ok(combined);
     }
     for variant in &closed {
@@ -336,15 +344,23 @@ fn sync_unify_batch_workbuddy(
             Ok(recovery) if !crate::modules::switch::recovery_blocks_startup(&recovery) => {}
             Ok(recovery) => {
                 combined["needsRecovery"] = json!(true);
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}仍有待恢复的会话写入（{}），已暂停重新打开客户端", workbuddy_variant_label(*variant), crate::modules::switch::recovery_blocking_detail(&recovery)),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}仍有待恢复的会话写入（{}），已暂停重新打开客户端", workbuddy_variant_label(*variant), crate::modules::switch::recovery_blocking_detail(&recovery)),
+                    }),
+                );
             }
             Err(error) => {
                 combined["needsRecovery"] = json!(true);
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}无法检查会话恢复状态（{error}），已暂停重新打开客户端", workbuddy_variant_label(*variant)),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}无法检查会话恢复状态（{error}），已暂停重新打开客户端", workbuddy_variant_label(*variant)),
+                    }),
+                );
             }
         }
     }
@@ -354,9 +370,13 @@ fn sync_unify_batch_workbuddy(
     let mut reopened = Vec::new();
     for variant in closed {
         if let Err(error) = process::launch_workbuddy(variant, None) {
-            combined["errors"].as_array_mut().unwrap().push(json!({
-                "error": format!("{}会话已处理，但客户端重新打开失败：{error}", workbuddy_variant_label(variant)),
-            }));
+            push_report_item(
+                &mut combined,
+                "errors",
+                json!({
+                    "error": format!("{}会话已处理，但客户端重新打开失败：{error}", workbuddy_variant_label(variant)),
+                }),
+            );
         } else {
             reopened.push(variant.as_str());
         }
@@ -387,9 +407,13 @@ fn sync_unify_batch_vscode(
         match run_pair_sync(client, scope, &pair, &[selection], editor_prepared) {
             Ok(report) => merge_sync_report(&mut combined, report),
             Err(error) => {
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}：{error}", pair.target.uid),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}：{error}", pair.target.uid),
+                    }),
+                );
                 break;
             }
         }
@@ -474,12 +498,16 @@ pub fn sync_safe_batch(
         )?;
         let preview = preview_resolved_pair(client, scope, &pair)?;
         if preview.get("verdict").and_then(Value::as_str) != Some("fastForward") {
-            combined["skipped"].as_array_mut().unwrap().push(json!({
-                "groupId": group_id,
-                "targetMemberId": target_member_id,
-                "reasonCode": "recheckNotFastForward",
-                "message": "重新检查后该副本不再属于安全快进范围",
-            }));
+            push_report_item(
+                &mut combined,
+                "skipped",
+                json!({
+                    "groupId": group_id,
+                    "targetMemberId": target_member_id,
+                    "reasonCode": "recheckNotFastForward",
+                    "message": "重新检查后该副本不再属于安全快进范围",
+                }),
+            );
             continue;
         }
         let token = preview
@@ -1326,6 +1354,23 @@ fn parse_selection(
     .into_iter()
     .next()
     .ok_or_else(|| "会话同步选择项为空".to_string())
+}
+
+/// 向汇总报告的数组槽位追加一项。
+///
+/// 槽位缺失或曾被合并逻辑写成 `null`/非数组时，自动补成数组再追加，
+/// 避免收尾阶段因 `as_array_mut().unwrap()` 直接 panic。
+fn push_report_item(combined: &mut Value, key: &str, item: Value) {
+    let Value::Object(map) = combined else {
+        return;
+    };
+    match map.get_mut(key) {
+        Some(Value::Array(items)) => items.push(item),
+        Some(slot) => *slot = json!([item]),
+        None => {
+            map.insert(key.to_owned(), json!([item]));
+        }
+    }
 }
 
 fn merge_sync_report(into: &mut Value, item: Value) {
@@ -2880,6 +2925,25 @@ mod tests {
                 "{key} 缺失时应补成数组并保留合并内容"
             );
         }
+    }
+
+    #[test]
+    fn push_report_item_recovers_missing_null_and_non_array_slots() {
+        let mut combined = combined_report();
+        combined.as_object_mut().unwrap().remove("errors");
+        push_report_item(&mut combined, "errors", json!({"error": "a"}));
+        assert_eq!(combined["errors"], json!([{"error": "a"}]));
+
+        combined["errors"] = Value::Null;
+        push_report_item(&mut combined, "errors", json!({"error": "b"}));
+        assert_eq!(combined["errors"], json!([{"error": "b"}]));
+
+        combined["errors"] = json!({"unexpected": true});
+        push_report_item(&mut combined, "errors", json!({"error": "c"}));
+        assert_eq!(combined["errors"], json!([{"error": "c"}]));
+
+        push_report_item(&mut combined, "errors", json!({"error": "d"}));
+        assert_eq!(combined["errors"].as_array().map(Vec::len), Some(2));
     }
 
     #[test]

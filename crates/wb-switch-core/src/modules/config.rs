@@ -326,7 +326,8 @@ fn checkin_config_with_enabled(enabled: bool) -> Value {
         "checkin_end": "",
         "start_hour": 6,
         "end_hour": 12,
-        "keepalive_days": 0,
+        // 保活临期窗口（天）：默认 7 天，避免每天无条件轮换全部 refresh token。
+        "keepalive_days": 7,
         "lazy_refresh_hours": 24,
         // 保活最小间隔（小时）：默认 12，避免频繁重启触发多轮全量刷新。
         "keepalive_min_interval_hours": 12,
@@ -923,6 +924,16 @@ impl Drop for RunFlagGuard<'_> {
 // 时间
 // ---------------------------------------------------------------------------
 
+/// 取互斥锁并忽略「中毒」状态。
+///
+/// 持锁线程 panic 后，标准库 Mutex 会永久中毒；继续 `unwrap()` 会把一次局部故障
+/// 放大成后续所有请求 panic。这里取回内部值继续运行，由调用方按业务状态处理。
+pub fn lock_unpoison<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1079,6 +1090,9 @@ pub async fn http_request_with_proxy(
                     json!({
                         "code": status.as_u16(),
                         "message": normalize_error_body(&text),
+                        // 非 JSON 响应（网关 HTML 错误页等）：`code` 只是 HTTP 状态码，
+                        // 不是业务信封里的鉴权结论，下游须据此区分（见 refresh 失败分类）。
+                        "nonJson": true,
                     })
                 })
             }
@@ -1174,8 +1188,6 @@ pub async fn http_request_raw(
     }
 }
 
-
-
 // ==== 以下两个带 timeout 的包装由本 fork 保留（上游仅有不带 timeout 的版本）====
 
 pub async fn http_request_with_proxy_timeout(
@@ -1225,6 +1237,8 @@ pub async fn http_request_with_proxy_timeout(
                     json!({
                         "code": status.as_u16(),
                         "message": text.chars().take(500).collect::<String>(),
+                        // 非 JSON 响应：`code` 仅为 HTTP 状态码，不代表业务鉴权结论。
+                        "nonJson": true,
                     })
                 })
             }

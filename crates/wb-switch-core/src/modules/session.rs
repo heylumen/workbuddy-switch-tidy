@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 
 use crate::modules::account;
 use crate::modules::auth_file;
-use crate::modules::config::{home_dir, now_ms, store_dir};
+use crate::modules::config::{now_ms, store_dir};
 use crate::modules::process;
 use crate::modules::session_backup::{
     self, BackupLifecycle, CleanupOutcome, CLEANUP_STATE_SAFE_TERMINATED,
@@ -45,8 +45,8 @@ use crate::modules::session_backup::{
 use crate::modules::session_link::{
     self, full_digest_of, BaselineState, ContentSnapshot, ContentState, LinkGroup, LinkMember,
     LinkStore, MemberState, NormalizedContent, OpPhase, Operation, OperationMember, PreviewBinding,
-    PreviewMemberBinding, RecoveryIssue, RecoveryReport, StoreState, SyncDecision, SyncMode,
-    SyncVerdict, NORMALIZATION_VERSION, OPERATION_VERSION,
+    RecoveryIssue, RecoveryReport, StoreState, SyncDecision, SyncMode, SyncVerdict,
+    NORMALIZATION_VERSION, OPERATION_VERSION,
 };
 use crate::modules::variant::WbVariant;
 
@@ -412,11 +412,12 @@ fn normalize_jsonl(text: &str, cid: &str) -> String {
     text.replace(cid, NEUTRAL_ID)
 }
 
-/// 一次性索引 `~/.workbuddy/projects` 下所有 `{cid}.jsonl`，返回 cid -> 路径。
+/// 一次性索引指定 `projects/` 下所有 `{cid}.jsonl`，返回 cid -> 路径。
+///
 /// 查找范围与 `find_project_jsonl` 一致（直接文件 + 各 workspace 子目录）。
-fn index_project_jsonls() -> std::collections::HashMap<String, PathBuf> {
+/// 多档位/测试注入都必须走这里，避免固定读当前用户主目录而漏掉另一档位的数据。
+fn index_project_jsonls_in(projects: &Path) -> std::collections::HashMap<String, PathBuf> {
     let mut map = std::collections::HashMap::new();
-    let projects = home_dir().join(".workbuddy").join("projects");
     if !projects.is_dir() {
         return map;
     }
@@ -425,7 +426,7 @@ fn index_project_jsonls() -> std::collections::HashMap<String, PathBuf> {
             map.entry(stem.to_string()).or_insert(p);
         }
     };
-    if let Ok(entries) = std::fs::read_dir(&projects) {
+    if let Ok(entries) = std::fs::read_dir(projects) {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.is_file() {
@@ -471,7 +472,7 @@ fn delete_edge_sync_mappings(db_path: &Path, cids: &[String]) {
 /// 仅在目标也无正文时才跳过，避免误跳正常会话。
 ///
 /// 读取失败（如 WorkBuddy 占用锁）时返回 `None`，即「不跳过」，保持包容行为。
-#[allow(clippy::too_many_arguments)]  // 参数语义独立；抽结构体会牵动全部调用点
+#[allow(clippy::too_many_arguments)] // 参数语义独立；抽结构体会牵动全部调用点
 fn target_has_equivalent_session(
     db: &Path,
     _source_cid: &str,
@@ -503,7 +504,8 @@ fn target_has_equivalent_session(
         return None;
     };
 
-    let index = index_project_jsonls();
+    let data_root = db.parent().unwrap_or_else(|| Path::new("."));
+    let index = index_project_jsonls_in(&data_root.join("projects"));
     for r in rows.flatten() {
         let (cid, cwd, title, custom_title) = r;
         let cid = cid.unwrap_or_default();
@@ -523,10 +525,12 @@ fn target_has_equivalent_session(
                     }
                 }
             }
-        } else if !source_has_jsonl && !target_has_jsonl
-            && session_display_title(title, custom_title) == source_title {
-                return Some(cid.clone());
-            }
+        } else if !source_has_jsonl
+            && !target_has_jsonl
+            && session_display_title(title, custom_title) == source_title
+        {
+            return Some(cid.clone());
+        }
     }
     None
 }
@@ -675,7 +679,7 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
         return json!({ "ok": false, "reason": "查询会话失败", "removed": 0 });
     };
 
-    let index = index_project_jsonls();
+    let index = index_project_jsonls_in(&SessionPaths::for_variant(variant).projects_dir());
     // key = (归一化 cwd, 归一化正文) -> 成员列表 (cid, updated_at, jsonl 路径)
     let mut groups: std::collections::HashMap<(String, String), Vec<SessionGroupMember>> =
         std::collections::HashMap::new();
@@ -696,14 +700,22 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
                 .unwrap_or_else(|| format!("__nojsonl__{cid}")),
             None => format!("__nojsonl__{cid}"),
         };
-        groups
-            .entry((norm_cwd, norm_jsonl))
-            .or_default()
-            .push((cid, updated_at.unwrap_or(0), jsonl_path));
+        groups.entry((norm_cwd, norm_jsonl)).or_default().push((
+            cid,
+            updated_at.unwrap_or(0),
+            jsonl_path,
+        ));
     }
 
     let mut removed = 0usize;
+    let mut protected = 0usize;
     let mut removed_ids: Vec<String> = Vec::new();
+    // 仍被关联组引用的会话不能删：删掉后关联立即失效，且 dedup 会连正文一起删除、
+    // 无法恢复。这里跨档位取并集，避免只保护当前档位而误伤另一档的关联。
+    let linked = match session_link::protected_session_ids(&SessionPaths::for_variant(variant)) {
+        Ok(ids) => ids,
+        Err(reason) => return json!({ "ok": false, "reason": reason, "removed": 0 }),
+    };
     // 写库失败立即中止并回报原因：WorkBuddy 占用锁时不再静默丢结果、不虚报成功数，
     // 也避免 UPDATE 未生效却把 jsonl 正文删掉造成数据丢失。
     let mut failure: Option<String> = None;
@@ -715,11 +727,17 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
         members.sort_by_key(|member| std::cmp::Reverse(member.1));
         let _keep = members.remove(0);
         for (cid, _ua, jsonl_path) in members {
+            if linked.contains(&cid) {
+                protected += 1;
+                continue;
+            }
             if let Err(e) = conn.execute(
                 "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND user_id = ?3",
                 rusqlite::params![now_ms(), &cid, uid],
             ) {
-                failure = Some(format!("写入 workbuddy.db 失败（请关闭 WorkBuddy 后重试）：{e}"));
+                failure = Some(format!(
+                    "写入 workbuddy.db 失败（请关闭 WorkBuddy 后重试）：{e}"
+                ));
                 break;
             }
             if let Some(p) = jsonl_path {
@@ -734,7 +752,10 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     }
 
     if !removed_ids.is_empty() {
-        delete_edge_sync_mappings(&edge_sync_db_path(&variant.data_root(), variant), &removed_ids);
+        delete_edge_sync_mappings(
+            &edge_sync_db_path(&variant.data_root(), variant),
+            &removed_ids,
+        );
     }
 
     if let Some(reason) = failure {
@@ -744,6 +765,7 @@ pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     json!({
         "ok": true,
         "removed": removed,
+        "protected": protected,
         "removedIds": removed_ids,
     })
 }
@@ -819,7 +841,14 @@ pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     }
 
     let mut removed = 0usize;
+    let mut protected = 0usize;
     let mut removed_ids: Vec<String> = Vec::new();
+    // 关联中的会话即使同名也不折叠：软隐藏后关联成员会立即失效，用户再打开
+    // 「关联会话」只能看到「会话记录缺失」。跨档位取并集保护。
+    let linked = match session_link::protected_session_ids(&SessionPaths::for_variant(variant)) {
+        Ok(ids) => ids,
+        Err(reason) => return json!({ "ok": false, "reason": reason, "removed": 0 }),
+    };
     // 写库失败立即中止并回报原因：WorkBuddy 占用锁时不再静默丢结果、不虚报成功数。
     let mut failure: Option<String> = None;
     for (_, mut members) in groups {
@@ -830,11 +859,17 @@ pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
         members.sort_by_key(|member| std::cmp::Reverse(member.1));
         let _keep = members.remove(0);
         for (cid, _ua) in members {
+            if linked.contains(&cid) {
+                protected += 1;
+                continue;
+            }
             if let Err(e) = conn.execute(
                 "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND user_id = ?3",
                 rusqlite::params![now_ms(), &cid, uid],
             ) {
-                failure = Some(format!("写入 workbuddy.db 失败（请关闭 WorkBuddy 后重试）：{e}"));
+                failure = Some(format!(
+                    "写入 workbuddy.db 失败（请关闭 WorkBuddy 后重试）：{e}"
+                ));
                 break;
             }
             // 注意：不删除 jsonl 正文，记忆留盘、可恢复。
@@ -847,7 +882,10 @@ pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     }
 
     if !removed_ids.is_empty() {
-        delete_edge_sync_mappings(&edge_sync_db_path(&variant.data_root(), variant), &removed_ids);
+        delete_edge_sync_mappings(
+            &edge_sync_db_path(&variant.data_root(), variant),
+            &removed_ids,
+        );
     }
 
     if let Some(reason) = failure {
@@ -857,6 +895,7 @@ pub fn collapse_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
     json!({
         "ok": true,
         "removed": removed,
+        "protected": protected,
         "removedIds": removed_ids,
     })
 }
@@ -2201,6 +2240,241 @@ fn session_row_info(paths: &SessionPaths, cid: &str) -> Option<(String, String)>
     })
 }
 
+/// 会话库中的一行身份信息（含已软删除行，用于识别旧关联）。
+#[derive(Debug, Clone)]
+struct SessionIdentityRow {
+    uid: String,
+    cwd: String,
+    title: String,
+    updated_at: i64,
+    deleted: bool,
+}
+
+/// 关联成员对账结果（仅供诊断与测试观察）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LinkReconcileReport {
+    relinked: usize,
+    superseded: usize,
+}
+
+struct LinkMemberFix {
+    group_id: String,
+    member_id: String,
+    /// 计算修复时的会话 id：写回前复核，避免覆盖并发复制/换绑后的新成员。
+    expected_session_id: String,
+    /// `Some` 表示同一账号下找到内容一致的存活会话，可原地换绑；`None` 表示置为失效。
+    session_id: Option<String>,
+}
+
+/// 读取会话库身份行；库/表不可用时返回 None（调用方保持原行为）。
+fn load_session_identity_rows(
+    paths: &SessionPaths,
+) -> Option<std::collections::HashMap<String, SessionIdentityRow>> {
+    let db = paths.workbuddy_db();
+    if !db.is_file() {
+        return None;
+    }
+    let conn = open_db(&db, true)?;
+    if !table_exists(&conn, "sessions") {
+        return None;
+    }
+    let has_custom = column_exists(&conn, "sessions", "custom_title");
+    let sql = if has_custom {
+        "SELECT id, user_id, cwd, title, custom_title, updated_at, deleted_at FROM sessions"
+    } else {
+        "SELECT id, user_id, cwd, title, NULL, updated_at, deleted_at FROM sessions"
+    };
+    let mut stmt = conn.prepare(sql).ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })
+        .ok()?;
+    let mut map = std::collections::HashMap::new();
+    for (id, uid, cwd, title, custom_title, updated_at, deleted_at) in rows.flatten() {
+        map.insert(
+            id,
+            SessionIdentityRow {
+                uid: uid.unwrap_or_default(),
+                cwd: cwd.unwrap_or_default(),
+                title: session_display_title(title, custom_title),
+                updated_at: updated_at.unwrap_or(0),
+                deleted: deleted_at.is_some(),
+            },
+        );
+    }
+    Some(map)
+}
+
+/// 把「成员仍 active、但会话行已软删/缺失」的历史脏关联对账一次。
+///
+/// 规则完全通用、不依赖具体账号或路径：
+/// 1. 同一账号下存在「归一化 cwd + 展示标题」相同、且正文归一化摘要一致的存活会话
+///    → 成员原地换绑到该会话（内容一致，配对基线仍然有效）；
+/// 2. 找不到可证明一致的存活会话 → 成员置为 `Superseded`（明确失效，不再误导）。
+///
+/// 返回诊断计数。存储/数据库不可用时不做任何写入。
+fn reconcile_stale_link_members(paths: &SessionPaths, variant: WbVariant) -> LinkReconcileReport {
+    let Some(rows) = load_session_identity_rows(paths) else {
+        return LinkReconcileReport::default();
+    };
+    let StoreState::Ready(store) = session_link::load_store(paths) else {
+        return LinkReconcileReport::default();
+    };
+
+    type IdentityKey = (String, String, String);
+    let mut candidates: std::collections::HashMap<IdentityKey, Vec<(String, i64)>> =
+        std::collections::HashMap::new();
+    for (id, row) in rows.iter() {
+        if row.deleted {
+            continue;
+        }
+        candidates
+            .entry((row.uid.clone(), normalize_cwd(&row.cwd), row.title.clone()))
+            .or_default()
+            .push((id.clone(), row.updated_at));
+    }
+    // 更新时间倒序、同值时按 id 定序，保证结果与目录/查询顺序无关。
+    for list in candidates.values_mut() {
+        list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+
+    let linked_ids = session_link::active_session_ids(paths);
+    let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut fixes: Vec<LinkMemberFix> = Vec::new();
+    let mut report = LinkReconcileReport::default();
+
+    // 跨档组里成员档位可能不同：必须按「成员自身档位」筛，不能按组档位，
+    // 否则用 CN 会话库去核对 AI 成员会全部误判为缺失。
+    for group in store.groups.iter() {
+        for member in group.members.iter().filter(|member| {
+            member.state == MemberState::Active
+                && session_link::member_variant(group, member) == variant
+        }) {
+            let Some(row) = rows.get(&member.session_id) else {
+                // 行被物理删除：无法按「同工作区 + 同标题」找替代项，但只要正文仍完整，
+                // 仍可作为只读来源；正文也没了才置失效。
+                let readable = find_project_jsonl(paths, &member.session_id).is_some_and(|path| {
+                    matches!(
+                        session_link::read_content_snapshot(&path, &member.session_id),
+                        ContentState::Ready(_)
+                    )
+                });
+                if !readable {
+                    report.superseded += 1;
+                    fixes.push(LinkMemberFix {
+                        group_id: group.id.clone(),
+                        member_id: member.member_id.clone(),
+                        expected_session_id: member.session_id.clone(),
+                        session_id: None,
+                    });
+                }
+                continue;
+            };
+            if !row.deleted && row.uid == member.uid {
+                continue;
+            }
+
+            let key = (
+                member.uid.clone(),
+                normalize_cwd(&row.cwd),
+                row.title.clone(),
+            );
+            let old_digest = find_project_jsonl(paths, &member.session_id).and_then(|path| {
+                match session_link::read_content_snapshot(&path, &member.session_id) {
+                    ContentState::Ready(snapshot) => Some(snapshot.normalized.total_digest),
+                    _ => None,
+                }
+            });
+
+            let mut replacement = None;
+            if let (Some(digest), Some(list)) = (old_digest.as_deref(), candidates.get(&key)) {
+                for (cid, _) in list {
+                    if cid == &member.session_id
+                        || claimed.contains(cid)
+                        || linked_ids.contains(cid)
+                    {
+                        continue;
+                    }
+                    let Some(path) = find_project_jsonl(paths, cid) else {
+                        continue;
+                    };
+                    if let ContentState::Ready(snapshot) =
+                        session_link::read_content_snapshot(&path, cid)
+                    {
+                        if snapshot.normalized.total_digest == digest {
+                            replacement = Some(cid.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(cid) = replacement.clone() {
+                claimed.insert(cid.clone());
+                report.relinked += 1;
+                fixes.push(LinkMemberFix {
+                    group_id: group.id.clone(),
+                    member_id: member.member_id.clone(),
+                    expected_session_id: member.session_id.clone(),
+                    session_id: Some(cid),
+                });
+            } else if old_digest.is_none() {
+                // 正文已不可验证（被 dedup 删除或文件丢失）才置失效；只要正文仍完整，
+                // 该成员仍可作为只读来源参与同步，是否可用交给预览按目标有效性判定。
+                report.superseded += 1;
+                fixes.push(LinkMemberFix {
+                    group_id: group.id.clone(),
+                    member_id: member.member_id.clone(),
+                    expected_session_id: member.session_id.clone(),
+                    session_id: None,
+                });
+            }
+        }
+    }
+
+    if fixes.is_empty() {
+        return report;
+    }
+    // 只改关联元数据（成员换绑/失效），不碰任何会话正文与数据库行。
+    let _ = session_link::with_link_store_write(paths, |store| {
+        for fix in &fixes {
+            let Some(group) = store
+                .groups
+                .iter_mut()
+                .find(|group| group.id == fix.group_id)
+            else {
+                continue;
+            };
+            let Some(member) = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == fix.member_id)
+            else {
+                continue;
+            };
+            // 并发写入后已换绑/失效的成员不再按旧快照修复。
+            if member.state != MemberState::Active || member.session_id != fix.expected_session_id {
+                continue;
+            }
+            match fix.session_id.as_deref() {
+                Some(session_id) => member.session_id = session_id.to_string(),
+                None => member.state = MemberState::Superseded,
+            }
+        }
+        Ok(())
+    });
+    report
+}
+
 /// 会话行是否仍归属该成员账号（行被删除或改归属即成员失效，design §5）。
 fn member_row_owned_by(paths: &SessionPaths, member: &LinkMember) -> bool {
     session_row_owner(paths, &member.session_id).is_some_and(|owner| owner == member.uid)
@@ -2317,27 +2591,6 @@ fn member_summary(member: Option<&LinkMember>) -> Value {
     }
 }
 
-/// 成员在预览时刻的内容绑定（不可验证时摘要留空，判定必然为 unknown）。
-fn member_binding(member: &LinkMember, content: &ContentState) -> PreviewMemberBinding {
-    let (raw_digest, normalized_digest, record_count) = match content {
-        ContentState::Ready(snapshot) => (
-            snapshot.full_digest.clone(),
-            snapshot.normalized.total_digest.clone(),
-            snapshot.normalized.record_count,
-        ),
-        _ => (String::new(), String::new(), 0),
-    };
-    PreviewMemberBinding {
-        member_id: member.member_id.clone(),
-        account_id: member.account_id.clone(),
-        uid: member.uid.clone(),
-        session_id: member.session_id.clone(),
-        raw_digest,
-        normalized_digest,
-        record_count,
-    }
-}
-
 /// 由实时状态组装预览绑定（预览与执行前核对共用同一份装配逻辑）。
 // 参数都是本次绑定的显式输入（含归档状态），与复制侧同口径不做结构装箱。
 #[allow(clippy::too_many_arguments)]
@@ -2355,8 +2608,8 @@ fn live_preview_binding(
         variant: group.variant,
         group_id: group.id.clone(),
         group_fingerprint: session_link::group_fingerprint(group),
-        source: member_binding(source_member, source_content),
-        target: member_binding(target_member, target_content),
+        source: session_link::preview_member_binding(source_member, source_content),
+        target: session_link::preview_member_binding(target_member, target_content),
         baseline_ref: session_link::find_pair_base(
             group,
             &source_member.member_id,
@@ -2374,7 +2627,9 @@ fn live_preview_binding(
 
 /// 预览「当前账号 → 目标账号」可同步的关联组（design §6）。
 ///
-/// 只处理双方共同参与的组，不涉及第三方账号；只读，不写任何会话正文。
+/// 只处理双方共同参与的组，不涉及第三方账号；不写任何会话正文或数据库行。
+/// 预览前会对历史脏关联做一次核对：仅在关联存储内把成员换绑到内容一致的存活副本，
+/// 或把正文已不可读的成员标为失效（不改变任何会话内容）。
 /// 来源身份一律取该档位登录态文件，不接受前端传入。
 pub fn session_links_preview(variant: WbVariant, target_acc: &Value) -> Result<Value, String> {
     session_links_preview_at(&SessionPaths::for_variant(variant), variant, target_acc)
@@ -2389,6 +2644,9 @@ fn session_links_preview_at(
     if target_uid.is_empty() {
         return Err("目标账号缺少 uid，无法同步会话".to_string());
     }
+    // 历史脏关联（成员 active 但会话已被折叠/清理）先做一次通用对账：
+    // 能按「同账号 + 同工作区 + 同标题 + 正文一致」换绑的换绑，否则明确置为失效。
+    let _ = reconcile_stale_link_members(paths, variant);
     let source_uid = current_user_uid_at(&paths.auth_file)
         .ok_or_else(|| "未读取到本机登录态，无法确定来源账号".to_string())?;
     if source_uid == target_uid {
@@ -2476,6 +2734,11 @@ fn session_links_preview_cross_at(
     }
     if source_variant == target_variant && source_uid == target_uid {
         return Err("来源账号与目标账号相同，无需同步会话".to_string());
+    }
+    // 两个档位各自做一次通用对账（关联存储共享，按组档位过滤，避免误处理另一档）。
+    let _ = reconcile_stale_link_members(source_paths, source_variant);
+    if target_variant != source_variant {
+        let _ = reconcile_stale_link_members(target_paths, target_variant);
     }
     // 能力探测与复制同口径：成员数据根只有国际版需要同构检查（读也依赖）。
     let mut supported = true;
@@ -2598,13 +2861,13 @@ fn preview_group_item(
     );
     let source_content = member_content_state(&source_paths, &source_member.session_id);
     let target_content = member_content_state(&target_paths, &target_member.session_id);
-    let rows_match = member_row_owned_by(&source_paths, source_member)
-        && member_row_owned_by(&target_paths, target_member);
-    let decision = if rows_match {
+    // 目标会话行必须有效：写入与展示都以它为准。来源只读，其会话行即使被折叠/软删，
+    // 只要正文仍可完整校验就不影响同步（正文摘要才是内容权威）。
+    let target_row_ok = member_row_owned_by(&target_paths, target_member);
+    let decision = if target_row_ok {
         session_link::decide_sync(&source_content, &target_content, &baseline)
     } else {
-        // 会话行缺失/归属异常：成员实际已失效，与内容不可验证同等对待。
-        SyncDecision::unknown("会话记录缺失或归属异常，对应的会话已失效")
+        SyncDecision::unknown("目标账号的关联会话已被删除或归属异常，请重新复制后再同步")
     };
     let reason = decision.reason.clone();
     let modes: Vec<&str> = decision
@@ -2781,12 +3044,10 @@ fn plan_sync_selection(
     ) else {
         return skip("对应的会话已失效，检查结果已失效".to_string());
     };
-    // 会话行缺失/归属异常：成员实际已失效（与预览的判定口径一致），提前拦下不写。
-    // 源行在源档读、目标行在目标档读（跨档时不同数据库）。
-    if !member_row_owned_by(source_paths, source_member)
-        || !member_row_owned_by(paths, target_member)
-    {
-        return skip("会话记录缺失或归属异常，检查结果已失效".to_string());
+    // 只校验目标行：目标行决定写入对象与展示归属，必须仍然有效。
+    // 来源只读，软删/折叠的源会话只要正文可校验仍可作为同步来源（与预览口径一致）。
+    if !member_row_owned_by(paths, target_member) {
+        return skip("目标会话记录已被删除或归属异常，检查结果已失效".to_string());
     }
     // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
     let source_content = member_content_state(source_paths, &source_member.session_id);
@@ -4996,10 +5257,16 @@ mod tests {
     }
 
     fn body_text(cid: &str) -> String {
+        body_text_with(cid, "你好")
+    }
+
+    /// 带独特正文的会话：仅内容去重（复制/折叠）相关用例需要用它区分互不相同的会话，
+    /// 避免所有夹具都因「除自身 id 外逐字相同」被正确判成同一份内容。
+    fn body_text_with(cid: &str, marker: &str) -> String {
         format!(
             "{}\n{}\n",
-            json!({"type": "user", "sessionId": cid, "text": "你好"}),
-            json!({"type": "assistant", "sessionId": cid, "text": "hi"})
+            json!({"type": "user", "sessionId": cid, "text": marker}),
+            json!({"type": "assistant", "sessionId": cid, "text": format!("{marker}-reply")})
         )
     }
 
@@ -5583,7 +5850,7 @@ mod tests {
     fn batch_copy_cleans_each_backup_before_next_item() {
         let env = ready_env("batch-cleanup");
         env.add_session("sess-2", "uid-a", "标题二");
-        env.add_body("sess-2", &body_text("sess-2"));
+        env.add_body("sess-2", &body_text_with("sess-2", "第二个会话独有内容"));
 
         let report = copy(&env, "uid-b", &["sess-1", "sess-2"]);
         assert_eq!(report["copied"].as_array().unwrap().len(), 2, "{report}");
@@ -5782,7 +6049,7 @@ mod tests {
     fn same_title_independent_sessions_stay_separate() {
         let env = ready_env("same-title");
         env.add_session("sess-2", "uid-a", "标题一");
-        env.add_body("sess-2", &body_text("sess-2"));
+        env.add_body("sess-2", &body_text_with("sess-2", "同标题但正文不同"));
 
         let report = copy(&env, "uid-b", &["sess-1", "sess-2"]);
         assert_eq!(report["copied"].as_array().unwrap().len(), 2);
@@ -6002,7 +6269,7 @@ mod tests {
     fn copy_report_carries_copied_already_linked_and_errors_together() {
         let env = ready_env("contract");
         env.add_session("sess-2", "uid-a", "标题二");
-        env.add_body("sess-2", &body_text("sess-2"));
+        env.add_body("sess-2", &body_text_with("sess-2", "契约用例的独立内容"));
 
         let first = copy(&env, "uid-b", &["sess-1", "sess-2"]);
         assert_eq!(first["copied"].as_array().unwrap().len(), 2);
@@ -7232,7 +7499,8 @@ mod tests {
     }
 
     /// 跨档预览：复制建组后判 identical；源追加 → fastForward；两边分别追加 → diverge；
-    /// 源行删除 → unknown。内容与标题按成员档位读取（源读 CN、目标读 AI）。
+    /// 源行删除但正文仍在 → 仍可判定（来源只读）；目标行删除 → unknown。
+    /// 内容与标题按成员档位读取（源读 CN、目标读 AI）。
     #[test]
     fn cross_preview_verdicts_follow_member_content() {
         let env = CrossEnv::new("preview");
@@ -7304,14 +7572,156 @@ mod tests {
         assert_eq!(item["extraB"], 2);
         assert_eq!(item["availableModes"][0], "overwrite");
 
-        // 源行删除 → 成员失效，判定 unknown 且不可执行。
+        // 源行被删除（正文仍在）→ 来源只读，仍可继续判定并给出覆盖动作；
+        // 否则「折叠/清理把源会话藏起来」会让整组永久无法同步。
         env.delete_session(WbVariant::Cn, "sess-1");
         let fourth = preview();
         let item = &fourth["groups"][0];
+        assert_eq!(item["verdict"], "diverge");
+        assert_eq!(item["availableModes"][0], "overwrite");
+        assert!(item["previewToken"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()));
+
+        // 目标行被删除 → 没有可写入/可展示的对象，必须 unknown 且不可执行。
+        env.delete_session(WbVariant::Ai, &new_id);
+        let fifth = preview();
+        let item = &fifth["groups"][0];
         assert_eq!(item["verdict"], "unknown");
         assert_eq!(item["defaultChecked"], false);
         assert!(item["availableModes"].as_array().unwrap().is_empty());
         assert!(item.get("previewToken").is_none());
+        assert!(
+            item["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("目标账号")),
+            "应明确指出目标会话失效：{}",
+            item["reason"]
+        );
+    }
+
+    /// 历史脏关联的通用对账：同账号存在正文完全一致的存活会话 → 原地换绑；
+    /// 找不到可证明一致的副本 → 成员置为失效，而不是继续伪装成 active。
+    #[test]
+    fn stale_link_member_relinks_or_supersedes_by_content() {
+        let env = CrossEnv::new("relink-stale");
+        env.create_db(WbVariant::Cn, "");
+        env.create_edge_db(WbVariant::Cn);
+        for (id, uid, title) in [
+            ("old", "uid-a", "标题一"),
+            ("keep", "uid-a", "标题一"),
+            ("orphan", "uid-c", "标题二"),
+            ("gone", "uid-d", "标题四"),
+            ("target", "uid-b", "标题三"),
+        ] {
+            env.add_session(WbVariant::Cn, id, uid, title);
+        }
+        env.add_body(WbVariant::Cn, "old", &body_text("old"));
+        env.add_body(WbVariant::Cn, "keep", &body_text("keep"));
+        env.add_body(
+            WbVariant::Cn,
+            "orphan",
+            "{\"type\":\"user\",\"sessionId\":\"orphan\",\"text\":\"only-here\"}\n",
+        );
+
+        // 模拟折叠：行软删、正文保留。
+        let conn = Connection::open(env.paths(WbVariant::Cn).workbuddy_db()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET deleted_at = 1 WHERE id IN ('old','orphan','gone')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let paths = env.paths(WbVariant::Cn);
+        session_link::with_link_store_write(&paths, |store| {
+            store.groups.push(LinkGroup {
+                id: "g-1".to_string(),
+                variant: WbVariant::Cn,
+                created_at: 1,
+                members: vec![
+                    LinkMember {
+                        member_id: "m-old".to_string(),
+                        account_id: None,
+                        uid: "uid-a".to_string(),
+                        session_id: "old".to_string(),
+                        variant: None,
+                        state: MemberState::Active,
+                        linked_at: 1,
+                        last_synced_at: None,
+                    },
+                    LinkMember {
+                        member_id: "m-orphan".to_string(),
+                        account_id: None,
+                        uid: "uid-c".to_string(),
+                        session_id: "orphan".to_string(),
+                        variant: None,
+                        state: MemberState::Active,
+                        linked_at: 1,
+                        last_synced_at: None,
+                    },
+                    LinkMember {
+                        member_id: "m-gone".to_string(),
+                        account_id: None,
+                        uid: "uid-d".to_string(),
+                        session_id: "gone".to_string(),
+                        variant: None,
+                        state: MemberState::Active,
+                        linked_at: 1,
+                        last_synced_at: None,
+                    },
+                    LinkMember {
+                        member_id: "m-target".to_string(),
+                        account_id: None,
+                        uid: "uid-b".to_string(),
+                        session_id: "target".to_string(),
+                        variant: None,
+                        state: MemberState::Active,
+                        linked_at: 1,
+                        last_synced_at: None,
+                    },
+                ],
+                pair_bases: Vec::new(),
+            });
+            Ok(())
+        })
+        .unwrap();
+
+        let report = reconcile_stale_link_members(&paths, WbVariant::Cn);
+        assert_eq!(report.relinked, 1);
+        assert_eq!(report.superseded, 1);
+
+        let StoreState::Ready(store) = session_link::load_store(&paths) else {
+            panic!("关联存储应可用");
+        };
+        let group = &store.groups[0];
+        let old = group
+            .members
+            .iter()
+            .find(|member| member.member_id == "m-old")
+            .unwrap();
+        assert_eq!(old.session_id, "keep", "内容一致应原地换绑到存活副本");
+        assert_eq!(old.state, MemberState::Active);
+        let orphan = group
+            .members
+            .iter()
+            .find(|member| member.member_id == "m-orphan")
+            .unwrap();
+        assert_eq!(
+            orphan.state,
+            MemberState::Active,
+            "正文仍完整时保留为只读来源，不强行失效"
+        );
+        let gone = group
+            .members
+            .iter()
+            .find(|member| member.member_id == "m-gone")
+            .unwrap();
+        assert_eq!(
+            gone.state,
+            MemberState::Superseded,
+            "正文不可读的成员必须明确失效"
+        );
     }
 
     /// 跨档预览入口也覆盖同档组（两个国内版账号）：判定路径一致，报告不带档位字段。

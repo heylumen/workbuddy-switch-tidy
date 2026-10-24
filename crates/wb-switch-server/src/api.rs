@@ -9,8 +9,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Query, RawQuery};
-use axum::http::{header, StatusCode, Uri};
+use axum::extract::{Query, RawQuery, Request};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -33,7 +34,7 @@ static RUNNING_CACHE: Mutex<Option<(Instant, bool, WbVariant)>> = Mutex::new(Non
 fn cached_workbuddy_running(variant: WbVariant) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let mut cache = RUNNING_CACHE.lock().unwrap();
+        let mut cache = config::lock_unpoison(&RUNNING_CACHE);
         if let Some((t, v, cached_variant)) = cache.as_ref() {
             if *cached_variant == variant && t.elapsed() < Duration::from_secs(3) {
                 return *v;
@@ -224,6 +225,94 @@ pub fn router() -> Router {
             get(api_update_config).post(api_save_update_config),
         )
         .fallback(static_handler)
+        // 防 DNS rebinding：仅接受回环 Host / Origin。桌面 Tauri IPC 不经过此层。
+        .layer(middleware::from_fn(local_only))
+}
+
+/// 仅允许本机回环访问的中间件。
+///
+/// 绑定 127.0.0.1 并不能防 DNS rebinding：恶意页面可把自己的域名解析到回环地址，
+/// 浏览器会视为同源并带上攻击者 Origin。这里同时校验 `Host` 与 `Origin`：
+/// - 缺少 Host（非浏览器客户端）放行，避免破坏 CLI/测试；
+/// - 出现非回环 Host/Origin 一律 403。
+async fn local_only(req: Request, next: Next) -> Response {
+    if !request_is_loopback(&req) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "ok": false, "error": "仅允许本机回环访问" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn request_is_loopback(req: &Request) -> bool {
+    let host = header_text(req.headers(), header::HOST);
+    if host.is_some_and(|value| !is_loopback_authority(value)) {
+        return false;
+    }
+    let origin = header_text(req.headers(), header::ORIGIN);
+    if origin.is_some_and(|value| !is_loopback_origin(value)) {
+        return false;
+    }
+    true
+}
+
+fn header_text(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// `host[:port]` 或 `[ipv6][:port]` 是否为回环地址。
+fn is_loopback_authority(authority: &str) -> bool {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return false;
+    }
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((inside, after)) = rest.split_once(']') else {
+            return false;
+        };
+        // 右括号后只能是空或 `:纯数字端口`，防止 `[::1]evil.com` 这类伪造通过。
+        if !after.is_empty()
+            && !after
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return false;
+        }
+        inside
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, port)| {
+                // 只有「冒号后全是数字」才当端口，避免把裸 IPv6 误切。
+                if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                    host
+                } else {
+                    authority
+                }
+            })
+    };
+    matches!(
+        host.trim_end_matches('.').to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+/// `scheme://host[:port]` 是否为本机回环来源；`Origin: null` 一律拒绝。
+fn is_loopback_origin(origin: &str) -> bool {
+    let origin = origin.trim();
+    if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    is_loopback_authority(authority)
 }
 
 fn json_ok(v: Value) -> Response {
@@ -836,16 +925,16 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     };
 
     {
-        let mut running = SWITCH_RUNNING.lock().unwrap();
+        let mut running = config::lock_unpoison(&SWITCH_RUNNING);
         if *running {
             return json_err("已有切换任务进行中".to_string(), StatusCode::CONFLICT);
         }
         *running = true;
-        *SWITCH_PROGRESS.lock().unwrap() = Some("开始切换账号…".to_string());
+        *config::lock_unpoison(&SWITCH_PROGRESS) = Some("开始切换账号…".to_string());
     }
 
     let progress: switch::ProgressFn = Box::new(|msg| {
-        *SWITCH_PROGRESS.lock().unwrap() = Some(msg.to_string());
+        *config::lock_unpoison(&SWITCH_PROGRESS) = Some(msg.to_string());
     });
 
     let result = tokio::task::spawn_blocking(move || {
@@ -860,7 +949,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     })
     .await;
 
-    *SWITCH_RUNNING.lock().unwrap() = false;
+    *config::lock_unpoison(&SWITCH_RUNNING) = false;
 
     match result {
         Ok(Ok(v)) => json_ok(v),
@@ -870,8 +959,8 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
 }
 
 async fn api_switch_progress() -> Response {
-    let p = SWITCH_PROGRESS.lock().unwrap().clone();
-    let running = *SWITCH_RUNNING.lock().unwrap();
+    let p = config::lock_unpoison(&SWITCH_PROGRESS).clone();
+    let running = *config::lock_unpoison(&SWITCH_RUNNING);
     json_ok(json!({ "running": running, "progress": p }))
 }
 
@@ -1694,9 +1783,14 @@ async fn api_clear_notifications() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_variant, checkin_status_item, query_variant, static_handler};
-    use axum::http::{header, StatusCode, Uri};
+    use super::{
+        body_variant, checkin_status_item, is_loopback_authority, is_loopback_origin,
+        query_variant, router, static_handler,
+    };
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode, Uri};
     use serde_json::json;
+    use tower::ServiceExt;
     use wb_switch_core::modules::variant::WbVariant;
 
     /// SPA 回退必须按**命中的文件**给 Content-Type：`/sessions` 这类前端路由曾按请求路径
@@ -1716,6 +1810,93 @@ mod tests {
                 "{path} 的 Content-Type 应为 text/html，实际 {content_type}"
             );
         }
+    }
+
+    /// DNS rebinding 防护：只认回环 Host/Origin，相似域名与私网地址都必须拒绝。
+    #[test]
+    fn loopback_host_and_origin_are_enforced() {
+        for host in [
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "localhost",
+            "LOCALHOST:3000",
+            "[::1]",
+            "[::1]:9000",
+        ] {
+            assert!(is_loopback_authority(host), "应允许回环 Host：{host}");
+        }
+        for host in [
+            "evil.com",
+            "evil.com:80",
+            "127.0.0.1.evil.com",
+            "localhost.evil.com:80",
+            "10.0.0.1:8080",
+            "[::2]:9000",
+            "[::1]evil.com",
+            "[::1]:80evil",
+            "[::1]:abc",
+            "user@127.0.0.1",
+            "",
+        ] {
+            assert!(!is_loopback_authority(host), "必须拒绝 Host：{host}");
+        }
+
+        for origin in [
+            "http://127.0.0.1:8080",
+            "https://localhost",
+            "http://[::1]:3000",
+            "HTTP://LOCALHOST:80",
+        ] {
+            assert!(is_loopback_origin(origin), "应允许回环 Origin：{origin}");
+        }
+        for origin in [
+            "null",
+            "",
+            "https://evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://user@127.0.0.1",
+            "file:///tmp/x",
+        ] {
+            assert!(!is_loopback_origin(origin), "必须拒绝 Origin：{origin}");
+        }
+    }
+
+    /// 中间件必须真正挂在路由上：外域 Host/Origin 403，回环或无 Host 放行。
+    #[tokio::test]
+    async fn router_blocks_dns_rebinding_headers() {
+        async fn status(host: Option<&str>, origin: Option<&str>) -> StatusCode {
+            let mut builder = Request::builder().uri("/api/accounts");
+            if let Some(host) = host {
+                builder = builder.header(header::HOST, host);
+            }
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            let request = builder.body(Body::empty()).unwrap();
+            router().oneshot(request).await.unwrap().status()
+        }
+
+        assert_eq!(
+            status(Some("evil.com"), None).await,
+            StatusCode::FORBIDDEN,
+            "外域 Host 必须拒绝"
+        );
+        assert_eq!(
+            status(Some("127.0.0.1"), Some("https://evil.com")).await,
+            StatusCode::FORBIDDEN,
+            "外域 Origin 必须拒绝"
+        );
+        assert_eq!(
+            status(Some("127.0.0.1"), Some("null")).await,
+            StatusCode::FORBIDDEN,
+            "Origin: null 必须拒绝"
+        );
+        // 回环 Host/Origin 与「无 Host」的非浏览器客户端放行（不应是 403）。
+        assert_ne!(
+            status(Some("127.0.0.1:3000"), Some("http://127.0.0.1:3000")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_ne!(status(None, None).await, StatusCode::FORBIDDEN);
     }
 
     /// 缺省档位必须与改造前一致（不传 variant 即国内版）。

@@ -4,9 +4,17 @@ import { ChevronRight, CircleAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type {
   SessionLinkPreviewGroup,
@@ -45,7 +53,10 @@ export const VERDICT_LABEL: Record<SessionSyncVerdict, string> = {
   unknown: "无法确认",
 };
 
-export const VERDICT_BADGE: Record<SessionSyncVerdict, "success" | "warning" | "outline" | "secondary"> = {
+export const VERDICT_BADGE: Record<
+  SessionSyncVerdict,
+  "success" | "warning" | "outline" | "secondary"
+> = {
   fastForward: "success",
   diverge: "warning",
   ahead: "warning",
@@ -89,7 +100,9 @@ export function LinksSkeleton() {
 }
 
 /** 可勾选的模式：判定只允许一个模式，取后端给出的第一个。 */
-export function primaryMode(group: SessionLinkPreviewGroup): SessionSyncMode | null {
+export function primaryMode(
+  group: SessionLinkPreviewGroup,
+): SessionSyncMode | null {
   return group.availableModes.length > 0 ? group.availableModes[0] : null;
 }
 
@@ -112,6 +125,18 @@ export function isActionable(group: SessionLinkPreviewGroup): boolean {
 /** 可直接同步项：全选只作用于这类会话，覆盖必须单独勾选。 */
 export function isDirectlySyncable(group: SessionLinkPreviewGroup): boolean {
   return isActionable(group) && primaryMode(group) === "fastForward";
+}
+
+/**
+ * 仅归档项：有凭据、无正文模式、后端授权 statusOnly。
+ *
+ * 单独给「全选归档」用：这类项默认不勾选（防误操作），会话多时逐项翻找成本高；
+ * 覆盖模式（overwrite）即使带 archiveAction 也不属于此类，绝不被批量选中。
+ */
+export function isArchiveOnlySyncable(group: SessionLinkPreviewGroup): boolean {
+  return (
+    isActionable(group) && primaryMode(group) === null && archiveOnly(group)
+  );
 }
 
 /**
@@ -149,11 +174,18 @@ export function buildSelections(
     if (!group.previewToken) return [];
     // 正文模式优先：有正文写入就提交该模式，归档作为它的副作用一并由后端处理。
     const mode = primaryMode(group);
-    if (mode) return [{ groupId: group.groupId, previewToken: group.previewToken, mode }];
+    if (mode)
+      return [
+        { groupId: group.groupId, previewToken: group.previewToken, mode },
+      ];
     // 没有正文模式时，仅同步归档才是可提交的独立动作。
     if (archiveOnly(group)) {
       return [
-        { groupId: group.groupId, previewToken: group.previewToken, mode: "statusOnly" as const },
+        {
+          groupId: group.groupId,
+          previewToken: group.previewToken,
+          mode: "statusOnly" as const,
+        },
       ];
     }
     return [];
@@ -161,7 +193,10 @@ export function buildSelections(
 }
 
 /** 卡片摘要句：一句人话说清发生了什么；条数与原始原因收进「查看详情」。 */
-export function summarySentence(group: SessionLinkPreviewGroup, targetLabel: string): string {
+export function summarySentence(
+  group: SessionLinkPreviewGroup,
+  targetLabel: string,
+): string {
   // 只归档项：正文判定会说「无需同步/本次不同步」，但本次确实要改状态，必须说清。
   if (archiveOnly(group) && primaryMode(group) === null) {
     return "仅同步归档，保留正文";
@@ -172,7 +207,10 @@ export function summarySentence(group: SessionLinkPreviewGroup, targetLabel: str
 }
 
 /** 纯按正文判定给出的摘要句（不含归档补充）。 */
-function bodySummarySentence(group: SessionLinkPreviewGroup, targetLabel: string): string {
+function bodySummarySentence(
+  group: SessionLinkPreviewGroup,
+  targetLabel: string,
+): string {
   switch (group.verdict) {
     case "fastForward":
       return `将当前账号的新内容同步到「${targetLabel}」`;
@@ -183,11 +221,14 @@ function bodySummarySentence(group: SessionLinkPreviewGroup, targetLabel: string
     case "identical":
       return "无需同步";
     case "unknown":
-      return "暂时无法确认两边内容，本次不会同步";
+      // 后端已给出具体原因（来源/目标会话被删除、归属异常、基线缺失等）时直接展示，
+      // 避免所有不可同步场景都退化成同一句笼统提示。
+      return group.reason?.trim() || "暂时无法确认两边内容，本次不会同步";
   }
 }
 
-export const RECORD_COUNT_HINT = "按会话内容的条数统计，不是对话轮数；条数相同也不代表内容顺序完全一致。";
+export const RECORD_COUNT_HINT =
+  "按会话内容的条数统计，不是对话轮数；条数相同也不代表内容顺序完全一致。";
 
 /** 会话行：勾选框 + 标题 + 一句摘要 + 判定徽标 + 折叠箭头（路径 / 条数 / 原因）。 */
 export function SessionLinkCard({
@@ -224,10 +265,16 @@ export function SessionLinkCard({
         )}
         <div className="min-w-0 flex-1 space-y-0.5">
           <div className="flex items-center gap-2">
-            <span className="min-w-0 flex-1 truncate text-sm font-medium" title={group.title}>
+            <span
+              className="min-w-0 flex-1 truncate text-sm font-medium"
+              title={group.title}
+            >
               {title}
             </span>
-            <Badge variant={VERDICT_BADGE[group.verdict]} className="shrink-0 text-[10px]">
+            <Badge
+              variant={VERDICT_BADGE[group.verdict]}
+              className="shrink-0 text-[10px]"
+            >
               {VERDICT_LABEL[group.verdict]}
             </Badge>
             <CollapsibleTrigger asChild>
@@ -237,11 +284,18 @@ export function SessionLinkCard({
                 className="size-6 shrink-0 text-muted-foreground"
                 aria-label="查看详情"
               >
-                <ChevronRight className={cn("size-4 transition-transform", open && "rotate-90")} />
+                <ChevronRight
+                  className={cn(
+                    "size-4 transition-transform",
+                    open && "rotate-90",
+                  )}
+                />
               </Button>
             </CollapsibleTrigger>
           </div>
-          <p className="text-xs text-muted-foreground">{summarySentence(group, targetLabel)}</p>
+          <p className="text-xs text-muted-foreground">
+            {summarySentence(group, targetLabel)}
+          </p>
           {overwrite && (
             <p className="flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
               <CircleAlert className="mt-px size-3.5 shrink-0" />
@@ -261,7 +315,8 @@ export function SessionLinkCard({
           <TooltipTrigger asChild>
             <span className="block w-fit cursor-help" tabIndex={0}>
               {`内容条数：当前账号 ${group.recordCount.source} 条 · 目标账号 ${group.recordCount.target} 条`}
-              {group.recordCount.baseline !== null && ` · 上次一致 ${group.recordCount.baseline} 条`}
+              {group.recordCount.baseline !== null &&
+                ` · 上次一致 ${group.recordCount.baseline} 条`}
               {group.extraB > 0 && ` · 目标账号独有 ${group.extraB} 条`}
             </span>
           </TooltipTrigger>

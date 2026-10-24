@@ -169,10 +169,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init());
 
     #[cfg(desktop)]
-    if !is_screenshot_demo() {
-    }
-
-    #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,

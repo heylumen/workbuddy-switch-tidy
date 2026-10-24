@@ -17,6 +17,7 @@ use crate::modules::config::{
     WORKBUDDY_API_ENDPOINT,
 };
 use crate::modules::credit_usage;
+use crate::modules::http_response::is_unauthorized;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 use crate::modules::variant::WbVariant;
 
@@ -363,28 +364,6 @@ fn is_success(response: &Value) -> bool {
                 && response.get("success").and_then(Value::as_bool) != Some(false)
         }
     }
-}
-
-fn is_unauthorized(response: &Value) -> bool {
-    let code = response_code(response).unwrap_or(-1);
-    // 网关 WAF 10085 是客户端指纹拦截，不是 token 过期；刷新无效。
-    if code == 10085 {
-        return false;
-    }
-    if code == 401 || code == 403 {
-        return true;
-    }
-    let message = response
-        .get("message")
-        .or_else(|| response.get("msg"))
-        .or_else(|| response.get("data").and_then(|value| value.get("message")))
-        .or_else(|| response.get("data").and_then(|value| value.get("msg")))
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_lowercase();
-    ["unauthorized", "401", "登录", "失效", "过期", "token"]
-        .iter()
-        .any(|keyword| message.contains(keyword))
 }
 
 fn is_transport_error(response: &Value) -> bool {
@@ -1916,6 +1895,9 @@ mod humanize_error_tests {
 
     #[test]
     fn informative_message_is_kept() {
-        assert_eq!(humanize_error(500, Some("余额服务暂不可用")), "余额服务暂不可用");
+        assert_eq!(
+            humanize_error(500, Some("余额服务暂不可用")),
+            "余额服务暂不可用"
+        );
     }
 }

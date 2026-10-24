@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildSelections,
   isActionable,
+  isArchiveOnlySyncable,
   isDirectlySyncable,
   primaryMode,
   shouldDefaultSelect,
@@ -41,7 +42,11 @@ function group(
 
 describe("isActionable", () => {
   it("有正文模式且有凭据时可勾选", () => {
-    expect(isActionable(group({ availableModes: ["fastForward"], previewToken: "t" }))).toBe(true);
+    expect(
+      isActionable(
+        group({ availableModes: ["fastForward"], previewToken: "t" }),
+      ),
+    ).toBe(true);
   });
 
   it("只归档项（模式为空 + archiveAction）有凭据时可勾选", () => {
@@ -96,38 +101,96 @@ describe("buildSelections", () => {
 describe("模式优先级与全选口径不变", () => {
   it("primaryMode 在模式为空时仍返回 null", () => {
     expect(primaryMode(group({ archiveAction: "statusOnly" }))).toBeNull();
-    expect(primaryMode(group({ availableModes: ["overwrite"] }))).toBe("overwrite");
+    expect(primaryMode(group({ availableModes: ["overwrite"] }))).toBe(
+      "overwrite",
+    );
   });
 
   it("全选仍只作用于 fastForward", () => {
-    expect(isDirectlySyncable(group({ availableModes: ["fastForward"], previewToken: "t" }))).toBe(
-      true,
-    );
     expect(
-      isDirectlySyncable(group({ availableModes: [], archiveAction: "statusOnly", previewToken: "t" })),
+      isDirectlySyncable(
+        group({ availableModes: ["fastForward"], previewToken: "t" }),
+      ),
+    ).toBe(true);
+    expect(
+      isDirectlySyncable(
+        group({
+          availableModes: [],
+          archiveAction: "statusOnly",
+          previewToken: "t",
+        }),
+      ),
     ).toBe(false);
-    expect(isDirectlySyncable(group({ availableModes: ["overwrite"], previewToken: "t" }))).toBe(
-      false,
-    );
+    expect(
+      isDirectlySyncable(
+        group({ availableModes: ["overwrite"], previewToken: "t" }),
+      ),
+    ).toBe(false);
+  });
+
+  it("归档全选只包含纯归档项，覆盖与正文同步都不进", () => {
+    expect(
+      isArchiveOnlySyncable(
+        group({
+          availableModes: [],
+          archiveAction: "statusOnly",
+          previewToken: "t",
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isArchiveOnlySyncable(
+        group({
+          availableModes: ["fastForward"],
+          archiveAction: "statusOnly",
+          previewToken: "t",
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isArchiveOnlySyncable(
+        group({
+          availableModes: ["overwrite"],
+          archiveAction: "statusOnly",
+          previewToken: "t",
+        }),
+      ),
+    ).toBe(false);
+    // 没有预览凭据时后端不会执行，不能批量勾选。
+    expect(
+      isArchiveOnlySyncable(
+        group({ availableModes: [], archiveAction: "statusOnly" }),
+      ),
+    ).toBe(false);
   });
 });
 
 describe("summarySentence", () => {
   it("只归档（identical）说明仅同步归档、保留正文", () => {
-    expect(summarySentence(group({ verdict: "identical", archiveAction: "statusOnly" }), "账号B")).toBe(
-      "仅同步归档，保留正文",
-    );
+    expect(
+      summarySentence(
+        group({ verdict: "identical", archiveAction: "statusOnly" }),
+        "账号B",
+      ),
+    ).toBe("仅同步归档，保留正文");
   });
 
   it("只归档（ahead）同样说明仅同步归档，不再是「本次不同步」", () => {
-    expect(summarySentence(group({ verdict: "ahead", archiveAction: "statusOnly" }), "账号B")).toBe(
-      "仅同步归档，保留正文",
-    );
+    expect(
+      summarySentence(
+        group({ verdict: "ahead", archiveAction: "statusOnly" }),
+        "账号B",
+      ),
+    ).toBe("仅同步归档，保留正文");
   });
 
   it("快进附带归档时保留正文句并写明一并归档", () => {
     const sentence = summarySentence(
-      group({ verdict: "fastForward", availableModes: ["fastForward"], archiveAction: "statusOnly" }),
+      group({
+        verdict: "fastForward",
+        availableModes: ["fastForward"],
+        archiveAction: "statusOnly",
+      }),
       "账号B",
     );
     expect(sentence).toContain("将当前账号的新内容同步到「账号B」");
@@ -135,14 +198,34 @@ describe("summarySentence", () => {
   });
 
   it("没有归档动作时文案与旧行为逐字一致", () => {
-    expect(summarySentence(group({ verdict: "identical" }), "账号B")).toBe("无需同步");
-    expect(summarySentence(group({ verdict: "ahead" }), "账号B")).toBe("保留目标内容，本次不同步");
-    expect(
-      summarySentence(group({ verdict: "fastForward", availableModes: ["fastForward"] }), "账号B"),
-    ).toBe("将当前账号的新内容同步到「账号B」");
-    expect(summarySentence(group({ verdict: "unknown" }), "账号B")).toBe(
-      "暂时无法确认两边内容，本次不会同步",
+    expect(summarySentence(group({ verdict: "identical" }), "账号B")).toBe(
+      "无需同步",
     );
+    expect(summarySentence(group({ verdict: "ahead" }), "账号B")).toBe(
+      "保留目标内容，本次不同步",
+    );
+    expect(
+      summarySentence(
+        group({ verdict: "fastForward", availableModes: ["fastForward"] }),
+        "账号B",
+      ),
+    ).toBe("将当前账号的新内容同步到「账号B」");
+    // 后端没有给出原因时保留兜底文案，避免空白提示。
+    expect(
+      summarySentence(group({ verdict: "unknown", reason: "" }), "账号B"),
+    ).toBe("暂时无法确认两边内容，本次不会同步");
+  });
+
+  it("unknown 有具体原因时直接展示原因，不再笼统提示", () => {
+    expect(
+      summarySentence(
+        group({
+          verdict: "unknown",
+          reason: "目标账号的关联会话已被删除或归属异常，请重新复制后再同步",
+        }),
+        "账号B",
+      ),
+    ).toBe("目标账号的关联会话已被删除或归属异常，请重新复制后再同步");
   });
 });
 
@@ -222,4 +305,3 @@ describe("shouldDefaultSelect (#165 方案 3)", () => {
     expect(shouldDefaultSelect(ffUnchecked, true)).toBe(false);
   });
 });
-

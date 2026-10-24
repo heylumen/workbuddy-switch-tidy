@@ -1132,6 +1132,43 @@ pub fn active_member_for<'a>(group: &'a LinkGroup, uid: &str) -> Option<&'a Link
         .find(|member| member.uid == uid && member.state == MemberState::Active)
 }
 
+/// 所有仍被 active 关联成员引用的会话 id（跨档位共享同一关联存储）。
+///
+/// 供会话折叠/去重前做保护：这些会话一旦被软删或删正文，关联组会立刻变成
+/// 「会话记录缺失」而无法同步。存储不可用时返回空集合（由调用方保持原行为）。
+pub fn active_session_ids(paths: &SessionPaths) -> std::collections::HashSet<String> {
+    match load_store(paths) {
+        StoreState::Ready(store) => store
+            .groups
+            .iter()
+            .flat_map(|group| group.members.iter())
+            .filter(|member| member.state == MemberState::Active)
+            .map(|member| member.session_id.clone())
+            .collect(),
+        _ => std::collections::HashSet::new(),
+    }
+}
+
+/// 删除前置保护：关联存储**存在但不可用**时必须报错而不是当成空集合，
+/// 否则折叠/去重会误删仍被关联引用的会话（数据不可恢复）。
+pub fn protected_session_ids(
+    paths: &SessionPaths,
+) -> Result<std::collections::HashSet<String>, String> {
+    match load_store(paths) {
+        StoreState::Ready(store) => Ok(store
+            .groups
+            .iter()
+            .flat_map(|group| group.members.iter())
+            .filter(|member| member.state == MemberState::Active)
+            .map(|member| member.session_id.clone())
+            .collect()),
+        StoreState::Missing => Ok(std::collections::HashSet::new()),
+        StoreState::Unavailable(reason) => Err(format!(
+            "关联存储不可用（{reason}），为避免误删关联会话已中止"
+        )),
+    }
+}
+
 /// 组内按 (uid, sessionId) 定位成员（任意状态）。
 pub fn find_member<'a>(
     group: &'a LinkGroup,
@@ -1322,6 +1359,29 @@ pub struct PreviewMemberBinding {
     pub normalized_digest: String,
     /// 记录数（不称消息数）。
     pub record_count: usize,
+}
+
+/// 成员在预览时刻的内容绑定（不可验证时摘要留空，判定必然为 unknown）。
+///
+/// WorkBuddy 与 VS Code/CN IDE 共用同一装配口径，避免两侧的预览门禁字段漂移。
+pub fn preview_member_binding(member: &LinkMember, content: &ContentState) -> PreviewMemberBinding {
+    let (raw_digest, normalized_digest, record_count) = match content {
+        ContentState::Ready(snapshot) => (
+            snapshot.full_digest.clone(),
+            snapshot.normalized.total_digest.clone(),
+            snapshot.normalized.record_count,
+        ),
+        _ => (String::new(), String::new(), 0),
+    };
+    PreviewMemberBinding {
+        member_id: member.member_id.clone(),
+        account_id: member.account_id.clone(),
+        uid: member.uid.clone(),
+        session_id: member.session_id.clone(),
+        raw_digest,
+        normalized_digest,
+        record_count,
+    }
 }
 
 /// 预览凭据绑定的全部版本信息：身份、组与基线版本、双方原始正文摘要、判定结果。
@@ -2231,6 +2291,46 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn active_session_ids_only_returns_active_members_across_groups() {
+        let dir = TempDir::new("active-sessions");
+        let paths = temp_paths(&dir);
+        with_link_store_write(&paths, |store| {
+            store.groups.push(group_with_members(
+                "g-1",
+                vec![
+                    member("uid-a", "sess-active", MemberState::Active),
+                    member("uid-a", "sess-superseded", MemberState::Superseded),
+                    member("uid-b", "sess-stale", MemberState::Stale),
+                ],
+            ));
+            store.groups.push(group_with_members(
+                "g-2",
+                vec![member("uid-c", "sess-active-2", MemberState::Active)],
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        let ids = active_session_ids(&paths);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("sess-active"));
+        assert!(ids.contains("sess-active-2"));
+        assert!(!ids.contains("sess-superseded"), "已替换成员不参与保护");
+        assert!(!ids.contains("sess-stale"), "失效成员不参与保护");
+
+        // 存储不存在 = 从未建立关联：允许删除，保护集合为空。
+        let missing = temp_paths(&TempDir::new("active-sessions-missing"));
+        assert!(active_session_ids(&missing).is_empty());
+        assert!(protected_session_ids(&missing).unwrap().is_empty());
+
+        // 主表缺失但残留基线 = 关联存储不可用：必须报错，不能当成「没有关联」继续删会话。
+        let broken = temp_paths(&TempDir::new("active-sessions-broken"));
+        let normalized = normalize_jsonl("{\"a\":1}\n", "sess").unwrap();
+        save_baseline(&broken, "orphan-baseline", &normalized).unwrap();
+        assert!(protected_session_ids(&broken).is_err());
     }
 
     #[test]

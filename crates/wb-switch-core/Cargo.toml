@@ -1,6 +1,6 @@
 [package]
 name = "wb-switch-core"
-version = "1.0.11"
+version = "1.0.12"
 edition = "2021"
 description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），不依赖 Tauri，可被桌面端与 HTTP server 复用"
 
@@ -8,10 +8,10 @@ description = "wb-switch 核心逻辑（账号/切换/会话/签到/更新），
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.44.2", features = ["rt", "sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
-dirs = "5"
-chrono = "0.4"
+dirs = "7"
+chrono = "0.4.45"
 # backup：会话同步前用 SQLite 在线备份 API 生成一致快照，不直接 cp 活动库。
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # 会话关联的内容版本（归一化行摘要 / 全文摘要）。不能改用 DefaultHasher：跨进程

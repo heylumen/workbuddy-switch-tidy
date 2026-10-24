@@ -694,7 +694,7 @@ function AutoCheckinCard() {
                     className={PANEL_ROW}
                     id="ac-keep"
                     spec={CHECKIN_NUMBER_FIELDS.keepalive_days}
-                    description="天；0 表示每天无条件刷新"
+                    description="天；默认 7，每 N 天至少保活一次并覆盖临期账号；0 表示每天全量刷新（不推荐）"
                     value={numDraft.keepalive_days ?? String(cfg.keepalive_days)}
                     onChange={(text) => onNumberChange("keepalive_days", text)}
                     onCommit={(raw) => onNumberCommit("keepalive_days", raw)}

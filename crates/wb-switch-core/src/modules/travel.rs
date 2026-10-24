@@ -18,6 +18,7 @@ use crate::modules::config::{
     save_travel_cache, with_travel_cache_lock, RunFlagGuard, TRAVEL_API_PREFIX,
     WORKBUDDY_API_ENDPOINT,
 };
+use crate::modules::http_response::is_unauthorized;
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 
 static TRAVEL_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -84,22 +85,6 @@ fn build_travel_headers(account: &Value) -> HashMap<String, String> {
         format!("{WORKBUDDY_API_ENDPOINT}/profile/growth-center"),
     );
     headers
-}
-
-fn is_unauthorized(resp: &Value) -> bool {
-    let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code == 401 || code == 403 {
-        return true;
-    }
-    let msg = resp
-        .get("message")
-        .or_else(|| resp.get("msg"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
-    ["unauthorized", "401", "登录", "失效", "过期", "token"]
-        .iter()
-        .any(|k| msg.contains(k))
 }
 
 /// 发旅行接口请求；遇到未授权且存在 refresh token 时刷新一次并重试。
