@@ -74,6 +74,16 @@ export default function SessionsPage() {
     setDetailOpen(false);
     requestAnimationFrame(() => openerRef.current?.focus({ preventScroll: true }));
   }
+  // 弹窗关闭动画结束后释放详情正文与预览数据：详情对象包含每个成员的正文预览，
+  // 长时间保留会让“关掉弹窗后内存不回收”的体感非常明显。重新打开会走加载流程。
+  useEffect(() => {
+    if (detailOpen) return;
+    const timer = window.setTimeout(() => {
+      setDetail(null);
+      setDetailError(null);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [detailOpen]);
   function openDetail(id: string) {
     openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setDetail(null);

@@ -3244,8 +3244,10 @@ fn plan_sync_selection(
         };
     }
     // 判定非 unknown 必然双方正文可验证（decide_sync 的前置条件），这里仍然显式兜底。
+    // 预览绑定已在上方用只读引用构造完成；这里按值取出快照，避免把整份正文再克隆进
+    // 写入计划（大会话下两份正文的克隆会显著抬高写入阶段峰值内存）。
     let (ContentState::Ready(source_snapshot), ContentState::Ready(target_snapshot)) =
-        (&source_content, &target_content)
+        (source_content, target_content)
     else {
         return skip("双方内容不可验证，检查结果已失效".to_string());
     };
@@ -3301,8 +3303,8 @@ fn plan_sync_selection(
             verdict: decision.verdict,
             source_member: source_member.clone(),
             target_member: target_member.clone(),
-            source_snapshot: source_snapshot.clone(),
-            target_snapshot: target_snapshot.clone(),
+            source_snapshot,
+            target_snapshot,
             incoming_text,
             incoming,
             old_baseline_ref: live.baseline_ref,
