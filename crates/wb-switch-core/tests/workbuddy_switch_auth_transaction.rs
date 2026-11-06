@@ -74,7 +74,7 @@ fn worker() {
             let result = switch::switch_account(Some(&callback), "fixture", false, false, &[], &[]);
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),
-                "{result:?}"
+                "busy switch must fail before any side effect"
             );
             assert_eq!(
                 calls.load(Ordering::SeqCst),
