@@ -175,6 +175,11 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
 /// key = (路径, 文件长度, mtime nanos)；只缓存可解析结果的摘要与行摘要，
 /// 不保存正文文本。命中后返回的  为空，仅可用于判定/统计，
 /// 需要正文的写入或预览路径必须改用 []。
+/// 摘要缓存的内存边界：条目数 + 单文件大小/记录数，避免长会话把进程内存撑大。
+const SUMMARY_CACHE_MAX_ENTRIES: usize = 16;
+const SUMMARY_CACHE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SUMMARY_CACHE_MAX_RECORDS: usize = 10_000;
+
 type SummaryKey = (PathBuf, u64, u128, String);
 type SummaryValue = (String, NormalizedContent);
 type SummaryCache = Mutex<std::collections::HashMap<SummaryKey, SummaryValue>>;
@@ -202,6 +207,10 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
     let Some(key) = summary_cache_key(path, own_session_id) else {
         return ContentState::Missing;
     };
+    // 超大文件不进缓存：单条摘要本身也要占内存，缓存收益低于风险。
+    if key.1 > SUMMARY_CACHE_MAX_FILE_BYTES {
+        return read_content_snapshot(path, own_session_id);
+    }
     if let Some(cache) = SUMMARY_CACHE.get() {
         if let Ok(guard) = cache.lock() {
             if let Some((full_digest, normalized)) = guard.get(&key) {
@@ -215,15 +224,18 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
     }
     match read_content_snapshot(path, own_session_id) {
         ContentState::Ready(snapshot) => {
-            if let Some(cache) = SUMMARY_CACHE.get() {
-                if let Ok(mut guard) = cache.lock() {
-                    if guard.len() > 512 {
-                        guard.clear();
+            let cacheable = snapshot.normalized.record_count <= SUMMARY_CACHE_MAX_RECORDS;
+            if cacheable {
+                if let Some(cache) = SUMMARY_CACHE.get() {
+                    if let Ok(mut guard) = cache.lock() {
+                        if guard.len() >= SUMMARY_CACHE_MAX_ENTRIES {
+                            guard.clear();
+                        }
+                        guard.insert(
+                            key,
+                            (snapshot.full_digest.clone(), snapshot.normalized.clone()),
+                        );
                     }
-                    guard.insert(
-                        key,
-                        (snapshot.full_digest.clone(), snapshot.normalized.clone()),
-                    );
                 }
             }
             ContentState::Ready(ContentSnapshot {

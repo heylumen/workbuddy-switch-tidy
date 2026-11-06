@@ -28,6 +28,9 @@ const REQUEST_COLLECT_LIMIT: usize = 4_000;
 
 /// 单源统计的内存缓存：以文件元数据签名判失效，避免同一进程内反复全量解析。
 static SOURCE_CACHE: OnceLock<Mutex<HashMap<String, (u64, Value)>>> = OnceLock::new();
+/// 统计缓存的内存边界：条目数与单值序列化大小；超出就不缓存。
+const SOURCE_CACHE_MAX_ENTRIES: usize = 8;
+const SOURCE_CACHE_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
 
 fn paths_signature(paths: &[(PathBuf, PathBuf)]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -719,12 +722,17 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
     let value = collector.into_value(name, paths.len());
     // 只有零解析错误的结果才缓存：瞬时 IO 失败不应被固化为长期结果。
     if value.get("parseErrors").and_then(Value::as_u64) == Some(0) {
-        if let Some(cache) = SOURCE_CACHE.get() {
-            if let Ok(mut guard) = cache.lock() {
-                if guard.len() > 32 {
-                    guard.clear();
+        let cacheable = serde_json::to_vec(&value)
+            .map(|bytes| bytes.len() <= SOURCE_CACHE_MAX_VALUE_BYTES)
+            .unwrap_or(false);
+        if cacheable {
+            if let Some(cache) = SOURCE_CACHE.get() {
+                if let Ok(mut guard) = cache.lock() {
+                    if guard.len() >= SOURCE_CACHE_MAX_ENTRIES {
+                        guard.clear();
+                    }
+                    guard.insert(cache_key, (signature, value.clone()));
                 }
-                guard.insert(cache_key, (signature, value.clone()));
             }
         }
     }
@@ -1038,19 +1046,17 @@ fn ide_source(
     // 请求指纹取**并集**：父历史只算一次（副本会把历史日期回溯性抬高），副本复制后各自
     // 追加的请求也都保留（只取「最长一份」会漏掉别的副本独有的请求）。会话标题、模型与
     // 项目归属取最完整的那份。
-    // 每个 index 只读一次：权重计算与请求并入共用同一份已解析 JSON，
-    // 避免旧实现把同一文件读两遍（IDE 源最大的 IO 放大点）。
-    let parsed: Vec<Option<Value>> = paths
+    // 峰值内存优先：权重计算逐文件读取后立即释放，不把全部 index.json 同时留在内存。
+    // 代价是后续并入请求时再读一次；IDE index 通常不大，换取更低的峰值更划算。
+    let weights: Vec<Option<(String, usize, u64)>> = paths
         .iter()
         .map(|path| {
             std::fs::read_to_string(path)
                 .ok()
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .as_ref()
+                .and_then(ide_file_weight)
         })
-        .collect();
-    let weights: Vec<Option<(String, usize, u64)>> = parsed
-        .iter()
-        .map(|value| value.as_ref().and_then(ide_file_weight))
         .collect();
     let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut lead: HashMap<&str, (usize, usize, u64)> = HashMap::new();
@@ -1100,7 +1106,11 @@ fn ide_source(
         let mut session_totals = Totals::default();
         let mut seen: HashSet<String> = HashSet::new();
         for member in members {
-            let Some(value) = parsed[*member].as_ref() else {
+            let Ok(text) = std::fs::read_to_string(&paths[*member]) else {
+                collector.note_parse_error();
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
                 collector.note_parse_error();
                 continue;
             };
