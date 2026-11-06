@@ -13,8 +13,10 @@
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use crate::modules::variant::WbVariant;
 
@@ -23,6 +25,24 @@ const REQUEST_WINDOW: usize = 500;
 /// 扫描期间明细缓存的内存硬上限；达到该值后立即裁剪到 `REQUEST_WINDOW`，
 /// 使峰值内存恒定，不随历史总量增长。
 const REQUEST_COLLECT_LIMIT: usize = 4_000;
+
+/// 单源统计的内存缓存：以文件元数据签名判失效，避免同一进程内反复全量解析。
+static SOURCE_CACHE: OnceLock<Mutex<HashMap<String, (u64, Value)>>> = OnceLock::new();
+
+fn paths_signature(paths: &[(PathBuf, PathBuf)]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (root, path) in paths {
+        path.hash(&mut hasher);
+        root.hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
@@ -575,6 +595,17 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(u64::MAX)
     });
+    let cache_key = format!("{name}|{cutoff:?}|{detail}|{roots:?}");
+    let signature = paths_signature(&paths);
+    if let Some(cache) = SOURCE_CACHE.get() {
+        if let Ok(guard) = cache.lock() {
+            if let Some((cached_sig, value)) = guard.get(&cache_key) {
+                if *cached_sig == signature {
+                    return value.clone();
+                }
+            }
+        }
+    }
     let mut seen: HashSet<(i64, u64, u64, u64, u64, String)> = HashSet::new();
 
     for (root, path) in &paths {
@@ -685,7 +716,19 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
         );
     }
 
-    collector.into_value(name, paths.len())
+    let value = collector.into_value(name, paths.len());
+    // 只有零解析错误的结果才缓存：瞬时 IO 失败不应被固化为长期结果。
+    if value.get("parseErrors").and_then(Value::as_u64) == Some(0) {
+        if let Some(cache) = SOURCE_CACHE.get() {
+            if let Ok(mut guard) = cache.lock() {
+                if guard.len() > 32 {
+                    guard.clear();
+                }
+                guard.insert(cache_key, (signature, value.clone()));
+            }
+        }
+    }
+    value
 }
 
 /// 某档位的候选 jsonl 根（顺序固定；纯函数，便于单测）。
@@ -923,9 +966,7 @@ fn ide_session_id(path: &Path) -> String {
 /// 追加——所以各份长短不一、内容并不完全相同，会话 id 也可能被重随机（插件侧
 /// `CopyIdPolicy::AlwaysNew`）。会话身份因此不能按目录名判，只能按「同一个起点请求」判。
 /// 指标里的条数/总量用于挑出最完整的那份，作为该会话的标题、模型与项目归属。
-fn ide_file_weight(path: &Path) -> Option<(String, usize, u64)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value = serde_json::from_str::<Value>(&text).ok()?;
+fn ide_file_weight(value: &Value) -> Option<(String, usize, u64)> {
     let requests = value.get("requests")?.as_array()?;
     let mut key: Option<String> = None;
     let mut count = 0usize;
@@ -997,8 +1038,20 @@ fn ide_source(
     // 请求指纹取**并集**：父历史只算一次（副本会把历史日期回溯性抬高），副本复制后各自
     // 追加的请求也都保留（只取「最长一份」会漏掉别的副本独有的请求）。会话标题、模型与
     // 项目归属取最完整的那份。
-    let weights: Vec<Option<(String, usize, u64)>> =
-        paths.iter().map(|path| ide_file_weight(path)).collect();
+    // 每个 index 只读一次：权重计算与请求并入共用同一份已解析 JSON，
+    // 避免旧实现把同一文件读两遍（IDE 源最大的 IO 放大点）。
+    let parsed: Vec<Option<Value>> = paths
+        .iter()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        })
+        .collect();
+    let weights: Vec<Option<(String, usize, u64)>> = parsed
+        .iter()
+        .map(|value| value.as_ref().and_then(ide_file_weight))
+        .collect();
     let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut lead: HashMap<&str, (usize, usize, u64)> = HashMap::new();
     for (index, weight) in weights.iter().enumerate() {
@@ -1047,11 +1100,7 @@ fn ide_source(
         let mut session_totals = Totals::default();
         let mut seen: HashSet<String> = HashSet::new();
         for member in members {
-            let Ok(text) = std::fs::read_to_string(&paths[*member]) else {
-                collector.note_parse_error();
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            let Some(value) = parsed[*member].as_ref() else {
                 collector.note_parse_error();
                 continue;
             };

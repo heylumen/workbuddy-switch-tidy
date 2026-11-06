@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::modules::config::{atomic_write, now_ms};
@@ -167,6 +168,72 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
         line_digests,
         total_digest,
     })
+}
+
+/// 正文摘要缓存：列表页反复进入时避免重复整文件解析。
+///
+/// key = (路径, 文件长度, mtime nanos)；只缓存可解析结果的摘要与行摘要，
+/// 不保存正文文本。命中后返回的  为空，仅可用于判定/统计，
+/// 需要正文的写入或预览路径必须改用 []。
+type SummaryKey = (PathBuf, u64, u128, String);
+type SummaryValue = (String, NormalizedContent);
+type SummaryCache = Mutex<std::collections::HashMap<SummaryKey, SummaryValue>>;
+
+static SUMMARY_CACHE: OnceLock<SummaryCache> = OnceLock::new();
+
+fn summary_cache_key(path: &Path, own_session_id: &str) -> Option<SummaryKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some((
+        path.to_path_buf(),
+        meta.len(),
+        mtime,
+        own_session_id.to_string(),
+    ))
+}
+
+/// 读取只用于判定/统计的正文摘要；命中缓存时不读文件，未命中则读一次并缓存。
+pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
+    let Some(key) = summary_cache_key(path, own_session_id) else {
+        return ContentState::Missing;
+    };
+    if let Some(cache) = SUMMARY_CACHE.get() {
+        if let Ok(guard) = cache.lock() {
+            if let Some((full_digest, normalized)) = guard.get(&key) {
+                return ContentState::Ready(ContentSnapshot {
+                    text: String::new(),
+                    full_digest: full_digest.clone(),
+                    normalized: normalized.clone(),
+                });
+            }
+        }
+    }
+    match read_content_snapshot(path, own_session_id) {
+        ContentState::Ready(snapshot) => {
+            if let Some(cache) = SUMMARY_CACHE.get() {
+                if let Ok(mut guard) = cache.lock() {
+                    if guard.len() > 512 {
+                        guard.clear();
+                    }
+                    guard.insert(
+                        key,
+                        (snapshot.full_digest.clone(), snapshot.normalized.clone()),
+                    );
+                }
+            }
+            ContentState::Ready(ContentSnapshot {
+                text: String::new(),
+                full_digest: snapshot.full_digest,
+                normalized: snapshot.normalized,
+            })
+        }
+        other => other,
+    }
 }
 
 /// 读取正文快照并做完整性校验；读取期间文件被改动时判定为不可验证。

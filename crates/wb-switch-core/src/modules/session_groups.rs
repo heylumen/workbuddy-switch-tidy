@@ -1047,7 +1047,12 @@ fn preview_resolved_pair(
     let paths = client.store_paths();
     let report = match client {
         SessionClient::Workbuddy => {
-            session::session_links_preview_cross(&pair.source_account, &pair.target_account)?
+            // 单对操作只读目标组，不再遍历所有相关组（性能关键路径）。
+            session::session_links_preview_pair(
+                &pair.source_account,
+                &pair.target_account,
+                &pair.group.id,
+            )?
         }
         SessionClient::CodebuddyIde => {
             let variant = scope.ok_or_else(|| "CodeBuddy IDE 缺少档位".to_string())?;
@@ -1462,7 +1467,7 @@ fn group_payload(
                 .or_else(|| member.account_id.clone())
                 .unwrap_or_else(|| member.uid.clone());
             let (title, project_label, updated_at, content) =
-                member_snapshot(client, &root, spec, group, member, cache);
+                member_snapshot(client, &root, spec, group, member, cache, !include_detail);
             let mut member = member.clone();
             // Correct legacy plugin labels from the account library; region never selects its data root.
             if client == SessionClient::VscodeExt {
@@ -1793,6 +1798,7 @@ fn member_snapshot(
     group: &LinkGroup,
     member: &LinkMember,
     cache: &mut HashMap<(String, String), Vec<Value>>,
+    summary_only: bool,
 ) -> (String, String, i64, ContentState) {
     match client {
         SessionClient::Workbuddy => {
@@ -1825,6 +1831,8 @@ fn member_snapshot(
             let member_paths = SessionPaths::for_variant(variant);
             let content = if row.is_none() {
                 ContentState::Missing
+            } else if summary_only {
+                session::member_content_summary(&member_paths, &member.session_id)
             } else {
                 session::member_content_state(&member_paths, &member.session_id)
             };

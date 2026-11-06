@@ -119,7 +119,8 @@ export default function SessionsPage() {
       if (live) setCurrentAccounts(results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []));
     });
     return () => { live = false; };
-  }, [client, selectedGroupId, detail]);
+    // 依赖只取「客户端 / 选中组 / 弹窗开关」：detail 内容变化不需要重新探测本机登录态。
+  }, [client, selectedGroupId, detailOpen]);
 
   useEffect(() => {
     if (accounts.length === 0) void fetchAll();
