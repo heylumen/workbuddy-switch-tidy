@@ -24,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -208,8 +208,9 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
         return ContentState::Missing;
     };
     // 超大文件不进缓存：单条摘要本身也要占内存，缓存收益低于风险。
+    // 即使不缓存，也用流式读取计算摘要，避免整文件读入造成峰值。
     if key.1 > SUMMARY_CACHE_MAX_FILE_BYTES {
-        return read_content_snapshot(path, own_session_id);
+        return read_content_summary_streaming(path, own_session_id);
     }
     if let Some(cache) = SUMMARY_CACHE.get() {
         if let Ok(guard) = cache.lock() {
@@ -222,7 +223,7 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
             }
         }
     }
-    match read_content_snapshot(path, own_session_id) {
+    match read_content_summary_streaming(path, own_session_id) {
         ContentState::Ready(snapshot) => {
             let cacheable = snapshot.normalized.record_count <= SUMMARY_CACHE_MAX_RECORDS;
             if cacheable {
@@ -246,6 +247,84 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
         }
         other => other,
     }
+}
+
+/// 流式读取正文摘要：逐行读取、边读边 hash，不把整份正文读进内存。
+///
+/// 与 read_content_snapshot 的判定口径一致：空正文/中间空行/非法 JSON/读取期间
+/// 文件变化都返回 Unavailable；返回的 text 恒为空，只用于判定与统计。
+fn read_content_summary_streaming(path: &Path, own_session_id: &str) -> ContentState {
+    let before = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == ErrorKind::NotFound => return ContentState::Missing,
+        Err(error) => return ContentState::Unavailable(format!("内容无法读取：{error}")),
+    };
+    let Ok(file) = File::open(path) else {
+        return ContentState::Unavailable("内容读取失败".to_string());
+    };
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut line_digests: Vec<String> = Vec::new();
+    let mut pending_empty = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return ContentState::Unavailable(format!("内容读取失败：{error}")),
+        }
+        hasher.update(&buf);
+        let mut line = &buf[..];
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        if line.is_empty() {
+            pending_empty += 1;
+            continue;
+        }
+        if pending_empty > 0 {
+            return ContentState::Unavailable(format!(
+                "第 {} 行为空，内容可能不完整",
+                line_digests.len() + 1
+            ));
+        }
+        let Ok(text) = std::str::from_utf8(line) else {
+            return ContentState::Unavailable("内容格式异常，无法读取".to_string());
+        };
+        if serde_json::from_str::<serde_json::Value>(text).is_err() {
+            return ContentState::Unavailable(format!(
+                "第 {} 行的格式无法识别，内容可能不完整",
+                line_digests.len() + 1
+            ));
+        }
+        line_digests.push(line_digest_of(
+            &text.replace(own_session_id, SESSION_ID_MARKER),
+        ));
+    }
+    let after = std::fs::metadata(path);
+    let changed = match after {
+        Ok(meta) => meta.len() != before.len() || meta.modified().ok() != before.modified().ok(),
+        Err(_) => true,
+    };
+    if changed {
+        return ContentState::Unavailable("内容在读取过程中发生变化，无法确认完整".to_string());
+    }
+    if line_digests.is_empty() {
+        return ContentState::Unavailable("内容为空".to_string());
+    }
+    ContentState::Ready(ContentSnapshot {
+        text: String::new(),
+        full_digest: to_hex(&hasher.finalize()),
+        normalized: NormalizedContent {
+            record_count: line_digests.len(),
+            total_digest: total_digest_of(&line_digests),
+            line_digests,
+        },
+    })
 }
 
 /// 读取正文快照并做完整性校验；读取期间文件被改动时判定为不可验证。
@@ -1796,6 +1875,39 @@ mod tests {
     use super::*;
 
     struct TempDir(PathBuf);
+
+    #[test]
+    fn streaming_summary_matches_full_snapshot_and_invalidates() {
+        let dir = TempDir::new("stream_summary");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            b"{\"sessionId\":\"own\",\"text\":\"a\"}\r\n{\"text\":\"b\"}\r\n",
+        )
+        .unwrap();
+        let (summary, full) = (
+            read_content_summary(&path, "own"),
+            read_content_snapshot(&path, "own"),
+        );
+        let (ContentState::Ready(summary), ContentState::Ready(full)) = (summary, full) else {
+            panic!("fixture 必须可验证");
+        };
+        assert_eq!(summary.full_digest, full.full_digest);
+        assert_eq!(summary.normalized, full.normalized);
+        assert!(summary.text.is_empty(), "摘要不得保留正文");
+
+        // 追加一行后，元数据签名变化，缓存必须失效并重新计算。
+        std::fs::write(
+            &path,
+            b"{\"sessionId\":\"own\",\"text\":\"a\"}\r\n{\"text\":\"b\"}\r\n{\"text\":\"c\"}\r\n",
+        )
+        .unwrap();
+        let ContentState::Ready(updated) = read_content_summary(&path, "own") else {
+            panic!("更新后的 fixture 必须可验证");
+        };
+        assert_eq!(updated.normalized.record_count, 3);
+        assert_ne!(updated.full_digest, summary.full_digest);
+    }
 
     impl TempDir {
         fn new(name: &str) -> Self {
