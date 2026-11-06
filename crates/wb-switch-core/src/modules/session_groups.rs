@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::modules::session::{SessionPaths, SyncSelection};
@@ -1587,7 +1588,7 @@ fn group_payload(
             "projectLabel": view.project_label,
             "updatedAt": view.updated_at,
             "recordCount": content_count(&view.content),
-            "contentPreview": content_preview(&view.content),
+            "contentPreview": preview_for_view(client, group, view),
             "contentState": content_state_name(&view.content),
             "reason": view.reason,
             "canBeSource": view.member.state == MemberState::Active && matches!(view.content, ContentState::Ready(_)),
@@ -1831,7 +1832,8 @@ fn member_snapshot(
             let member_paths = SessionPaths::for_variant(variant);
             let content = if row.is_none() {
                 ContentState::Missing
-            } else if summary_only {
+            } else if summary_only || client == SessionClient::Workbuddy {
+                // WorkBuddy 详情只需要摘要做判定；正文预览单独读文件尾部。
                 session::member_content_summary(&member_paths, &member.session_id)
             } else {
                 session::member_content_state(&member_paths, &member.session_id)
@@ -1929,6 +1931,68 @@ fn content_count(content: &ContentState) -> Option<usize> {
         ContentState::Ready(snapshot) => Some(snapshot.normalized.record_count),
         _ => None,
     }
+}
+
+/// 详情页正文预览：WorkBuddy 走“文件尾部只读”，IDE 仍用已读内容。
+fn preview_for_view(client: SessionClient, group: &LinkGroup, view: &MemberView) -> Vec<Value> {
+    if client != SessionClient::Workbuddy {
+        return content_preview(&view.content);
+    }
+    let variant = session_link::member_variant(group, &view.member);
+    tail_preview(&SessionPaths::for_variant(variant), &view.member.session_id)
+}
+
+/// 只读文件尾部 256KB，取最近 6 条可展示记录；不加载整份正文。
+fn tail_preview(paths: &SessionPaths, session_id: &str) -> Vec<Value> {
+    let Some(path) = session::find_project_jsonl(paths, session_id) else {
+        return Vec::new();
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Vec::new();
+    };
+    let len = meta.len();
+    let start = len.saturating_sub(256 * 1024);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Vec::new();
+    };
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if start > 0 {
+        // 丢掉从中间截断的第一行，避免把半条 JSON 当作记录。
+        lines.remove(0);
+    }
+    let mut recent = lines
+        .iter()
+        .rev()
+        .filter_map(|line| {
+            let record: Value = serde_json::from_str(line.trim()).ok()?;
+            let text = record_text(&record)?;
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let speaker = match record
+                .get("role")
+                .or_else(|| record.get("type"))
+                .and_then(Value::as_str)
+            {
+                Some("user") => "用户",
+                Some("assistant") => "助手",
+                _ => "记录",
+            };
+            Some(json!({ "speaker": speaker, "text": text.chars().take(240).collect::<String>() }))
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+    recent.reverse();
+    recent
 }
 
 fn content_preview(content: &ContentState) -> Vec<Value> {
