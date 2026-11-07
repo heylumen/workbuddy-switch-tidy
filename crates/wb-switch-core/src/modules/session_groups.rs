@@ -1690,9 +1690,19 @@ fn group_payload(
             );
         }
     }
-    let (safe_source, aggregate_status) = aggregate_group_state(&mut views, &active, &matrix);
-    let divergence = common_base_branches(&views, &active);
-    let summary_status = if divergence.is_some() {
+    let (mut safe_source, aggregate_status) = aggregate_group_state(&mut views, &active, &matrix);
+    // 只剩一个活跃副本时不存在“落后/分歧”，也不应因为正文过大而显示无法确认。
+    if active.len() <= 1 {
+        safe_source = active.first().copied();
+    }
+    let divergence = if active.len() <= 1 {
+        None
+    } else {
+        common_base_branches(&views, &active)
+    };
+    let summary_status = if active.len() <= 1 {
+        "latest"
+    } else if divergence.is_some() {
         "diverge"
     } else {
         aggregate_status
@@ -1735,7 +1745,9 @@ fn group_payload(
         "safeSourceMemberId": safe_source.map(|index| views[index].member.member_id.clone()),
         "hasSafeSource": safe_source.is_some(),
     });
-    if summary_status == "unknown"
+    if active.len() <= 1 && summary_status == "latest" {
+        result["summaryText"] = json!("仅一个副本，无需同步");
+    } else if summary_status == "unknown"
         && views.iter().any(|view| {
             matches!(&view.content, ContentState::Unavailable(reason) if reason.contains("文件过大"))
         })
