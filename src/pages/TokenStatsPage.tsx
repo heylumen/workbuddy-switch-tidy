@@ -1362,10 +1362,16 @@ function RequestDetailDialog({
   open,
   onOpenChange,
   source,
+  loading,
+  error,
+  onRetry,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   source: TokenStatsSource;
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
 }) {
   const rows = source.requests ?? [];
 
@@ -1378,7 +1384,19 @@ function RequestDetailDialog({
             每次模型调用一行，按时间倒序展示本地 CodeBuddy CLI 日志记录。
           </DialogDescription>
         </DialogHeader>
-        {rows.length === 0 ? (
+        {loading ? (
+          <div className="flex items-center justify-center rounded-lg border border-dashed px-4 py-10 text-sm text-muted-foreground" role="status">
+            <Loader2 className="mr-2 size-4 animate-spin" />
+            正在加载请求明细…
+          </div>
+        ) : error ? (
+          <div className="rounded-lg border border-dashed px-4 py-8 text-center text-sm">
+            <p className="text-destructive">{error}</p>
+            <Button variant="outline" size="sm" className="mt-3" onClick={onRetry}>
+              重试
+            </Button>
+          </div>
+        ) : rows.length === 0 ? (
           <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
             该来源暂无可展示的请求明细。
           </div>
@@ -1552,6 +1570,9 @@ export default function TokenStatsPage() {
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailReload, setDetailReload] = useState(0);
 
   useEffect(() => {
     let disposed = false;
@@ -1590,20 +1611,28 @@ export default function TokenStatsPage() {
 
   // 请求明细按需加载：默认不把 500 行明细常驻内存，打开弹窗时才补拉。
   useEffect(() => {
-    if (!detailOpen || active !== "codebuddy-cli" || source?.requests) return;
+    if (!detailOpen || active !== "codebuddy-cli") return;
+    if (source?.requests && detailReload === 0) return;
     let disposed = false;
+    setDetailLoading(true);
+    setDetailError(null);
     api
       .getTokenStatistics(undefined, true)
       .then((result) => {
         if (!disposed) setStats(result);
       })
-      .catch(() => {
-        // 明细加载失败不影响聚合数据；弹窗显示空态即可。
+      .catch((reason) => {
+        if (!disposed) {
+          setDetailError(reason instanceof Error ? reason.message : "请求明细加载失败");
+        }
+      })
+      .finally(() => {
+        if (!disposed) setDetailLoading(false);
       });
     return () => {
       disposed = true;
     };
-  }, [active, detailOpen, source?.requests]);
+  }, [active, detailOpen, detailReload, source?.requests]);
 
   return (
     <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
@@ -1728,6 +1757,9 @@ export default function TokenStatsPage() {
           open={detailOpen}
           onOpenChange={setDetailOpen}
           source={source}
+          loading={detailLoading}
+          error={detailError}
+          onRetry={() => setDetailReload((value) => value + 1)}
         />
       )}
     </div>

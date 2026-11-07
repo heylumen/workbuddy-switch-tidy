@@ -1422,6 +1422,46 @@ mod tests {
     }
 
     #[test]
+    fn source_per_file_cache_invalidates_when_file_changes() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-incremental-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = |ts, input| {
+            json!({
+                "timestamp": ts,
+                "cwd": "/fixture/example-project",
+                "providerData": {
+                    "model": "fixture-model",
+                    "usage": { "inputTokens": input, "outputTokens": 1 }
+                }
+            })
+        };
+        let file = project.join("session.jsonl");
+        fs::write(&file, format!("{}\n", record(now, 10))).expect("write first fixture");
+
+        let first = source(root.clone(), "fixture", None, false);
+        assert_eq!(first["summary"]["input"], 10);
+        assert_eq!(first["summary"]["records"], 1);
+
+        // 文件变化（size 改变）必须使缓存失效；未变化文件的复用由缓存实现保证。
+        fs::write(
+            &file,
+            format!("{}\n{}\n", record(now, 10), record(now + 1, 7)),
+        )
+        .expect("append fixture");
+        let second = source(root.clone(), "fixture", None, false);
+        assert_eq!(second["summary"]["input"], 17);
+        assert_eq!(second["summary"]["records"], 2);
+        assert_eq!(second["parseErrors"], 0);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn source_excludes_subagents_and_counts_each_record_once() {
         let root = std::env::temp_dir().join(format!(
             "wb-switch-token-stats-{}-{}",
