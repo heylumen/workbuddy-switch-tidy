@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -173,16 +174,55 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
 /// 正文摘要缓存：列表页反复进入时避免重复整文件解析。
 ///
 /// key = (路径, 文件长度, mtime nanos)；只缓存可解析结果的摘要与行摘要，
-/// 不保存正文文本。命中后返回的  为空，仅可用于判定/统计，
-/// 需要正文的写入或预览路径必须改用 []。
+/// 不保存正文文本。命中后返回的 text 为空，仅可用于判定/统计，
+/// 需要正文的写入或预览路径必须改用 read_content_snapshot。
 /// 摘要缓存的内存边界：条目数 + 单文件大小/记录数，避免长会话把进程内存撑大。
-const SUMMARY_CACHE_MAX_ENTRIES: usize = 16;
+const SUMMARY_CACHE_MAX_ENTRIES: usize = 32;
+const SUMMARY_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SUMMARY_CACHE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const SUMMARY_CACHE_MAX_RECORDS: usize = 10_000;
 
 type SummaryKey = (PathBuf, u64, u128, String);
 type SummaryValue = (String, NormalizedContent);
-type SummaryCache = Mutex<std::collections::HashMap<SummaryKey, SummaryValue>>;
+
+struct SummaryCacheState {
+    entries: std::collections::HashMap<SummaryKey, (SummaryValue, usize)>,
+    order: VecDeque<SummaryKey>,
+    bytes: usize,
+}
+
+impl SummaryCacheState {
+    fn touch(&mut self, key: &SummaryKey) {
+        if let Some(position) = self.order.iter().position(|item| item == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key.clone());
+    }
+
+    fn insert(&mut self, key: SummaryKey, value: SummaryValue, size: usize) {
+        if size > SUMMARY_CACHE_MAX_BYTES / 4 {
+            return;
+        }
+        if let Some((_, old_size)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_size);
+        }
+        while (self.bytes.saturating_add(size) > SUMMARY_CACHE_MAX_BYTES
+            || self.entries.len() >= SUMMARY_CACHE_MAX_ENTRIES)
+            && !self.order.is_empty()
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some((_, old_size)) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(old_size);
+                }
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (value, size));
+    }
+}
+
+type SummaryCache = Mutex<SummaryCacheState>;
 
 static SUMMARY_CACHE: OnceLock<SummaryCache> = OnceLock::new();
 
@@ -213,12 +253,14 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
         return read_content_summary_streaming(path, own_session_id);
     }
     if let Some(cache) = SUMMARY_CACHE.get() {
-        if let Ok(guard) = cache.lock() {
-            if let Some((full_digest, normalized)) = guard.get(&key) {
+        if let Ok(mut guard) = cache.lock() {
+            let cached = guard.entries.get(&key).map(|(value, _)| value.clone());
+            if let Some((full_digest, normalized)) = cached {
+                guard.touch(&key);
                 return ContentState::Ready(ContentSnapshot {
                     text: String::new(),
-                    full_digest: full_digest.clone(),
-                    normalized: normalized.clone(),
+                    full_digest,
+                    normalized,
                 });
             }
         }
@@ -228,13 +270,20 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
             let cacheable = snapshot.normalized.record_count <= SUMMARY_CACHE_MAX_RECORDS;
             if cacheable {
                 if let Some(cache) = SUMMARY_CACHE.get() {
+                    let size = snapshot.full_digest.len()
+                        + snapshot
+                            .normalized
+                            .line_digests
+                            .iter()
+                            .map(|digest| digest.len() + 24)
+                            .sum::<usize>()
+                        + snapshot.normalized.total_digest.len()
+                        + 128;
                     if let Ok(mut guard) = cache.lock() {
-                        if guard.len() >= SUMMARY_CACHE_MAX_ENTRIES {
-                            guard.clear();
-                        }
                         guard.insert(
                             key,
                             (snapshot.full_digest.clone(), snapshot.normalized.clone()),
+                            size,
                         );
                     }
                 }

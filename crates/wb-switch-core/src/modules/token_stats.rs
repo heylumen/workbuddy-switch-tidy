@@ -12,7 +12,7 @@
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -27,10 +27,48 @@ const REQUEST_WINDOW: usize = 500;
 const REQUEST_COLLECT_LIMIT: usize = 4_000;
 
 /// 单源统计的内存缓存：以文件元数据签名判失效，避免同一进程内反复全量解析。
-static SOURCE_CACHE: OnceLock<Mutex<HashMap<String, (u64, Value)>>> = OnceLock::new();
-/// 统计缓存的内存边界：条目数与单值序列化大小；超出就不缓存。
+struct SourceCacheState {
+    entries: HashMap<String, (u64, Value, usize)>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl SourceCacheState {
+    fn touch(&mut self, key: &str) {
+        if let Some(position) = self.order.iter().position(|item| item == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key.to_string());
+    }
+
+    fn insert(&mut self, key: String, signature: u64, value: Value, size: usize) {
+        if size > SOURCE_CACHE_MAX_VALUE_BYTES {
+            return;
+        }
+        if let Some((_, _, old_size)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_size);
+        }
+        while (self.bytes.saturating_add(size) > SOURCE_CACHE_MAX_BYTES
+            || self.entries.len() >= SOURCE_CACHE_MAX_ENTRIES)
+            && !self.order.is_empty()
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some((_, _, old_size)) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(old_size);
+                }
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (signature, value, size));
+    }
+}
+
+static SOURCE_CACHE: OnceLock<Mutex<SourceCacheState>> = OnceLock::new();
+/// 统计缓存的内存边界：条目数、单值与总字节预算。
 const SOURCE_CACHE_MAX_ENTRIES: usize = 8;
 const SOURCE_CACHE_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
+const SOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 fn paths_signature(paths: &[(PathBuf, PathBuf)]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -601,11 +639,15 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
     let cache_key = format!("{name}|{cutoff:?}|{detail}|{roots:?}");
     let signature = paths_signature(&paths);
     if let Some(cache) = SOURCE_CACHE.get() {
-        if let Ok(guard) = cache.lock() {
-            if let Some((cached_sig, value)) = guard.get(&cache_key) {
-                if *cached_sig == signature {
-                    return value.clone();
-                }
+        if let Ok(mut guard) = cache.lock() {
+            let cached = guard
+                .entries
+                .get(&cache_key)
+                .filter(|(cached_sig, _, _)| *cached_sig == signature)
+                .map(|(_, value, _)| value.clone());
+            if let Some(value) = cached {
+                guard.touch(&cache_key);
+                return value;
             }
         }
     }
@@ -722,16 +764,13 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
     let value = collector.into_value(name, paths.len());
     // 只有零解析错误的结果才缓存：瞬时 IO 失败不应被固化为长期结果。
     if value.get("parseErrors").and_then(Value::as_u64) == Some(0) {
-        let cacheable = serde_json::to_vec(&value)
-            .map(|bytes| bytes.len() <= SOURCE_CACHE_MAX_VALUE_BYTES)
-            .unwrap_or(false);
-        if cacheable {
+        let size = serde_json::to_vec(&value)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0);
+        if size > 0 && size <= SOURCE_CACHE_MAX_VALUE_BYTES {
             if let Some(cache) = SOURCE_CACHE.get() {
                 if let Ok(mut guard) = cache.lock() {
-                    if guard.len() >= SOURCE_CACHE_MAX_ENTRIES {
-                        guard.clear();
-                    }
-                    guard.insert(cache_key, (signature, value.clone()));
+                    guard.insert(cache_key, signature, value.clone(), size);
                 }
             }
         }
