@@ -7173,6 +7173,75 @@ mod tests {
     }
 
     #[test]
+    fn insert_session_copy_normalizes_visibility_fields() {
+        type NormalizedCols = (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        );
+        let env = ready_env("insert-normalize");
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN project_id TEXT;
+             ALTER TABLE sessions ADD COLUMN status TEXT;
+             ALTER TABLE sessions ADD COLUMN last_activity_at INTEGER;
+             ALTER TABLE sessions ADD COLUMN source_mode TEXT;",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET project_id = 'p_source', status = 'terminated', \
+             last_activity_at = NULL, source_mode = NULL, created_at = 1234 \
+             WHERE id = 'sess-1'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = insert_session_copy(
+            &env.paths(),
+            &env.paths(),
+            "normalized-copy",
+            "sess-1",
+            "uid-a",
+            "uid-b",
+        )
+        .unwrap();
+        assert_eq!(outcome, DbCopyOutcome::Inserted);
+
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        let (project_id, status, last_activity_at, source_mode, created_at): NormalizedCols = conn
+            .query_row(
+                "SELECT project_id, status, last_activity_at, source_mode, created_at \
+                 FROM sessions WHERE id = 'normalized-copy'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(project_id, None, "项目归属不得跨账号继承");
+        assert_eq!(
+            status.as_deref(),
+            Some("completed"),
+            "非空闲/终态状态应归一为 completed"
+        );
+        assert!(
+            last_activity_at.is_some_and(|value| value > 0),
+            "last_activity_at 为 NULL 时必须补当前时间"
+        );
+        assert_eq!(source_mode.as_deref(), Some("craft"));
+        assert_eq!(created_at, Some(1234), "created_at 必须保留源会话起点");
+    }
+
+    #[test]
     fn insert_session_copy_reports_missing_source_and_db() {
         let env = ready_env("insert-missing");
         assert_eq!(
