@@ -2015,11 +2015,13 @@ fn member_snapshot(
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
             let member_paths = SessionPaths::for_variant(variant);
-            let content = if row.is_none() {
-                ContentState::Missing
-            } else if summary_only || client == SessionClient::Workbuddy {
+            // DB 行可能已被软删除，但 jsonl 正文仍在（历史副本/归档）。
+            // 只要正文可读就按可读处理，不能仅因 DB 行缺失就误报“内容缺失”。
+            let content = if summary_only || client == SessionClient::Workbuddy {
                 // WorkBuddy 详情只需要摘要做判定；正文预览单独读文件尾部。
                 session::member_content_summary(&member_paths, &member.session_id)
+            } else if row.is_none() {
+                ContentState::Missing
             } else {
                 session::member_content_state(&member_paths, &member.session_id)
             };
