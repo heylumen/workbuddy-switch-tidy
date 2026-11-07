@@ -36,6 +36,9 @@ export default function SessionsPage() {
   const [client, setClient] = useState<SessionGroupClient>("workbuddy");
   const [variantScope, setVariantScope] = useState<WbVariant>("cn");
   const [groups, setGroups] = useState<SessionGroupSummary[]>([]);
+  const [groupsRevision, setGroupsRevision] = useState(0);
+  const [lightweight, setLightweight] = useState(false);
+  const [enriching, setEnriching] = useState(false);
   const [storeStatus, setStoreStatus] = useState<"missing" | "ready" | "unavailable">("missing");
   const [storeError, setStoreError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -146,6 +149,8 @@ export default function SessionsPage() {
       const result = await api.listSessionGroups(client, scope);
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key || listRequestId.current !== requestId) return;
       setGroups(result.groups);
+      setLightweight(Boolean(result.lightweight));
+      setGroupsRevision((value) => value + 1);
       setStoreStatus(result.storeStatus);
       setStoreError(result.storeError ?? null);
     } catch (error) {
@@ -171,6 +176,8 @@ export default function SessionsPage() {
     api.listSessionGroups(client, scope).then((result) => {
       if (!live || listRequestId.current !== requestId || `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key) return;
       setGroups(result.groups);
+      setLightweight(Boolean(result.lightweight));
+      setGroupsRevision((value) => value + 1);
       setStoreStatus(result.storeStatus);
       setStoreError(result.storeError ?? null);
     }).catch((error) => {
@@ -182,6 +189,47 @@ export default function SessionsPage() {
     });
     return () => { live = false; };
   }, [client, scope, listContextKey]);
+
+  // 大数据列表先秒开；后台按两组并发回填真实标题/状态，完成一个更新一个。
+  useEffect(() => {
+    const pending = groups.filter((group) => group.summaryStatus === "unknown");
+    if (!lightweight || pending.length === 0) return;
+    let cancelled = false;
+    let cursor = 0;
+    setEnriching(true);
+    const revision = groupsRevision;
+    const worker = async () => {
+      while (!cancelled) {
+        const group = pending[cursor++];
+        if (!group) return;
+        try {
+          const next = await api.getSessionGroup(client, group.groupId, scope);
+          if (cancelled || groupsRevision !== revision) return;
+          setGroups((current) => current.map((item) => item.groupId === group.groupId ? {
+            ...item,
+            title: next.title,
+            projectLabel: next.projectLabel,
+            latestActivityAt: next.latestActivityAt,
+            summaryStatus: next.summaryStatus,
+            summaryText: next.summaryText,
+            safeSourceMemberId: next.safeSourceMemberId,
+            hasSafeSource: next.hasSafeSource,
+          } : item));
+        } catch {
+          // 单组确认失败保留“无法确认”，不影响其它组。
+        }
+      }
+    };
+    void Promise.all([worker(), worker()]).finally(() => {
+      if (!cancelled) setEnriching(false);
+    });
+    return () => {
+      cancelled = true;
+      setEnriching(false);
+    };
+    // groups 通过 revision 触发；避免每次回填都重启后台任务。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, scope, groupsRevision, lightweight]);
 
   useEffect(() => {
     // 只有弹窗打开且已选中会话组才需要详情：关闭时同样进入这里，作废在途请求并停掉加载态，
@@ -562,7 +610,7 @@ export default function SessionsPage() {
           </div>
           {(storeStatus === "unavailable" || storeError) && <p role="status" className="mb-3 rounded-lg border border-amber-500/30 p-3 text-sm text-muted-foreground">{storeError ?? "关联组存储暂不可用，当前只展示可读取的数据。"}</p>}
           {loadError && <div role="alert" className="mb-3 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{loadError}<Button variant="outline" size="sm" className="ml-2" onClick={() => void reloadGroups()}>重试</Button></div>}
-          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
+          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} confirming={lightweight && enriching} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
           {!loading && filteredGroups.length > PAGINATION_HIDE_MAX && <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"><span>显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredGroups.length)}，共 {filteredGroups.length} 个会话</span><nav aria-label="会话分页" className="flex flex-wrap items-center gap-1.5"><Button variant="outline" size="icon" className="size-8" aria-label="上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft /></Button>{pages.map((value, index) => <span key={value} className="flex items-center gap-1.5">{index > 0 && value - pages[index - 1] > 1 && <span>…</span>}<Button variant={value === currentPage ? "default" : "outline"} className={`size-8 p-0 ${value === currentPage ? "bg-brand text-brand-foreground hover:bg-brand/90" : ""}`} aria-label={`第 ${value} 页`} aria-current={value === currentPage ? "page" : undefined} onClick={() => setPage(value)}>{value}</Button></span>)}<Button variant="outline" size="icon" className="size-8" aria-label="下一页" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight /></Button></nav></div>}
         </section>
       </div>
@@ -922,13 +970,13 @@ function GroupSkeleton() {
   </div>;
 }
 
-function SessionGroupCard({ group, selected, onSelect, onRequestDelete }: { group: SessionGroupSummary; selected: boolean; onSelect: () => void; onRequestDelete: () => void }) {
+function SessionGroupCard({ group, confirming, selected, onSelect, onRequestDelete }: { group: SessionGroupSummary; confirming: boolean; selected: boolean; onSelect: () => void; onRequestDelete: () => void }) {
   // 「…」不能嵌在整卡按钮里（button 不能嵌套 button），所以绝对定位到卡片右上角。
   return <div className="relative min-w-0">
     <button type="button" onClick={onSelect} aria-pressed={selected} className={`w-full min-w-0 cursor-pointer rounded-lg border bg-card px-4 py-3.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selected ? "border-brand shadow-sm" : "border-border hover:border-brand/50"}`}>
       <div className="flex min-w-0 items-center justify-between gap-2 pr-7 text-xs text-muted-foreground"><span className="flex min-w-0 items-center gap-2"><Folder className="size-4 shrink-0" /><span className="truncate" title={group.projectLabel}>{group.projectLabel || "未标记项目"}</span></span><span className="shrink-0" title={formatDate(group.latestActivityAt)}>{relativeDate(group.latestActivityAt)}</span></div>
       <h3 className="my-3 truncate text-base font-semibold" title={group.title}>{group.title}</h3>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{{ latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失", unknown: "无法确认" }[group.summaryStatus]}</span></span></div>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{{ latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失", unknown: confirming ? "正在确认…" : "无法确认" }[group.summaryStatus]}</span></span></div>
     </button>
     <DropdownMenu>
       <DropdownMenuTrigger asChild>

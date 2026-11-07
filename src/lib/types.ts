@@ -337,6 +337,8 @@ export interface SessionGroupList {
   variantScope: WbVariant | null;
   storeStatus: "missing" | "ready" | "unavailable";
   storeError?: string;
+  /** 数据量过大时列表先只返回元数据，状态由详情接口后台回填。 */
+  lightweight?: boolean;
   groups: SessionGroupSummary[];
 }
 
