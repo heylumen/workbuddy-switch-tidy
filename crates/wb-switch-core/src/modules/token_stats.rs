@@ -1258,7 +1258,7 @@ fn ide_source(
 /// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI, and
 /// CodeBuddy IDE aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
-pub fn get_statistics(days: Option<i64>) -> Value {
+pub fn get_statistics(days: Option<i64>, include_requests: bool) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let generated_at = crate::modules::config::now_ms();
     let range_days = match days {
@@ -1277,7 +1277,7 @@ pub fn get_statistics(days: Option<i64>) -> Value {
             // 国际版独立 source：不与国内版混算（不同账号体系）。
             source_from_roots(&variant_source_roots(WbVariant::Ai), "workbuddy-ai", cutoff, false),
             // 请求明细目前只对 CodeBuddy CLI 开放（见 spec 的 requests 契约）。
-            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff, true),
+            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff, include_requests),
             ide_source(
                 codebuddy_extension_data_dir(),
                 "codebuddy-ide",
@@ -2281,7 +2281,7 @@ mod tests {
         // ~/.codebuddy 与扩展目录）。在数据量大的机器上耗时可达成分钟级，且结果随本机
         // 数据漂移——因此这条用例默认跳过，仅在需要端到端核对时手动运行：
         //   cargo test -p wb-switch-core --lib -- --ignored get_statistics_returns_four_isolated_sources
-        let value = get_statistics(None);
+        let value = get_statistics(None, true);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()

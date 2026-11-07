@@ -1477,7 +1477,10 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
             .split('&')
             .find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
     });
-    match tokio::task::spawn_blocking(move || token_stats::get_statistics(days)).await {
+    let include_requests = query_flag_enabled(query.as_deref(), "requests");
+    match tokio::task::spawn_blocking(move || token_stats::get_statistics(days, include_requests))
+        .await
+    {
         Ok(statistics) => json_ok(statistics),
         Err(error) => json_err(
             format!("扫描 Token 统计失败: {error}"),

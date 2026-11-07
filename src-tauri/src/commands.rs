@@ -1013,10 +1013,15 @@ pub async fn get_credit_statistics(refresh: Option<bool>) -> Value {
 }
 
 #[tauri::command]
-pub async fn get_token_statistics(days: Option<i64>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || token_stats::get_statistics(days))
-        .await
-        .map_err(|error| format!("扫描 Token 统计失败: {error}"))
+pub async fn get_token_statistics(
+    days: Option<i64>,
+    requests: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        token_stats::get_statistics(days, requests.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("扫描 Token 统计失败: {error}"))
 }
 
 /// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。

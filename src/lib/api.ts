@@ -804,7 +804,12 @@ export function getCreditStatistics(refresh = false): Promise<CreditStatistics> 
   return call("get_credit_statistics", refresh ? { refresh: true } : undefined);
 }
 
-export function getTokenStatistics(days?: number): Promise<TokenStatistics> { return call("get_token_statistics", days ? { days } : undefined); }
+export function getTokenStatistics(days?: number, requests?: boolean): Promise<TokenStatistics> {
+  const args: Record<string, unknown> = {};
+  if (days) args.days = days;
+  if (requests) args.requests = true;
+  return call("get_token_statistics", Object.keys(args).length ? args : undefined);
+}
 
 /**
  * 模型限额台账：一次返回**全部账号**当前受限的模型与官方恢复时刻。

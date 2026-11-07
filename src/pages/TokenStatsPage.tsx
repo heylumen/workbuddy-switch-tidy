@@ -1588,6 +1588,23 @@ export default function TokenStatsPage() {
 
   const source = stats?.sources.find((item) => item.source === active);
 
+  // 请求明细按需加载：默认不把 500 行明细常驻内存，打开弹窗时才补拉。
+  useEffect(() => {
+    if (!detailOpen || active !== "codebuddy-cli" || source?.requests) return;
+    let disposed = false;
+    api
+      .getTokenStatistics(undefined, true)
+      .then((result) => {
+        if (!disposed) setStats(result);
+      })
+      .catch(() => {
+        // 明细加载失败不影响聚合数据；弹窗显示空态即可。
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [active, detailOpen, source?.requests]);
+
   return (
     <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
       <header className="mb-6 flex min-w-0 flex-wrap items-start justify-between gap-4">
