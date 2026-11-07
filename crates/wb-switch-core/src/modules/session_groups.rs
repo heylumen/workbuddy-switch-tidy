@@ -1952,6 +1952,8 @@ fn preview_for_view(client: SessionClient, group: &LinkGroup, view: &MemberView)
 
 /// 只读文件尾部 256KB，取最近 6 条可展示记录；不加载整份正文。
 fn tail_preview(paths: &SessionPaths, session_id: &str) -> Vec<Value> {
+    const INITIAL_WINDOW: u64 = 256 * 1024;
+    const MAX_WINDOW: u64 = 4 * 1024 * 1024;
     let Some(path) = session::find_project_jsonl(paths, session_id) else {
         return Vec::new();
     };
@@ -1959,8 +1961,20 @@ fn tail_preview(paths: &SessionPaths, session_id: &str) -> Vec<Value> {
         return Vec::new();
     };
     let len = meta.len();
-    let start = len.saturating_sub(256 * 1024);
-    let Ok(mut file) = std::fs::File::open(&path) else {
+    let mut window = INITIAL_WINDOW;
+    loop {
+        let start = len.saturating_sub(window);
+        let recent = read_tail_records(&path, start);
+        // 长消息可能让 256KB 尾巴不足 6 条；逐步扩大窗口，最多 4MB。
+        if recent.len() >= 6 || start == 0 || window >= MAX_WINDOW {
+            return recent;
+        }
+        window = (window * 2).min(MAX_WINDOW);
+    }
+}
+
+fn read_tail_records(path: &Path, start: u64) -> Vec<Value> {
+    let Ok(mut file) = std::fs::File::open(path) else {
         return Vec::new();
     };
     if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
@@ -2435,6 +2449,26 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn tail_preview_expands_window_for_long_records() {
+        let store = TempStore::new("tail-long");
+        let project = store.paths.projects_dir().join("ws-long");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut body = String::new();
+        for index in 0..8 {
+            let text = format!("msg-{index}-{}", "x".repeat(50_000));
+            body.push_str(
+                &json!({"type": "user", "sessionId": "session", "text": text}).to_string(),
+            );
+            body.push('\n');
+        }
+        std::fs::write(project.join("session.jsonl"), body).unwrap();
+
+        let preview = tail_preview(&store.paths, "session");
+        assert_eq!(preview.len(), 6, "长记录时也必须尽量补足最近 6 条");
+        assert!(preview[5]["text"].as_str().unwrap().contains("msg-7-"));
     }
 
     fn stored_member(member_id: &str, uid: &str, state: MemberState) -> LinkMember {
