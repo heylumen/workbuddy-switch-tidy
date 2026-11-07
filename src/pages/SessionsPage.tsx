@@ -976,7 +976,7 @@ function SessionGroupCard({ group, confirming, selected, onSelect, onRequestDele
     <button type="button" onClick={onSelect} aria-pressed={selected} className={`w-full min-w-0 cursor-pointer rounded-lg border bg-card px-4 py-3.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selected ? "border-brand shadow-sm" : "border-border hover:border-brand/50"}`}>
       <div className="flex min-w-0 items-center justify-between gap-2 pr-7 text-xs text-muted-foreground"><span className="flex min-w-0 items-center gap-2"><Folder className="size-4 shrink-0" /><span className="truncate" title={group.projectLabel}>{group.projectLabel || "未标记项目"}</span></span><span className="shrink-0" title={formatDate(group.latestActivityAt)}>{relativeDate(group.latestActivityAt)}</span></div>
       <h3 className="my-3 truncate text-base font-semibold" title={group.title}>{group.title}</h3>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{{ latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失", unknown: confirming ? "正在确认…" : "无法确认" }[group.summaryStatus]}</span></span></div>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{groupStatusLabel(group, confirming)}</span></span></div>
     </button>
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -987,6 +987,14 @@ function SessionGroupCard({ group, confirming, selected, onSelect, onRequestDele
       </DropdownMenuContent>
     </DropdownMenu>
   </div>;
+}
+
+function groupStatusLabel(group: SessionGroupSummary, confirming: boolean): string {
+  if (group.summaryStatus === "unknown") {
+    if (group.summaryText.includes("文件过大")) return "文件过大";
+    return confirming ? "正在确认…" : "无法确认";
+  }
+  return { latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失" }[group.summaryStatus] ?? "无法确认";
 }
 
 function relativeDate(timestamp: number): string {

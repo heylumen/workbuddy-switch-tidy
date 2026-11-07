@@ -1683,6 +1683,13 @@ fn group_payload(
         "safeSourceMemberId": safe_source.map(|index| views[index].member.member_id.clone()),
         "hasSafeSource": safe_source.is_some(),
     });
+    if summary_status == "unknown"
+        && views.iter().any(|view| {
+            matches!(&view.content, ContentState::Unavailable(reason) if reason.contains("文件过大"))
+        })
+    {
+        result["summaryText"] = json!("文件过大，未自动校验");
+    }
     if include_detail {
         if let Some(divergence) = divergence {
             result["divergence"] = json!({
