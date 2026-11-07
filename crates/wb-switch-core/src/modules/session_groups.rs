@@ -1633,12 +1633,16 @@ fn common_base_branches(views: &[MemberView], active: &[usize]) -> Option<Common
         return None;
     }
     let common_index = versions.iter().position(|version| {
-        let common = lines(version[0]).expect("active members have readable content");
+        let Some(common) = lines(version[0]) else {
+            return false;
+        };
         versions
             .iter()
             .filter(|other| *other != version)
             .all(|other| {
-                let branch = lines(other[0]).expect("active members have readable content");
+                let Some(branch) = lines(other[0]) else {
+                    return false;
+                };
                 branch.len() > common.len() && branch.starts_with(common)
             })
     })?;
@@ -1646,8 +1650,9 @@ fn common_base_branches(views: &[MemberView], active: &[usize]) -> Option<Common
     // Each remaining version must be independently advanced from the shared snapshot.
     if versions.iter().enumerate().any(|(index, branch)| {
         versions.iter().skip(index + 1).any(|other| {
-            let left = lines(branch[0]).expect("active members have readable content");
-            let right = lines(other[0]).expect("active members have readable content");
+            let (Some(left), Some(right)) = (lines(branch[0]), lines(other[0])) else {
+                return false;
+            };
             left.starts_with(right) || right.starts_with(left)
         })
     }) {
@@ -1857,7 +1862,10 @@ fn member_snapshot(
                     let Some(root) = root.as_ref() else {
                         return Vec::new();
                     };
-                    vscode_session::list_sessions_in_store(spec.unwrap(), root, &member.uid)
+                    let Some(spec) = spec else {
+                        return Vec::new();
+                    };
+                    vscode_session::list_sessions_in_store(spec, root, &member.uid)
                         .get("sessions")
                         .and_then(Value::as_array)
                         .cloned()
