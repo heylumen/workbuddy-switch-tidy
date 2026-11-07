@@ -126,15 +126,26 @@ pub fn list(client: SessionClient, scope: Option<WbVariant>) -> Result<Value, St
         StoreState::Ready(store) => {
             result["storeStatus"] = json!("ready");
             let accounts = account::load_accounts_at(&account::accounts_file_in(&paths.store_root));
-            let mut cache = HashMap::new();
-            let groups = store
-                .groups
-                .iter()
-                .filter(|group| group_is_in_scope(client, scope, group))
-                .map(|group| {
-                    group_payload(client, scope, &paths, group, &accounts, &mut cache, false)
-                })
-                .collect::<Vec<_>>();
+            let lightweight = list_needs_lightweight(client, scope, &store);
+            result["lightweight"] = json!(lightweight);
+            let groups = if lightweight {
+                store
+                    .groups
+                    .iter()
+                    .filter(|group| group_is_in_scope(client, scope, group))
+                    .map(|group| group_list_payload(client, scope, group, &accounts))
+                    .collect::<Vec<_>>()
+            } else {
+                let mut cache = HashMap::new();
+                store
+                    .groups
+                    .iter()
+                    .filter(|group| group_is_in_scope(client, scope, group))
+                    .map(|group| {
+                        group_payload(client, scope, &paths, group, &accounts, &mut cache, false)
+                    })
+                    .collect::<Vec<_>>()
+            };
             result["groups"] = json!(groups);
         }
     }
@@ -1442,6 +1453,110 @@ fn ide_flavor(variant: WbVariant) -> codebuddy_ide_session::IdeFlavor {
     }
 }
 
+/// 真实数据可能存在数百 MB 的副本。列表精确计算摘要前先估算规模：
+/// 只读元数据/文件名即可判断，超阈值才降级为零正文列表。
+fn list_needs_lightweight(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    store: &session_link::LinkStore,
+) -> bool {
+    const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+    const MAX_SINGLE_BYTES: u64 = 32 * 1024 * 1024;
+    // 测试夹具故意构造大/异常内容；单测继续走精确路径，避免把“降级”当成正常语义。
+    if cfg!(test) {
+        return false;
+    }
+    if client != SessionClient::Workbuddy {
+        return false;
+    }
+    let mut total = 0u64;
+    for group in store
+        .groups
+        .iter()
+        .filter(|group| group_is_in_scope(client, scope, group))
+    {
+        for member in group
+            .members
+            .iter()
+            .filter(|member| member.state == MemberState::Active)
+        {
+            let variant = session_link::member_variant(group, member);
+            let paths = SessionPaths::for_variant(variant);
+            let Some(path) = session::find_project_jsonl(&paths, &member.session_id) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            if meta.len() > MAX_SINGLE_BYTES {
+                return true;
+            }
+            total = total.saturating_add(meta.len());
+            if total > MAX_TOTAL_BYTES {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 列表专用：只读关联元数据，不读取任何会话正文。
+///
+/// 真实数据中一个组可能有多个数百 MB 的副本；列表若逐个成员算摘要会扫描数十 GB，
+/// 打开页面直接卡死。状态/标题在打开详情时再精确计算；列表只提供数量、账号和最晚时间。
+fn group_list_payload(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    group: &LinkGroup,
+    accounts: &[Value],
+) -> Value {
+    let mut account_names = Vec::with_capacity(group.members.len());
+    let mut active_member_count = 0usize;
+    let mut latest_activity_at = group.created_at;
+    for member in &group.members {
+        if member.state == MemberState::Active {
+            active_member_count += 1;
+        }
+        let account = account_by_uid(accounts, &member.uid);
+        account_names.push(
+            account
+                .as_ref()
+                .map(account::account_display_name)
+                .unwrap_or_else(|| member.uid.clone()),
+        );
+        latest_activity_at =
+            latest_activity_at.max(member.last_synced_at.unwrap_or(member.linked_at));
+    }
+    let key = format!(
+        "{}:{}:{}",
+        client.as_str(),
+        scope.map(WbVariant::as_str).unwrap_or("all"),
+        group.id
+    );
+    let title = account_names
+        .first()
+        .map(|name| format!("{name} 等 {} 个账号", group.members.len()))
+        .unwrap_or_else(|| "会话组".to_string());
+    json!({
+        "key": key,
+        "client": client.as_str(),
+        "variantScope": scope.map(WbVariant::as_str),
+        "groupId": group.id,
+        "groupVariant": group.variant.as_str(),
+        // 标题/项目/版本状态需要正文或基线，打开详情时再计算。
+        "title": title,
+        "projectLabel": "",
+        "latestActivityAt": latest_activity_at,
+        "memberCount": group.members.len(),
+        "activeMemberCount": active_member_count,
+        "accountNames": account_names,
+        "summaryStatus": "unknown",
+        "summaryText": summary_text("unknown"),
+        "safeSourceMemberId": Value::Null,
+        "hasSafeSource": false,
+    })
+}
+
 fn group_payload(
     client: SessionClient,
     scope: Option<WbVariant>,
@@ -1809,28 +1924,22 @@ fn member_snapshot(
     match client {
         SessionClient::Workbuddy => {
             let variant = session_link::member_variant(group, member);
-            let rows = cache
-                .entry((variant.as_str().to_string(), member.uid.clone()))
-                .or_insert_with(|| {
-                    session::list_sessions_for_user(variant, &member.uid)
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                });
-            let row = rows.iter().find(|row| {
-                row.get("id").and_then(Value::as_str) == Some(member.session_id.as_str())
-            });
+            // 只查当前 sessionId，避免列出该账号全部会话（真实数据下单次要扫上千条）。
+            let row = session::session_row_for_user(variant, &member.uid, &member.session_id);
             let title = row
+                .as_ref()
                 .and_then(|row| row.get("title"))
                 .and_then(Value::as_str)
                 .unwrap_or("会话标题暂不可用")
                 .to_string();
             let cwd = row
+                .as_ref()
                 .and_then(|row| row.get("cwd"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let project = basename(cwd);
             let updated_at = row
+                .as_ref()
                 .and_then(|row| row.get("updatedAt"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
@@ -2469,6 +2578,41 @@ mod tests {
         let preview = tail_preview(&store.paths, "session");
         assert_eq!(preview.len(), 6, "长记录时也必须尽量补足最近 6 条");
         assert!(preview[5]["text"].as_str().unwrap().contains("msg-7-"));
+    }
+
+    #[test]
+    #[ignore = "读取本机真实关联数据，手动运行"]
+    fn real_workbuddy_detail_timing() {
+        let list = super::list(SessionClient::Workbuddy, None).expect("list real data");
+        let group = list["groups"]
+            .as_array()
+            .and_then(|groups| {
+                groups
+                    .iter()
+                    .max_by_key(|group| group["memberCount"].as_u64())
+            })
+            .expect("at least one group");
+        let group_id = group["groupId"].as_str().expect("group id").to_string();
+        let started = std::time::Instant::now();
+        let detail = super::detail(SessionClient::Workbuddy, None, &group_id).expect("detail");
+        println!(
+            "real detail: members={} elapsed={:?}",
+            detail["members"].as_array().map(Vec::len).unwrap_or(0),
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[ignore = "读取本机真实关联数据，手动运行"]
+    fn real_workbuddy_list_timing() {
+        let started = std::time::Instant::now();
+        let report = super::list(SessionClient::Workbuddy, None).expect("list real data");
+        let elapsed = started.elapsed();
+        println!(
+            "real list: groups={} elapsed={:?}",
+            report["groups"].as_array().map(Vec::len).unwrap_or(0),
+            elapsed
+        );
     }
 
     fn stored_member(member_id: &str, uid: &str, state: MemberState) -> LinkMember {

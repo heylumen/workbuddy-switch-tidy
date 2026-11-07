@@ -31,8 +31,10 @@ use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::modules::account;
 use crate::modules::auth_file;
@@ -925,6 +927,45 @@ pub fn list_sessions_for_account(account: &Value) -> Value {
     })
 }
 
+/// 只查一个会话行（关联会话详情/同步使用），避免列出该账号全部会话。
+pub(crate) fn session_row_for_user(
+    variant: WbVariant,
+    uid: &str,
+    session_id: &str,
+) -> Option<Value> {
+    let paths = SessionPaths::for_variant(variant);
+    let db = paths.workbuddy_db();
+    if !db.is_file() {
+        return None;
+    }
+    let conn = open_db(&db, true)?;
+    if !table_exists(&conn, "sessions") {
+        return None;
+    }
+    let has_custom = column_exists(&conn, "sessions", "custom_title");
+    let sql = if has_custom {
+        "SELECT cwd, title, custom_title, updated_at FROM sessions \n         WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL LIMIT 1"
+    } else {
+        "SELECT cwd, title, NULL, updated_at FROM sessions \n         WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL LIMIT 1"
+    };
+    let (cwd, title, custom_title, updated_at) = conn
+        .query_row(sql, rusqlite::params![session_id, uid], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })
+        .ok()?;
+    Some(json!({
+        "id": session_id,
+        "title": session_display_title(title, custom_title),
+        "cwd": cwd.unwrap_or_default(),
+        "updatedAt": updated_at.unwrap_or(0),
+    }))
+}
+
 fn list_sessions_for_user_at(paths: &SessionPaths, uid: &str) -> Value {
     let db = paths.workbuddy_db();
     if !db.is_file() {
@@ -994,7 +1035,14 @@ fn list_sessions_for_user_at(paths: &SessionPaths, uid: &str) -> Value {
 }
 
 /// 在 `{档位数据根}/projects/{workspace}/{cid}.jsonl` 定位会话正文。
-pub(crate) fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
+struct ProjectJsonlIndex {
+    modified: Option<SystemTime>,
+    files: HashMap<String, PathBuf>,
+}
+
+static PROJECT_JSONL_INDEX: OnceLock<Mutex<HashMap<PathBuf, ProjectJsonlIndex>>> = OnceLock::new();
+
+fn project_jsonl_for(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
     let projects = paths.projects_dir();
     if !projects.is_dir() {
         return None;
@@ -1003,16 +1051,49 @@ pub(crate) fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<Path
     if direct.is_file() {
         return Some(direct);
     }
-    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
-        if !entry.path().is_dir() {
-            continue;
-        }
-        let p = entry.path().join(format!("{cid}.jsonl"));
-        if p.is_file() {
-            return Some(p);
+    let modified = std::fs::metadata(&projects)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let cache = PROJECT_JSONL_INDEX.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(index) = guard.get(&projects) {
+        if index.modified == modified {
+            if let Some(found) = index.files.get(cid) {
+                if found.is_file() {
+                    return Some(found.clone());
+                }
+            }
+            // 目录时间戳精度可能不足以反映刚创建/删除的文件：miss 或文件已删时重建一次。
         }
     }
-    None
+    let mut files = HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(&projects) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            if let Ok(children) = std::fs::read_dir(&dir) {
+                for child in children.flatten() {
+                    let path = child.path();
+                    if path.extension().is_some_and(|ext| ext == "jsonl") {
+                        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                            files.insert(stem.to_string(), path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let result = files.get(cid).cloned();
+    guard.insert(projects, ProjectJsonlIndex { modified, files });
+    result
+}
+
+pub(crate) fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
+    project_jsonl_for(paths, cid)
 }
 
 /// 备份 workbuddy.db（含 -wal/-shm），返回主库备份路径。

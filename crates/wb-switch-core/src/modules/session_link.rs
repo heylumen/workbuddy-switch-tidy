@@ -157,7 +157,7 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
         if line.trim().is_empty() {
             return Err(format!("第 {} 行为空，内容可能不完整", index + 1));
         }
-        serde_json::from_str::<serde_json::Value>(line)
+        serde_json::from_str::<serde::de::IgnoredAny>(line)
             .map_err(|_| format!("第 {} 行的格式无法识别，内容可能不完整", index + 1))?;
         line_digests.push(line_digest_of(
             &line.replace(own_session_id, SESSION_ID_MARKER),
@@ -181,6 +181,9 @@ const SUMMARY_CACHE_MAX_ENTRIES: usize = 32;
 const SUMMARY_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SUMMARY_CACHE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const SUMMARY_CACHE_MAX_RECORDS: usize = 10_000;
+/// 详情页自动校验的硬上限：真实数据中存在数百 MB 的副本，逐行扫描会让界面失去响应。
+/// 超过该值只保留尾部预览，并明确显示“文件过大、未自动校验”，不静默假装一致。
+const SUMMARY_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 type SummaryKey = (PathBuf, u64, u128, String);
 type SummaryValue = (String, NormalizedContent);
@@ -251,8 +254,14 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
             Ok(_) => ContentState::Unavailable("内容元数据无法读取".to_string()),
         };
     };
-    // 超大文件不进缓存：单条摘要本身也要占内存，缓存收益低于风险。
-    // 即使不缓存，也用流式读取计算摘要，避免整文件读入造成峰值。
+    // 超大文件只保留尾部预览，禁止在详情页逐行扫描数百 MB 副本。
+    if key.1 > SUMMARY_SCAN_MAX_BYTES {
+        return ContentState::Unavailable(format!(
+            "会话文件过大（{:.1} MB），已跳过内容校验",
+            key.1 as f64 / 1024.0 / 1024.0
+        ));
+    }
+    // 2MB–32MB 不进缓存，但仍流式计算摘要，避免整文件读入造成峰值。
     if key.1 > SUMMARY_CACHE_MAX_FILE_BYTES {
         return read_content_summary_streaming(path, own_session_id);
     }
@@ -348,7 +357,7 @@ fn read_content_summary_streaming(path: &Path, own_session_id: &str) -> ContentS
         let Ok(text) = std::str::from_utf8(line) else {
             return ContentState::Unavailable("内容格式异常，无法读取".to_string());
         };
-        if serde_json::from_str::<serde_json::Value>(text).is_err() {
+        if serde_json::from_str::<serde::de::IgnoredAny>(text).is_err() {
             return ContentState::Unavailable(format!(
                 "第 {} 行的格式无法识别，内容可能不完整",
                 line_digests.len() + 1
