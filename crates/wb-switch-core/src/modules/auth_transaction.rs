@@ -18,7 +18,10 @@ pub struct AuthTransaction {
 /// The OS releases the lock on drop, including error returns and process exit.
 pub fn try_auth() -> io::Result<AuthTransaction> {
     let path = store_dir().join("auth-state.lock");
-    std::fs::create_dir_all(path.parent().unwrap())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "认证锁路径缺少父目录"))?;
+    std::fs::create_dir_all(parent)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)

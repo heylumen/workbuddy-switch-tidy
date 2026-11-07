@@ -361,12 +361,13 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
         account["refreshExpiresAt"] = json!(v);
     }
     account["refreshedAt"] = json!(now_ms());
-    let map = account.as_object_mut().unwrap();
-    map.remove("needs_relogin");
-    map.remove("needs_relogin_reason");
-    map.remove("last_refresh_error");
-    map.remove("last_refresh_error_at");
-    map.remove("relogin_recheck_at");
+    if let Some(map) = account.as_object_mut() {
+        map.remove("needs_relogin");
+        map.remove("needs_relogin_reason");
+        map.remove("last_refresh_error");
+        map.remove("last_refresh_error_at");
+        map.remove("relogin_recheck_at");
+    }
     persist_account(&account, "刷新状态");
     // Windows 不执行 apiKeyHelper；当前 CLI 账号刷新后同步 settings env。
     // 同步失败不阻断 WorkBuddy 保活；状态接口会根据 settings 与账号库是否

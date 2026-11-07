@@ -376,12 +376,13 @@ fn register_one(
             Some(member_id) => {
                 session_link::set_member_state(group, &member_id, MemberState::Active);
                 if let Some(value) = source_variant {
-                    group
+                    if let Some(member) = group
                         .members
                         .iter_mut()
                         .find(|member| member.member_id == member_id)
-                        .unwrap()
-                        .variant = Some(value);
+                    {
+                        member.variant = Some(value);
+                    }
                 }
                 member_id
             }
@@ -409,12 +410,13 @@ fn register_one(
             Some(member_id) => {
                 session_link::set_member_state(group, &member_id, MemberState::Active);
                 if let Some(value) = target_variant {
-                    group
+                    if let Some(member) = group
                         .members
                         .iter_mut()
                         .find(|member| member.member_id == member_id)
-                        .unwrap()
-                        .variant = Some(value);
+                    {
+                        member.variant = Some(value);
+                    }
                 }
                 member_id
             }
