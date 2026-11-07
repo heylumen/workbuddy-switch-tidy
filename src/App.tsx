@@ -215,7 +215,16 @@ function Layout() {
           hasUnifiedTitleBar && "pt-16 [&>div]:pt-4",
         )}
       >
-        <Outlet />
+        <Suspense
+          fallback={
+            <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground" role="status">
+              <Loader2 className="mr-2 size-4 animate-spin" />
+              正在加载…
+            </div>
+          }
+        >
+          <Outlet />
+        </Suspense>
       </main>
     </div>
   );
@@ -227,14 +236,6 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={250}>
       <Router>
-        <Suspense
-          fallback={
-            <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground" role="status">
-              <Loader2 className="mr-2 size-4 animate-spin" />
-              正在加载…
-            </div>
-          }
-        >
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
@@ -246,7 +247,6 @@ export default function App() {
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
-        </Suspense>
         <Toaster />
       </Router>
     </TooltipProvider>

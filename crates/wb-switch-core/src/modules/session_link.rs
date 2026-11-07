@@ -245,7 +245,11 @@ fn summary_cache_key(path: &Path, own_session_id: &str) -> Option<SummaryKey> {
 /// 读取只用于判定/统计的正文摘要；命中缓存时不读文件，未命中则读一次并缓存。
 pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
     let Some(key) = summary_cache_key(path, own_session_id) else {
-        return ContentState::Missing;
+        return match std::fs::metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => ContentState::Missing,
+            Err(error) => ContentState::Unavailable(format!("内容无法读取：{error}")),
+            Ok(_) => ContentState::Unavailable("内容元数据无法读取".to_string()),
+        };
     };
     // 超大文件不进缓存：单条摘要本身也要占内存，缓存收益低于风险。
     // 即使不缓存，也用流式读取计算摘要，避免整文件读入造成峰值。

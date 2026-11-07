@@ -2903,6 +2903,21 @@ fn session_links_preview_pair_at(
     if source_variant == target_variant && source_uid == target_uid {
         return Err("来源账号与目标账号相同，无需同步会话".to_string());
     }
+    // 与完整预览同口径：国际版数据根不同构时不能给出可写预览，避免误操作。
+    for (paths, variant) in [
+        (source_paths, source_variant),
+        (target_paths, target_variant),
+    ] {
+        if variant == WbVariant::Ai && !session_copy_supported_at(&paths.data_root) {
+            return Ok(json!({
+                "supported": false,
+                "storeStatus": "unsupported",
+                "groups": [],
+                "sourceUid": source_uid,
+                "targetUid": target_uid,
+            }));
+        }
+    }
     // 只对账目标组：历史脏关联仍会被修复，但不再为一次单对操作扫描全部组。
     let _ = reconcile_stale_link_members_scoped(source_paths, source_variant, Some(group_id));
     if target_variant != source_variant {
@@ -9037,6 +9052,21 @@ mod tests {
         assert_eq!(report["supported"], false);
         assert_eq!(report["storeStatus"], "unsupported");
         assert_eq!(report["groups"].as_array().unwrap().len(), 0);
+
+        // 单对预览也必须遵守同一个能力门禁，不能因为只算一组就放行不可写预览。
+        let pair = session_links_preview_pair_at(
+            &ai_paths,
+            WbVariant::Ai,
+            &json!({"uid": "uid-a", "variant": "ai"}),
+            &ai_paths,
+            WbVariant::Ai,
+            &json!({"uid": "uid-b", "variant": "ai"}),
+            "any-group",
+        )
+        .unwrap();
+        assert_eq!(pair["supported"], false);
+        assert_eq!(pair["storeStatus"], "unsupported");
+        assert_eq!(pair["groups"].as_array().unwrap().len(), 0);
 
         // 入参错误：缺 uid、同账号。
         assert!(
