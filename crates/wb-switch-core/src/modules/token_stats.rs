@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::modules::variant::WbVariant;
 
@@ -69,6 +69,128 @@ static SOURCE_CACHE: OnceLock<Mutex<SourceCacheState>> = OnceLock::new();
 const SOURCE_CACHE_MAX_ENTRIES: usize = 8;
 const SOURCE_CACHE_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone)]
+struct CachedTokenRecord {
+    timestamp: Option<i64>,
+    usage: Usage,
+    model: String,
+    project: String,
+    thinking: u64,
+    fingerprint: Option<(i64, u64, u64, u64, u64, String)>,
+}
+
+struct CachedTokenFile {
+    signature: (u64, u128),
+    records: Vec<CachedTokenRecord>,
+    title: Option<String>,
+    session_project: Option<String>,
+    parse_errors: u64,
+}
+
+const TOKEN_FILE_CACHE_MAX_ENTRIES: usize = 32;
+const TOKEN_FILE_CACHE_MAX_RECORDS: usize = 10_000;
+const TOKEN_FILE_CACHE_MAX_SIZE: u64 = 8 * 1024 * 1024;
+
+static TOKEN_FILE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<CachedTokenFile>>>> = OnceLock::new();
+
+fn file_signature(path: &Path) -> Option<(u64, u128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some((meta.len(), mtime))
+}
+
+fn parse_token_file(path: &Path, fallback_project: &str) -> Option<CachedTokenFile> {
+    let signature = file_signature(path)?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut records = Vec::new();
+    let mut parse_errors = 0u64;
+    let mut ai_title: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut session_project: Option<String> = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            parse_errors += 1;
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            parse_errors += 1;
+            continue;
+        };
+        if let Some(title) = non_empty_text(value.get("aiTitle")) {
+            ai_title = Some(title);
+        }
+        if let Some(value) = non_empty_text(value.get("summary")) {
+            summary = Some(value);
+        }
+        let Some(usage) = usage(&value) else {
+            continue;
+        };
+        let ts = timestamp(&value);
+        let model_name = model(&value);
+        let project = record_project(&value, fallback_project);
+        if session_project.is_none() {
+            session_project = Some(project.clone());
+        }
+        records.push(CachedTokenRecord {
+            timestamp: ts,
+            usage,
+            model: model_name.clone(),
+            project,
+            thinking: thinking(&value),
+            fingerprint: ts.map(|ts| {
+                (
+                    ts,
+                    usage.input,
+                    usage.output,
+                    usage.read,
+                    usage.write,
+                    model_name,
+                )
+            }),
+        });
+    }
+    Some(CachedTokenFile {
+        signature,
+        records,
+        title: ai_title.or(summary),
+        session_project,
+        parse_errors,
+    })
+}
+
+fn load_token_file(path: &Path, fallback_project: &str) -> Option<Arc<CachedTokenFile>> {
+    let signature = file_signature(path)?;
+    if let Some(cache) = TOKEN_FILE_CACHE.get() {
+        if let Ok(guard) = cache.lock() {
+            if let Some(cached) = guard.get(path) {
+                if cached.signature == signature {
+                    return Some(cached.clone());
+                }
+            }
+        }
+    }
+    if signature.0 > TOKEN_FILE_CACHE_MAX_SIZE {
+        return parse_token_file(path, fallback_project).map(Arc::new);
+    }
+    let parsed = Arc::new(parse_token_file(path, fallback_project)?);
+    if parsed.records.len() <= TOKEN_FILE_CACHE_MAX_RECORDS {
+        if let Some(cache) = TOKEN_FILE_CACHE.get() {
+            if let Ok(mut guard) = cache.lock() {
+                if guard.len() >= TOKEN_FILE_CACHE_MAX_ENTRIES {
+                    guard.clear();
+                }
+                guard.insert(path.to_path_buf(), parsed.clone());
+            }
+        }
+    }
+    Some(parsed)
+}
 
 fn paths_signature(paths: &[(PathBuf, PathBuf)]) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -661,90 +783,47 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
             .unwrap_or("未知会话")
             .to_string();
         let fallback_project = project_name(root, path);
-        let Ok(file) = std::fs::File::open(path) else {
+        let Some(cached) = load_token_file(path, &fallback_project) else {
             collector.note_parse_error();
             continue;
         };
-
+        collector.parse_errors = collector.parse_errors.saturating_add(cached.parse_errors);
         let mut session_totals = Totals::default();
-        // Detail rows are buffered per file so the file-scoped title can be
-        // backfilled once the whole file has been read.
         let mut file_requests: Vec<RequestRow> = Vec::new();
-        let mut session_project: Option<String> = None;
-        let mut ai_title: Option<String> = None;
-        let mut summary: Option<String> = None;
-
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                collector.note_parse_error();
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                collector.note_parse_error();
-                continue;
-            };
-            // Title metadata belongs to the whole JSONL session file. Read it
-            // before applying the usage cutoff so an older title can still
-            // label usage that falls inside the selected range. aiTitle has
-            // precedence over summary regardless of event order.
-            if let Some(title) = non_empty_text(value.get("aiTitle")) {
-                ai_title = Some(title);
-            }
-            if let Some(value) = non_empty_text(value.get("summary")) {
-                summary = Some(value);
-            }
-            // Records with a missing timestamp are excluded from a bounded
-            // range rather than guessed from file mtime or browser time.
-            if cutoff.is_some_and(|minimum| timestamp(&value).is_none_or(|ts| ts < minimum)) {
+        for record in &cached.records {
+            // 时间范围在合并时应用：同一文件可被多个时间窗口复用。
+            if cutoff.is_some_and(|minimum| record.timestamp.is_none_or(|ts| ts < minimum)) {
                 continue;
             }
-            let Some(usage) = usage(&value) else {
-                continue;
-            };
-            // Fingerprint = (timestamp, full usage, model). Records without a
-            // timestamp cannot be fingerprinted and are counted as before; they
-            // are also unsortable and therefore never appear in the detail
-            // window. Reuse the parsed model name for the fingerprint and the
-            // detail row instead of decoding it twice.
-            let ts = timestamp(&value);
-            let model_name = model(&value);
-            let duplicate = ts.is_some_and(|ts| {
-                !seen.insert((
-                    ts,
-                    usage.input,
-                    usage.output,
-                    usage.read,
-                    usage.write,
-                    model_name.clone(),
-                ))
-            });
-            if duplicate {
-                continue;
+            if let Some(fingerprint) = &record.fingerprint {
+                if !seen.insert(fingerprint.clone()) {
+                    continue;
+                }
             }
-            let project = record_project(&value, &fallback_project);
-            if session_project.is_none() {
-                session_project = Some(project.clone());
-            }
-            session_totals.add(usage);
-            collector.add(usage, &value, &project);
+            session_totals.add(record.usage);
+            collector.add(
+                record.usage,
+                &json!({
+                    "timestamp": record.timestamp,
+                    "providerData": { "model": record.model },
+                }),
+                &record.project,
+            );
             if collector.collect_requests {
-                if let Some(ts) = ts {
+                if let Some(ts) = record.timestamp {
                     file_requests.push(RequestRow {
                         timestamp: ts,
-                        model: model_name,
-                        project,
+                        model: record.model.clone(),
+                        project: record.project.clone(),
                         session_id: session_id.clone(),
                         title: None,
-                        usage,
-                        thinking: thinking(&value),
+                        usage: record.usage,
+                        thinking: record.thinking,
                     });
                 }
             }
         }
-
-        // `aiTitle` can appear anywhere in the file (including after the usage
-        // records), so the file title is only final once the file is read.
-        let title = ai_title.or(summary);
+        let title = cached.title.clone();
         if !file_requests.is_empty() {
             for row in &mut file_requests {
                 row.title = title.clone();
@@ -756,7 +835,10 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
         collector.push_session(
             session_id,
             title,
-            session_project.unwrap_or(fallback_project),
+            cached
+                .session_project
+                .clone()
+                .unwrap_or_else(|| fallback_project.clone()),
             session_totals,
         );
     }
