@@ -1020,7 +1020,7 @@ function notifyResult(report: { synced?: unknown[]; skipped?: unknown[]; errors?
     : report.restartedEditor ? "，已重新打开 VS Code" : "";
   if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}` });
   if (skipped > 0) toast.warning(`有 ${skipped} 项跳过`, { description: "预览过期或复核后不再符合安全条件的项不会计为成功。" });
-  if (errors.length > 0) toast.error("部分会话同步失败", { description: errors.map((item) => item.error).join("；") });
+  if (errors.length > 0) toast.error(`已执行全部目标，${errors.length} 项失败`, { description: errors.map((item) => item.error).join("；") });
   if (report.needsRecovery) toast.error("会话操作待恢复", { description: report.temporaryFiles?.map((item) => item.reason).join("；") || "已保留恢复所需材料。" });
   if (report.editorError) toast.warning("VS Code 未能自动重新打开", { description: report.editorError });
   if (synced === 0 && skipped === 0 && errors.length === 0 && !report.needsRecovery) toast.info("当前没有需要同步的副本");

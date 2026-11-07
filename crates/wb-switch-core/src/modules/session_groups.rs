@@ -336,7 +336,8 @@ fn sync_unify_batch_workbuddy(
                         "error": format!("{}：{error}", pair.target.uid),
                     }),
                 );
-                break;
+                // 单个目标失败不应让整组后续目标都不执行。
+                continue;
             }
         }
     }
@@ -426,7 +427,8 @@ fn sync_unify_batch_vscode(
                         "error": format!("{}：{error}", pair.target.uid),
                     }),
                 );
-                break;
+                // 单个目标失败不应让整组后续目标都不执行。
+                continue;
             }
         }
     }
@@ -487,6 +489,7 @@ pub fn sync_safe_batch(
         .flatten()
         .filter(|member| {
             member.get("memberId").and_then(Value::as_str) != Some(source_member_id.as_str())
+                && member.get("linkState").and_then(Value::as_str) == Some("active")
                 && member.get("versionStatus").and_then(Value::as_str) == Some("behind")
         })
         .filter_map(|member| {
@@ -501,14 +504,35 @@ pub fn sync_safe_batch(
     // 避免为注定失败的请求打断用户。
     let mut prepared = Vec::new();
     for target_member_id in targets {
-        let pair = resolve_pair(
+        // 单个目标复核失败只记录并继续，不能让整批在第一个失败处停止。
+        let pair = match resolve_pair(
             client,
             scope,
             group_id,
             &source_member_id,
             &target_member_id,
-        )?;
-        let preview = preview_resolved_pair(client, scope, &pair)?;
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": error }),
+                );
+                continue;
+            }
+        };
+        let preview = match preview_resolved_pair(client, scope, &pair) {
+            Ok(preview) => preview,
+            Err(error) => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": error }),
+                );
+                continue;
+            }
+        };
         if preview.get("verdict").and_then(Value::as_str) != Some("fastForward") {
             push_report_item(
                 &mut combined,
@@ -522,11 +546,28 @@ pub fn sync_safe_batch(
             );
             continue;
         }
-        let token = preview
-            .get("previewToken")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "重新预览未返回可执行凭据".to_string())?;
-        let selection = parse_selection(group_id, token, "fastForward")?;
+        let token = match preview.get("previewToken").and_then(Value::as_str) {
+            Some(token) => token,
+            None => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": "重新预览未返回可执行凭据" }),
+                );
+                continue;
+            }
+        };
+        let selection = match parse_selection(group_id, token, "fastForward") {
+            Ok(selection) => selection,
+            Err(error) => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": error }),
+                );
+                continue;
+            }
+        };
         prepared.push((pair, selection));
     }
     let target_uids: Vec<&str> = prepared
@@ -535,14 +576,25 @@ pub fn sync_safe_batch(
         .collect();
     let guard = prepare_editor_window(client, restart, VSCODE_SYNC_RUNNING_HINT, &target_uids)?;
     let editor_prepared = guard.is_some();
-    let result = (|| -> Result<Value, String> {
-        for (pair, selection) in prepared {
-            let report = run_pair_sync(client, scope, &pair, &[selection], editor_prepared)?;
-            merge_sync_report(&mut combined, report);
+    for (pair, selection) in prepared {
+        match run_pair_sync(client, scope, &pair, &[selection], editor_prepared) {
+            Ok(report) => {
+                merge_sync_report(&mut combined, report);
+                if combined["needsRecovery"] == true {
+                    break;
+                }
+            }
+            Err(error) => {
+                // 普通失败不应阻断其余目标；需要恢复时下一轮会重新校验。
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": pair.target.member_id, "error": error }),
+                );
+            }
         }
-        Ok(combined)
-    })();
-    settle_editor_window(guard, result)
+    }
+    settle_editor_window(guard, Ok(combined))
 }
 
 /// 插件侧「复制 + 登记」共享段：复制给定会话到目标账号，并登记关联（无现成组则新建关联组）。
