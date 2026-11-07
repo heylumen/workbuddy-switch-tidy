@@ -1,15 +1,17 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
 import { ArrowUp, Link2, Loader2, MessagesSquare, Settings, Sparkles, Timer, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import AccountsPage from "@/pages/AccountsPage";
-import SessionsPage from "@/pages/SessionsPage";
-import CreditStatsPage from "@/pages/CreditStatsPage";
 import LimitsPage from "@/pages/LimitsPage";
-import TokenStatsPage from "@/pages/TokenStatsPage";
-import SettingsPage from "@/pages/SettingsPage";
+
+// 重型页面按需加载：不在启动时把图表/统计/会话管理全部载入 WebView。
+const SessionsPage = lazy(() => import("@/pages/SessionsPage"));
+const CreditStatsPage = lazy(() => import("@/pages/CreditStatsPage"));
+const TokenStatsPage = lazy(() => import("@/pages/TokenStatsPage"));
+const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
@@ -225,6 +227,14 @@ export default function App() {
   return (
     <TooltipProvider delayDuration={250}>
       <Router>
+        <Suspense
+          fallback={
+            <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground" role="status">
+              <Loader2 className="mr-2 size-4 animate-spin" />
+              正在加载…
+            </div>
+          }
+        >
         <Routes>
           <Route element={<Layout />}>
             <Route path="/" element={<AccountsPage />} />
@@ -236,6 +246,7 @@ export default function App() {
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>
+        </Suspense>
         <Toaster />
       </Router>
     </TooltipProvider>
