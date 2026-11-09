@@ -1502,6 +1502,30 @@ pub async fn clear_notifications() -> Result<(), String> {
     notifications::clear()
 }
 
+/// 只读审计指定账号的同名会话，不修改数据库/正文/关联表。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn audit_session_duplicates(account_id: String) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let target = account::find_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
+        let variant = account::variant_of(&target);
+        let uid = target
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if uid.is_empty() {
+            return Err("账号缺少 uid".to_string());
+        }
+        Ok(session::audit_session_duplicates_for_user(variant, &uid))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn dedup_sessions(account_id: String) -> Result<Value, String> {

@@ -429,7 +429,6 @@ pub(crate) fn list_sessions_for_user_at(paths: &SessionPaths, uid: &str) -> Valu
 // ---------------------------------------------------------------------------
 
 type AuditMember = (String, i64, Option<Vec<String>>, String);
-type AuditGroups = HashMap<(String, String), Vec<AuditMember>>;
 
 /// 只读分析某账号的同名会话候选组。
 ///
@@ -482,8 +481,8 @@ pub(crate) fn audit_session_duplicates_for_user_at(
         return json!({ "ok": false, "reason": "查询会话失败", "groups": [], "summary": {} });
     };
 
-    let index = index_project_jsonls_in(&paths.projects_dir());
-    let mut grouped: AuditGroups = HashMap::new();
+    // 先按「工作区 + 标题」收窄候选；只有重复组需要读取正文。
+    let mut candidates: HashMap<(String, String), Vec<(String, i64)>> = HashMap::new();
     for r in rows.flatten() {
         let (cid, cwd, title, custom_title, updated_at) = r;
         let cid = cid.unwrap_or_default();
@@ -491,30 +490,40 @@ pub(crate) fn audit_session_duplicates_for_user_at(
         if is_claw_workspace(&cwd) {
             continue;
         }
-        let title = session_display_title(title, custom_title);
-        let body = index.get(&cid).and_then(|path| {
-            match session_link::read_content_snapshot(path, &cid) {
-                ContentState::Ready(snapshot) => Some(snapshot.normalized.line_digests),
-                ContentState::Missing | ContentState::Unavailable(_) => None,
-            }
-        });
-        let status = if body.is_some() {
-            "ready"
-        } else {
-            "unavailable"
-        };
-        grouped
-            .entry((normalize_cwd(&cwd), title))
+        candidates
+            .entry((
+                normalize_cwd(&cwd),
+                session_display_title(title, custom_title),
+            ))
             .or_default()
-            .push((cid, updated_at.unwrap_or(0), body, status.to_string()));
+            .push((cid, updated_at.unwrap_or(0)));
     }
 
+    let index = index_project_jsonls_in(&paths.projects_dir());
     let mut groups = Vec::new();
     let mut counters = HashMap::<String, usize>::new();
-    for ((cwd, title), members) in grouped {
-        if members.len() <= 1 {
+    for ((cwd, title), candidates_members) in candidates {
+        if candidates_members.len() <= 1 {
             continue;
         }
+        let members: Vec<AuditMember> = candidates_members
+            .into_iter()
+            .map(|(cid, updated_at)| {
+                let body =
+                    index.get(&cid).and_then(|path| {
+                        match session_link::read_content_snapshot(path, &cid) {
+                            ContentState::Ready(snapshot) => Some(snapshot.normalized.line_digests),
+                            ContentState::Missing | ContentState::Unavailable(_) => None,
+                        }
+                    });
+                let status = if body.is_some() {
+                    "ready"
+                } else {
+                    "unavailable"
+                };
+                (cid, updated_at, body, status.to_string())
+            })
+            .collect();
         let kind = classify_duplicate_group(&members);
         *counters.entry(kind.to_string()).or_default() += 1;
         let sessions: Vec<Value> = members
@@ -543,6 +552,7 @@ pub(crate) fn audit_session_duplicates_for_user_at(
             "sessions": sessions,
         }));
     }
+
     groups.sort_by(|a, b| {
         b["count"].as_u64().cmp(&a["count"].as_u64()).then_with(|| {
             a["title"]

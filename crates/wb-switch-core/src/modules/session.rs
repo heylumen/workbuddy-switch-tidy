@@ -609,7 +609,7 @@ fn read_source_session_row(
     let mut stmt = conn
         .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
         .map_err(|e| e.to_string())?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
     let mut rows = stmt
         .query(rusqlite::params![cid, uid])
         .map_err(|e| e.to_string())?;
@@ -634,7 +634,7 @@ fn session_table_columns(conn: &Connection) -> Result<Vec<String>, String> {
     let stmt = conn
         .prepare("SELECT * FROM sessions LIMIT 0")
         .map_err(|e| e.to_string())?;
-    Ok(stmt.column_names().iter().map(|s| s.to_string()).collect())
+    Ok(stmt.column_names().map(|s| s.to_string()).collect())
 }
 
 /// 写后校验：目标行必须存在、归属目标账号且未删除。

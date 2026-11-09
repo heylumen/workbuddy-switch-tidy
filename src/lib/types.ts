@@ -160,6 +160,41 @@ export interface LinkedCopyResult {
   groupId: string;
 }
 
+/** 只读重复审计的消息序列分类。 */
+export type SessionDuplicateKind = "exact" | "fastForward" | "divergent" | "independent" | "unavailable";
+
+export interface SessionDuplicateAuditSession {
+  sessionId: string;
+  updatedAt: number;
+  records: number | null;
+  status: "ready" | "unavailable";
+}
+
+export interface SessionDuplicateAuditGroup {
+  uid: string;
+  cwd: string;
+  title: string;
+  count: number;
+  kind: SessionDuplicateKind;
+  suggested: string;
+  sessions: SessionDuplicateAuditSession[];
+}
+
+export interface SessionDuplicateAudit {
+  ok: boolean;
+  uid?: string;
+  reason?: string;
+  groups: SessionDuplicateAuditGroup[];
+  summary: {
+    groups: number;
+    exact: number;
+    fastForward: number;
+    divergent: number;
+    independent: number;
+    unavailable: number;
+  };
+}
+
 /** 切换时的会话复制报告；复制失败时后端只回 `error`（切换本身仍继续）。 */
 export interface SessionCopyReport {
   sourceUid?: string;

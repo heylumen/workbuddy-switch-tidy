@@ -240,6 +240,7 @@ pub fn run() {
             commands::list_account_sessions,
             commands::copy_sessions,
             commands::copy_sessions_cross,
+            commands::audit_session_duplicates,
             commands::dedup_sessions,
             commands::collapse_sessions,
             commands::session_links_preview,

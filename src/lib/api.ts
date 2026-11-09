@@ -34,6 +34,7 @@ import type {
   RotateStatus,
   Session,
   SessionCopyReport,
+  SessionDuplicateAudit,
   SessionLinksPreview,
   SessionSyncReport,
   SessionSyncSelection,
@@ -146,6 +147,7 @@ const ROUTES: Record<string, Route> = {
   list_account_sessions: { method: "GET", path: "/api/sessions/account" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
   copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
+  audit_session_duplicates: { method: "POST", path: "/api/sessions/audit-duplicates" },
   session_links_preview: { method: "POST", path: "/api/session-links/preview" },
   session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
   session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
@@ -1124,6 +1126,11 @@ export function collapseSessions(
   accountId: string,
 ): Promise<{ ok: boolean; removed: number; removedIds?: string[]; reason?: string }> {
   return call("collapse_sessions", { accountId });
+}
+
+/** 只读审计同名会话；不修改数据库、正文或关联表。 */
+export function auditSessionDuplicates(accountId: string): Promise<SessionDuplicateAudit> {
+  return call("audit_session_duplicates", { accountId });
 }
 // ---------------------------------------------------------------------------
 // 通知存档（toast 事后可查）
