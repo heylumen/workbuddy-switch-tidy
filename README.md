@@ -128,6 +128,7 @@ npm i -g workbuddy-switch
 workbuddy-switch              # 启动本地服务 + 自动打开浏览器
 workbuddy-switch status       # 终端查看当前账号
 workbuddy-switch repair-links # 修复关联表脏元数据（自动备份）
+workbuddy-switch audit-duplicates # 只读审计同名会话（不修改数据）
 # 首次启动会打印带 token 的 WebUI 链接；直接访问无 token 地址会被拒绝
 ```
 

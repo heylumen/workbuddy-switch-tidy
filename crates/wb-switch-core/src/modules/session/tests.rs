@@ -2496,6 +2496,60 @@ fn cross_copy_reuses_existing_equivalent_target_without_link() {
     );
 }
 
+/// P1a 只读审计：按消息序列公共前缀分类，不修改会话。
+#[test]
+fn audit_session_duplicates_classifies_exact_fast_forward_divergent_and_independent() {
+    let env = Env::new("audit-duplicates");
+    env.create_db();
+    env.create_edge_db(WbVariant::Cn);
+
+    for (id, title) in [("exact-a", "exact"), ("exact-b", "exact")] {
+        env.add_session(id, "uid-a", title);
+        env.add_body(id, &body_text(id));
+    }
+    let mut fast_long = body_text("fast-a");
+    fast_long
+        .push_str(&json!({"type": "user", "sessionId": "fast-a", "text": "extra"}).to_string());
+    fast_long.push('\n');
+    for (id, body) in [
+        ("fast-a", fast_long.as_str()),
+        ("fast-b", body_text("fast-b").as_str()),
+    ] {
+        env.add_session(id, "uid-a", "fast");
+        env.add_body(id, body);
+    }
+    for id in ["div-a", "div-b"] {
+        env.add_session(id, "uid-a", "div");
+        let body = if id == "div-a" {
+            body_text_with(id, "共同")
+        } else {
+            format!(
+                "{}\n{}\n",
+                json!({"type": "user", "sessionId": id, "text": "共同"}),
+                json!({"type": "assistant", "sessionId": id, "text": "不同"})
+            )
+        };
+        env.add_body(id, &body);
+    }
+    for id in ["ind-a", "ind-b"] {
+        env.add_session(id, "uid-a", "ind");
+        env.add_body(
+            id,
+            &body_text_with(id, if id == "ind-a" { "甲" } else { "乙" }),
+        );
+    }
+
+    let report = audit_session_duplicates_for_user_at(&env.paths(), WbVariant::Cn, "uid-a");
+    assert_eq!(report["ok"], true, "{report}");
+    let summary = &report["summary"];
+    assert_eq!(summary["exact"], 1, "{report}");
+    assert_eq!(summary["fastForward"], 1, "{report}");
+    assert_eq!(summary["divergent"], 1, "{report}");
+    assert_eq!(summary["independent"], 1, "{report}");
+    assert_eq!(summary["unavailable"], 0, "{report}");
+    assert_eq!(report["groups"].as_array().unwrap().len(), 4, "{report}");
+}
+
 /// 目标档列集合与源档不同（双向缺列）时按目标列取交集：不写 NULL、不报错。
 #[test]
 fn cross_copy_uses_target_columns_intersection() {
