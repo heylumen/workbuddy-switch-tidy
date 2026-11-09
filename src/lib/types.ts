@@ -178,9 +178,23 @@ export interface SessionDuplicateAuditGroup {
   title: string;
   count: number;
   kind: SessionDuplicateKind;
+  commonPrefix?: number;
   suggested: string;
   suggestedKeepSessionId?: string | null;
   sessions: SessionDuplicateAuditSession[];
+}
+
+export interface SessionDuplicateHideRecord {
+  id: string;
+  variant: string;
+  uid: string;
+  cwd: string;
+  title: string;
+  keepSessionId: string;
+  hiddenIds: string[];
+  linkRefs: { groupId: string; memberId: string }[];
+  backup: string;
+  createdAt: number;
 }
 
 export interface SessionDuplicateAudit {

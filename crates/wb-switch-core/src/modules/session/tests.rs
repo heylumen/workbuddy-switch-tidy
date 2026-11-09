@@ -2554,7 +2554,46 @@ fn hide_duplicate_group_unlinks_alias_before_soft_hide() {
         other => panic!("关联存储应为 Ready，实际 {other:?}"),
     };
     assert!(store.groups.iter().any(|group| group.id == "g-keep"));
-    assert!(!store.groups.iter().any(|group| group.id == "g-alias"));
+    let alias_group = store
+        .groups
+        .iter()
+        .find(|group| group.id == "g-alias")
+        .expect("stale 关联组必须保留，便于恢复");
+    assert_eq!(
+        alias_group.members[0].state,
+        session_link::MemberState::Stale
+    );
+
+    let hides = list_duplicate_hides_for_user_at(&paths, WbVariant::Cn, "uid-a");
+    let hide_id = hides["hides"][0]["id"].as_str().unwrap().to_string();
+    let restored = restore_duplicate_hide_for_user_at(&paths, WbVariant::Cn, "uid-a", &hide_id);
+    assert_eq!(restored["ok"], true, "{restored}");
+    assert_eq!(restored["restored"], 1, "{restored}");
+    assert_eq!(restored["reactivated"], 1, "{restored}");
+    let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+    let alias_deleted: Option<i64> = conn
+        .query_row(
+            "SELECT deleted_at FROM sessions WHERE id='alias'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(alias_deleted.is_none());
+    let store = match session_link::load_store(&paths) {
+        session_link::StoreState::Ready(store) => store,
+        other => panic!("关联存储应为 Ready，实际 {other:?}"),
+    };
+    let alias_group = store
+        .groups
+        .iter()
+        .find(|group| group.id == "g-alias")
+        .unwrap();
+    assert_eq!(
+        alias_group.members[0].state,
+        session_link::MemberState::Active
+    );
+    let hides = list_duplicate_hides_for_user_at(&paths, WbVariant::Cn, "uid-a");
+    assert!(hides["hides"].as_array().unwrap().is_empty());
 }
 
 #[test]

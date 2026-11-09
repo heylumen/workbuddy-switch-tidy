@@ -24,7 +24,7 @@ import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import { formatFullDateTime } from "@/lib/format-time";
-import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateAuditGroup, SessionDuplicateAuditSession, SessionDuplicateKind, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateAuditGroup, SessionDuplicateAuditSession, SessionDuplicateHideRecord, SessionDuplicateKind, TravelStatus } from "@/lib/types";
 
 const AUDIT_KIND_LABEL: Record<SessionDuplicateKind, string> = {
   exact: "精确重复",
@@ -419,6 +419,8 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
   const [hideTarget, setHideTarget] = useState<{ group: SessionDuplicateAuditGroup; keep: SessionDuplicateAuditSession } | null>(null);
   const [hideBusy, setHideBusy] = useState(false);
   const [hideError, setHideError] = useState<string | null>(null);
+  const [hides, setHides] = useState<SessionDuplicateHideRecord[]>([]);
+  const [restoreBusy, setRestoreBusy] = useState<string | null>(null);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
   const [dedupResult, setDedupResult] = useState<string | null>(null);
@@ -501,7 +503,12 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
     setAuditReport(null);
     setAuditBusy(true);
     try {
-      setAuditReport(await api.auditSessionDuplicates(account.id));
+      const [report, hidden] = await Promise.all([
+        api.auditSessionDuplicates(account.id),
+        api.listDuplicateHides(account.id),
+      ]);
+      setAuditReport(report);
+      setHides(hidden.hides ?? []);
     } catch (e) {
       setAuditError(api.asError(e));
     } finally {
@@ -529,7 +536,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
         result.hidden
           ? `已软隐藏 ${result.hidden} 个别名（正文保留）`
           : "没有可隐藏的别名",
-        { description: result.unlinked ? `${result.unlinked} 个关联副本已解除关联` : result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : undefined },
+        { description: [result.unlinked ? `${result.unlinked} 个关联副本已标记 stale` : result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : "", result.backup ? `备份：${result.backup}` : ""].filter(Boolean).join(" · ") || undefined },
       );
       setHideTarget(null);
       await loadAudit();
@@ -537,6 +544,25 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
       setHideError(api.asError(e));
     } finally {
       setHideBusy(false);
+    }
+  }
+
+  async function restoreHide(hideId: string) {
+    setRestoreBusy(hideId);
+    try {
+      const result = await api.restoreDuplicateHide(account.id, hideId);
+      if (!result.ok) {
+        toast.error("恢复失败", { description: result.reason || "未知错误" });
+        return;
+      }
+      toast.success(`已恢复 ${result.restored ?? 0} 个会话`, {
+        description: result.reactivated ? `${result.reactivated} 个关联已重新激活` : undefined,
+      });
+      await loadAudit();
+    } catch (e) {
+      toast.error("恢复失败", { description: api.asError(e) });
+    } finally {
+      setRestoreBusy(null);
     }
   }
 
@@ -633,12 +659,6 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               {!demoModeEnabled && (
                 <>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => { setDedupResult(null); setDedupOpen(true); }}>
-                  <Eraser />清理重复会话
-                </DropdownMenuItem>
-                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => { setCollapseResult(null); setCollapseOpen(true); }}>
-                  <Layers />折叠同名会话
-                </DropdownMenuItem>
                 <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => void loadAudit()}>
                   <Search />重复审计
                 </DropdownMenuItem>
@@ -1116,7 +1136,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
           <DialogHeader>
             <DialogTitle>重复审计</DialogTitle>
             <DialogDescription>
-              {name} · 只读分析，不修改数据库、正文或关联表
+              {name} · 审计报告只读；选择保留项确认后才会写入数据库
             </DialogDescription>
           </DialogHeader>
           {auditBusy && (
@@ -1155,6 +1175,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                         <div className="min-w-0">
                           <div className="truncate font-medium">{group.title}</div>
                           <div className="mt-1 truncate text-xs text-muted-foreground" title={group.cwd}>{group.cwd}</div>
+                          {typeof group.commonPrefix === "number" && group.commonPrefix > 0 && (
+                            <div className="mt-1 text-xs text-muted-foreground">公共前缀 {group.commonPrefix} 条消息</div>
+                          )}
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
                           <Badge variant="outline">{AUDIT_KIND_LABEL[group.kind]}</Badge>
@@ -1197,6 +1220,25 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                     </div>
                   ))}
                   {auditReport.groups.length > 50 && <p className="text-xs text-muted-foreground">仅显示前 50 组，共 {auditReport.groups.length} 组。</p>}
+                </div>
+              )}
+              {hides.length > 0 && (
+                <div className="space-y-2 border-t pt-3">
+                  <div className="text-xs font-medium text-muted-foreground">已软隐藏，尚未恢复（{hides.length} 组）</div>
+                  {hides.slice(0, 10).map((record) => (
+                    <div key={record.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2 text-xs">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium">{record.title}</div>
+                        <div className="mt-0.5 truncate text-muted-foreground" title={record.backup}>
+                          {record.hiddenIds.length} 条已隐藏 · 备份：{record.backup}
+                        </div>
+                      </div>
+                      <Button size="sm" variant="outline" disabled={restoreBusy === record.id} onClick={() => void restoreHide(record.id)}>
+                        {restoreBusy === record.id ? "恢复中…" : "恢复"}
+                      </Button>
+                    </div>
+                  ))}
+                  {hides.length > 10 && <p className="text-xs text-muted-foreground">仅显示前 10 条恢复记录，共 {hides.length} 条。</p>}
                 </div>
               )}
             </div>

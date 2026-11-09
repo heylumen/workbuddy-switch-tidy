@@ -1550,6 +1550,9 @@ pub async fn hide_duplicate_group(
         if uid.is_empty() {
             return Err("账号缺少 uid".to_string());
         }
+        if process::is_workbuddy_running(variant) {
+            return Err("请先退出 WorkBuddy 再软隐藏重复会话".to_string());
+        }
         Ok(session::hide_duplicate_group_for_user(
             variant,
             &uid,
@@ -1557,6 +1560,49 @@ pub async fn hide_duplicate_group(
             &title,
             &keep_session_id,
             unlink_linked.unwrap_or(false),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 列出本工具已软隐藏、尚未恢复的重复组。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_duplicate_hides(account_id: String) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let target = account::find_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
+        let variant = account::variant_of(&target);
+        let uid = account::get_str(&target, "uid")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "账号缺少 uid".to_string())?;
+        Ok(session::list_duplicate_hides_for_user(variant, &uid))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 恢复一次软隐藏；清 deleted_at 并重新激活 stale 关联。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn restore_duplicate_hide(account_id: String, hide_id: String) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let target = account::find_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
+        let variant = account::variant_of(&target);
+        let uid = account::get_str(&target, "uid")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "账号缺少 uid".to_string())?;
+        if process::is_workbuddy_running(variant) {
+            return Err("请先退出 WorkBuddy 再恢复重复会话".to_string());
+        }
+        Ok(session::restore_duplicate_hide_for_user(
+            variant, &uid, &hide_id,
         ))
     })
     .await
@@ -1605,6 +1651,9 @@ pub async fn collapse_sessions(account_id: String) -> Result<Value, String> {
             .to_string();
         if uid.is_empty() {
             return Err("账号缺少 uid".to_string());
+        }
+        if process::is_workbuddy_running(variant) {
+            return Err("请先退出 WorkBuddy 再折叠同名会话".to_string());
         }
         Ok(session::collapse_sessions_for_user(variant, &uid))
     })
