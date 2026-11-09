@@ -5394,7 +5394,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-core"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -5417,7 +5417,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-rust"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "libc",
  "objc2",
@@ -5441,7 +5441,7 @@ dependencies = [
 
 [[package]]
 name = "wb-switch-server"
-version = "1.0.13"
+version = "1.0.14"
 dependencies = [
  "axum",
  "rust-embed",

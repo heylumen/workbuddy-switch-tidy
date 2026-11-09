@@ -253,7 +253,7 @@ interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
-  onRefresh?: (a: AccountMeta) => void;
+  onRefresh?: (a: AccountMeta) => void | Promise<void>;
   /** 打开「账号信息」弹框（查看信息、编辑备注、选择显示字段）。 */
   onShowInfo?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
@@ -403,6 +403,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
 export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
+  const [refreshBusy, setRefreshBusy] = useState(false);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
   const [collapseOpen, setCollapseOpen] = useState(false);
@@ -543,8 +544,20 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-40">
               {!demoModeEnabled && (
-                <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
-                  <RefreshCw />刷新 Token
+                <DropdownMenuItem
+                  disabled={featuresDisabled || !onRefresh || refreshBusy}
+                  onSelect={async () => {
+                    if (!onRefresh || refreshBusy) return;
+                    setRefreshBusy(true);
+                    try {
+                      await onRefresh(account);
+                    } finally {
+                      setRefreshBusy(false);
+                    }
+                  }}
+                >
+                  {refreshBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  {refreshBusy ? "刷新中…" : "刷新 Token"}
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem disabled={featuresDisabled || !onShowInfo} onSelect={() => onShowInfo?.(account)}>
@@ -926,15 +939,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               disabled={dedupBusy}
               onClick={async () => {
                 setDedupBusy(true);
+                const toastId = toast.loading("正在清理重复会话", { description: name });
                 try {
                   const res = await api.dedupSessions(account.id);
                   if (res.ok) {
-                    toast.success(`已清理 ${res.removed} 个重复会话`, { description: name });
+                    toast.success(`已清理 ${res.removed} 个重复会话`, { id: toastId, description: name });
                   } else {
-                    toast.error("清理失败", { description: res.reason || "未知错误" });
+                    toast.error("清理失败", { id: toastId, description: res.reason || "未知错误" });
                   }
                 } catch (e) {
-                  toast.error("清理失败", { description: api.asError(e) });
+                  toast.error("清理失败", { id: toastId, description: api.asError(e) });
                 } finally {
                   setDedupBusy(false);
                   setDedupOpen(false);
@@ -977,15 +991,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               disabled={collapseBusy}
               onClick={async () => {
                 setCollapseBusy(true);
+                const toastId = toast.loading("正在折叠同名会话", { description: name });
                 try {
                   const res = await api.collapseSessions(account.id);
                   if (res.ok) {
-                    toast.success(`已折叠 ${res.removed} 个冗余会话（数据已保留）`, { description: name });
+                    toast.success(`已折叠 ${res.removed} 个冗余会话（数据已保留）`, { id: toastId, description: name });
                   } else {
-                    toast.error("折叠失败", { description: res.reason || "未知错误" });
+                    toast.error("折叠失败", { id: toastId, description: res.reason || "未知错误" });
                   }
                 } catch (e) {
-                  toast.error("折叠失败", { description: api.asError(e) });
+                  toast.error("折叠失败", { id: toastId, description: api.asError(e) });
                 } finally {
                   setCollapseBusy(false);
                   setCollapseOpen(false);
