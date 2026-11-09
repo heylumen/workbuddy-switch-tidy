@@ -634,17 +634,18 @@ export default function AccountsPage() {
   }
 
   async function onRefresh(a: AccountMeta) {
+    const label = displayName(a);
+    const toastId = toast.loading("正在刷新 Token", { description: label });
     try {
       const res = await api.refreshAccountToken(a.id);
-      const label = displayName(a);
       if (res.needsRelogin) {
-        toast.error("Token 刷新失败", { description: `${label}：需重新登录${res.needsReloginReason ? `（${res.needsReloginReason}）` : ""}` });
+        toast.error("Token 刷新失败", { id: toastId, description: `${label}：需重新登录${res.needsReloginReason ? `（${res.needsReloginReason}）` : ""}` });
       } else {
-        toast.success("Token 已刷新", { description: label });
+        toast.success("Token 已刷新", { id: toastId, description: label });
       }
       void fetchAll();
     } catch (e) {
-      toast.error("Token 刷新失败", { description: api.asError(e) });
+      toast.error("Token 刷新失败", { id: toastId, description: api.asError(e) });
     }
   }
 
