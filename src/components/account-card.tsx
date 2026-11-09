@@ -406,8 +406,10 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
   const [refreshBusy, setRefreshBusy] = useState(false);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
+  const [dedupResult, setDedupResult] = useState<string | null>(null);
   const [collapseOpen, setCollapseOpen] = useState(false);
   const [collapseBusy, setCollapseBusy] = useState(false);
+  const [collapseResult, setCollapseResult] = useState<string | null>(null);
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   /**
@@ -571,10 +573,10 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               {!demoModeEnabled && (
                 <>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setDedupOpen(true)}>
+                  <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => { setDedupResult(null); setDedupOpen(true); }}>
                   <Eraser />清理重复会话
                 </DropdownMenuItem>
-                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setCollapseOpen(true)}>
+                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => { setCollapseResult(null); setCollapseOpen(true); }}>
                   <Layers />折叠同名会话
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
@@ -931,7 +933,19 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             </p>
             <p>被清理的重复会话会被软删除（标记 deleted_at），不会从云端移除目标账号的已有副本。</p>
           </div>
+          {dedupResult && (
+            <div className={cn(
+              "rounded-md border p-3 text-sm",
+              dedupResult.startsWith("清理失败") ? "border-destructive/30 bg-destructive/5 text-destructive" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-800",
+            )}>
+              {dedupResult}
+            </div>
+          )}
           <DialogFooter className="gap-2">
+            {dedupResult ? (
+              <Button onClick={() => setDedupOpen(false)}>关闭</Button>
+            ) : (
+              <>
             <Button variant="outline" onClick={() => setDedupOpen(false)} disabled={dedupBusy}>
               取消
             </Button>
@@ -943,21 +957,25 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                 try {
                   const res = await api.dedupSessions(account.id);
                   if (res.ok) {
+                    setDedupResult(`已清理 ${res.removed} 个重复会话`);
                     toast.success(`已清理 ${res.removed} 个重复会话`, { id: toastId, description: name });
                   } else {
+                    setDedupResult(`清理失败：${res.reason || "未知错误"}`);
                     toast.error("清理失败", { id: toastId, description: res.reason || "未知错误" });
                   }
                 } catch (e) {
+                  setDedupResult(`清理失败：${api.asError(e)}`);
                   toast.error("清理失败", { id: toastId, description: api.asError(e) });
                 } finally {
                   setDedupBusy(false);
-                  setDedupOpen(false);
                 }
               }}
             >
               {dedupBusy ? <Loader2 className="size-4 animate-spin" /> : <Eraser className="size-4" />}
               {dedupBusy ? "清理中…" : "确认清理"}
             </Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -983,7 +1001,19 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               <strong className="text-foreground">执行前请关闭 WorkBuddy 本体</strong>，否则数据库可能被占用导致失败。
             </p>
           </div>
+          {collapseResult && (
+            <div className={cn(
+              "rounded-md border p-3 text-sm",
+              collapseResult.startsWith("折叠失败") ? "border-destructive/30 bg-destructive/5 text-destructive" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-800",
+            )}>
+              {collapseResult}
+            </div>
+          )}
           <DialogFooter className="gap-2">
+            {collapseResult ? (
+              <Button onClick={() => setCollapseOpen(false)}>关闭</Button>
+            ) : (
+              <>
             <Button variant="outline" onClick={() => setCollapseOpen(false)} disabled={collapseBusy}>
               取消
             </Button>
@@ -995,21 +1025,25 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                 try {
                   const res = await api.collapseSessions(account.id);
                   if (res.ok) {
+                    setCollapseResult(`已折叠 ${res.removed} 个冗余会话（数据已保留）`);
                     toast.success(`已折叠 ${res.removed} 个冗余会话（数据已保留）`, { id: toastId, description: name });
                   } else {
+                    setCollapseResult(`折叠失败：${res.reason || "未知错误"}`);
                     toast.error("折叠失败", { id: toastId, description: res.reason || "未知错误" });
                   }
                 } catch (e) {
+                  setCollapseResult(`折叠失败：${api.asError(e)}`);
                   toast.error("折叠失败", { id: toastId, description: api.asError(e) });
                 } finally {
                   setCollapseBusy(false);
-                  setCollapseOpen(false);
                 }
               }}
             >
               {collapseBusy ? <Loader2 className="size-4 animate-spin" /> : <Layers className="size-4" />}
               {collapseBusy ? "折叠中…" : "确认折叠"}
             </Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
