@@ -379,11 +379,16 @@ pub(crate) use list::dedup_sessions_for_user_at;
 #[cfg(test)]
 pub(crate) use list::hide_duplicate_group_for_user_at;
 #[cfg(test)]
+pub(crate) use list::list_duplicate_hides_for_user_at;
+#[cfg(test)]
 pub(crate) use list::list_sessions_for_user_at;
+#[cfg(test)]
+pub(crate) use list::restore_duplicate_hide_for_user_at;
 pub(crate) use list::session_row_for_user;
 pub use list::{
     audit_session_duplicates_for_user, collapse_sessions_for_user, dedup_sessions_for_user,
-    hide_duplicate_group_for_user, list_sessions_for_account, list_sessions_for_user,
+    hide_duplicate_group_for_user, list_duplicate_hides_for_user, list_sessions_for_account,
+    list_sessions_for_user, restore_duplicate_hide_for_user,
 };
 
 /// 在 `{档位数据根}/projects/{workspace}/{cid}.jsonl` 定位会话正文。
