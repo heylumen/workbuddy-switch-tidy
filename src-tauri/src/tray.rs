@@ -59,8 +59,7 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
             "open-github" => open_github(app),
             "checkin-all" => start_checkin_all(app),
             "check-update" => start_update_check(app),
-            "update-now" => start_update_download(app),
-            "update-restart" => start_update_restart(app),
+            "update-release" | "update-now" | "update-restart" => open_release_page(app),
             "lightweight-mode" => toggle_lightweight(app),
             "quit-app" => app.exit(0),
             _ => {}
@@ -428,29 +427,11 @@ fn start_update_check<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
-/// 托盘「升级到 vX.Y.Z」/「更新失败，点击重试」：启动后台下载。
-///
-/// 互斥与演示模式短路都在更新服务内（下载是长任务，托盘不持有它的生命周期）。
-fn start_update_download<R: Runtime>(app: &AppHandle<R>) {
-    if crate::is_screenshot_demo() {
-        set_tray_tooltip(app, "README 截图演示模式");
-        return;
-    }
-    let _ = crate::update_service::start_download(app);
-}
-
-/// 托盘「重启以完成升级」：安装已下载的包并重启。
-///
-/// 安装会解压整包 / 替换应用（macOS 未授权时弹系统授权框），必须离开主线程执行。
-fn start_update_restart<R: Runtime>(app: &AppHandle<R>) {
-    if crate::is_screenshot_demo() {
-        set_tray_tooltip(app, "README 截图演示模式");
-        return;
-    }
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = crate::update_service::restart(&app).await;
-    });
+/// 托盘「打开发布页」：单文件版不在应用内下载或安装，只打开 Release 页面。
+fn open_release_page<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app
+        .opener()
+        .open_url(crate::update_service::release_url(), None::<&str>);
 }
 
 fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
@@ -549,18 +530,15 @@ pub(crate) fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 enum UpdateMenuAction {
     /// 检查更新。
     Check,
-    /// 下载 / 重试下载。
-    Download,
-    /// 安装并重启。
-    Restart,
+    /// 打开 Release 页面，手动下载。
+    OpenRelease,
 }
 
 impl UpdateMenuAction {
     fn id(self) -> &'static str {
         match self {
             Self::Check => "check-update",
-            Self::Download => "update-now",
-            Self::Restart => "update-restart",
+            Self::OpenRelease => "update-release",
         }
     }
 }
@@ -575,32 +553,19 @@ fn update_menu_spec(snapshot: &UpdateSnapshot) -> (UpdateMenuAction, String, boo
             (UpdateMenuAction::Check, "检查更新".to_string(), true)
         }
         UpdatePhase::Checking => (UpdateMenuAction::Check, "正在检查…".to_string(), false),
-        UpdatePhase::Available => (
-            UpdateMenuAction::Download,
+        UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::ReadyToRestart => (
+            UpdateMenuAction::OpenRelease,
             match snapshot.latest.as_deref() {
-                Some(latest) => format!("升级到 v{latest}"),
-                None => "升级到新版本".to_string(),
+                Some(latest) => format!("打开发布页（v{latest}）"),
+                None => "打开发布页".to_string(),
             },
-            true,
-        ),
-        UpdatePhase::Downloading => (
-            UpdateMenuAction::Download,
-            match snapshot.percent {
-                Some(percent) => format!("正在下载更新 {percent}%"),
-                None => "正在下载更新…".to_string(),
-            },
-            false,
-        ),
-        UpdatePhase::ReadyToRestart => (
-            UpdateMenuAction::Restart,
-            "重启以完成升级".to_string(),
             true,
         ),
         UpdatePhase::Error => {
             if snapshot.latest.is_some() {
                 (
-                    UpdateMenuAction::Download,
-                    "更新失败，点击重试".to_string(),
+                    UpdateMenuAction::OpenRelease,
+                    "更新失败，打开发布页".to_string(),
                     true,
                 )
             } else {
@@ -883,9 +848,11 @@ fn format_checkin_tooltip(value: &Value) -> String {
 mod tests {
     #[cfg(windows)]
     use super::taskbar_uses_light_theme;
+    #[cfg(not(windows))]
+    use super::tray_icon;
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
+        should_keep_tray_alive, should_wake_main_window, tray_icon_variant, MouseButton,
         MouseButtonState, TrayIconVariant,
     };
     use serde_json::json;
@@ -1230,8 +1197,8 @@ mod tests {
         assert_eq!(
             update_menu_spec(&snapshot(UpdatePhase::Available, Some("0.1.48"), None)),
             (
-                UpdateMenuAction::Download,
-                "升级到 v0.1.48".to_string(),
+                UpdateMenuAction::OpenRelease,
+                "打开发布页（v0.1.48）".to_string(),
                 true
             )
         );
@@ -1242,37 +1209,37 @@ mod tests {
                 Some(42)
             )),
             (
-                UpdateMenuAction::Download,
-                "正在下载更新 42%".to_string(),
-                false
+                UpdateMenuAction::OpenRelease,
+                "打开发布页（v0.1.48）".to_string(),
+                true
             )
         );
         assert_eq!(
             update_menu_spec(&snapshot(UpdatePhase::Downloading, Some("0.1.48"), None)),
             (
-                UpdateMenuAction::Download,
-                "正在下载更新…".to_string(),
-                false
+                UpdateMenuAction::OpenRelease,
+                "打开发布页（v0.1.48）".to_string(),
+                true
             ),
-            "总量未知时只显示进行中，不显示假百分比"
+            "单文件版不提供应用内下载"
         );
         assert_eq!(
             update_menu_spec(&snapshot(UpdatePhase::ReadyToRestart, Some("0.1.48"), None)),
             (
-                UpdateMenuAction::Restart,
-                "重启以完成升级".to_string(),
+                UpdateMenuAction::OpenRelease,
+                "打开发布页（v0.1.48）".to_string(),
                 true
             ),
-            "重启时机由用户决定，不自动重启"
+            "不提供应用内安装或重启"
         );
         assert_eq!(
             update_menu_spec(&snapshot(UpdatePhase::Error, Some("0.1.48"), None)),
             (
-                UpdateMenuAction::Download,
-                "更新失败，点击重试".to_string(),
+                UpdateMenuAction::OpenRelease,
+                "更新失败，打开发布页".to_string(),
                 true
             ),
-            "已知目标版本 → 重试的是下载"
+            "已知目标版本 → 打开发布页手动下载"
         );
         assert_eq!(
             update_menu_spec(&snapshot(UpdatePhase::Error, None, None)),
