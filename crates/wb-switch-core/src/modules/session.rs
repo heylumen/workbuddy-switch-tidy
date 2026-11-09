@@ -1063,6 +1063,8 @@ enum CopyOutcome {
 struct TargetResolution {
     group_id: Option<String>,
     existing_link: Option<String>,
+    /// 目标账号在同组内被软隐藏的关联副本；复制时必须先恢复，不能新建。
+    hidden_aliases: Vec<String>,
 }
 
 /// 目标账号在关联组内的 active 成员是否真实有效：正文可验证 + 会话行归属正确。
@@ -1084,6 +1086,7 @@ fn resolve_target(context: &CopyContext, cid: &str) -> Result<TargetResolution, 
             return Ok(TargetResolution {
                 group_id: None,
                 existing_link: None,
+                hidden_aliases: Vec::new(),
             })
         }
         StoreState::Ready(store) => store,
@@ -1101,25 +1104,39 @@ fn resolve_target(context: &CopyContext, cid: &str) -> Result<TargetResolution, 
         return Ok(TargetResolution {
             group_id: None,
             existing_link: None,
+            hidden_aliases: Vec::new(),
         });
     };
     let group_id = Some(group.id.clone());
+    let hidden_aliases: Vec<String> = group
+        .members
+        .iter()
+        .filter(|member| {
+            member.state == session_link::MemberState::Stale
+                && member.uid == context.target_uid
+                && member.variant.unwrap_or(group.variant) == context.variant
+        })
+        .map(|member| member.session_id.clone())
+        .collect();
     let Some(member) = session_link::active_member_for(group, context.target_uid) else {
         return Ok(TargetResolution {
             group_id,
             existing_link: None,
+            hidden_aliases,
         });
     };
     if member_is_valid(context.paths, member) {
         return Ok(TargetResolution {
             group_id,
             existing_link: Some(member.session_id.clone()),
+            hidden_aliases: Vec::new(),
         });
     }
-    // 失效成员保留记录、不自动复活；本次会重建一个新成员。
+    // 失效成员保留记录、不自动复活；存在隐藏别名时由调用方阻止新建。
     Ok(TargetResolution {
         group_id,
         existing_link: None,
+        hidden_aliases,
     })
 }
 
@@ -1239,6 +1256,12 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
             session_id,
             group_id: resolution.group_id.unwrap_or_default(),
         });
+    }
+    if !resolution.hidden_aliases.is_empty() {
+        return Err(format!(
+            "目标账号存在 {} 个已隐藏的关联副本，请先在「重复审计」中恢复后再复制",
+            resolution.hidden_aliases.len()
+        ));
     }
 
     // 本 fork 的内容级去重（design：从源头杜绝重复行累积）。
