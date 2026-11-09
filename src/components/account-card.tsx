@@ -532,12 +532,18 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
         setHideError(result.reason || "软隐藏失败");
         return;
       }
-      toast.success(
-        result.hidden
-          ? `已软隐藏 ${result.hidden} 个别名（正文保留）`
-          : "没有可隐藏的别名",
-        { description: [result.unlinked ? `${result.unlinked} 个关联副本已标记 stale` : result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : "", result.backup ? `备份：${result.backup}` : ""].filter(Boolean).join(" · ") || undefined },
-      );
+      if (result.restoreRecordSaved === false) {
+        toast.warning("已软隐藏，但恢复记录保存失败", {
+          description: result.restoreRecordError || "请使用备份文件恢复",
+        });
+      } else {
+        toast.success(
+          result.hidden
+            ? `已软隐藏 ${result.hidden} 个别名（正文保留）`
+            : "没有可隐藏的别名",
+          { description: [result.unlinked ? `${result.unlinked} 个关联副本已标记 stale` : result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : "", result.backup ? `备份：${result.backup}` : ""].filter(Boolean).join(" · ") || undefined },
+        );
+      }
       setHideTarget(null);
       await loadAudit();
     } catch (e) {
@@ -555,9 +561,13 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
         toast.error("恢复失败", { description: result.reason || "未知错误" });
         return;
       }
-      toast.success(`已恢复 ${result.restored ?? 0} 个会话`, {
-        description: result.reactivated ? `${result.reactivated} 个关联已重新激活` : undefined,
-      });
+      if (result.journalError) {
+        toast.warning("会话已恢复，但隐藏记录清理失败", { description: result.journalError });
+      } else {
+        toast.success(`已恢复 ${result.restored ?? 0} 个会话`, {
+          description: [result.reactivated ? `${result.reactivated} 个关联已重新激活` : "", result.backup ? `备份：${result.backup}` : ""].filter(Boolean).join(" · ") || undefined,
+        });
+      }
       await loadAudit();
     } catch (e) {
       toast.error("恢复失败", { description: api.asError(e) });

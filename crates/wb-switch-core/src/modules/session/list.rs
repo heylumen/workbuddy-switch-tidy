@@ -2,12 +2,12 @@ use serde_json::{json, Value};
 
 use super::*;
 
-/// 清理某账号下「同一会话被复制多次」产生的重复行（路径 B 副本）。
+/// 清理某账号下「同一会话被复制多次」产生的精确重复行。
 ///
 /// 判重键 = (归一化 cwd, 归一化 jsonl 正文)；仅正文一致才视为重复，
 /// 不依赖 (cwd + title) 这种过宽键，避免误删同工作区下「无标题 / 会议纪要」
-/// 等正常同名会话。每组保留 `updated_at` 最新一条，其余软删除
-/// （`deleted_at` 置值），并清理其孤儿 jsonl 与云端映射，避免残留。
+/// 等正常同名会话。每组保留 `updated_at` 最新一条，其余仅软删除
+/// （`deleted_at` 置值）；JSONL 正文保留，只清理对应 edge mapping。
 ///
 /// 注意：直接调用会写入 `~/.workbuddy/workbuddy.db`，请在 WorkBuddy 关闭后执行。
 pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
@@ -77,8 +77,8 @@ pub(crate) fn dedup_sessions_for_user_at(
     let mut removed = 0usize;
     let mut protected = 0usize;
     let mut removed_ids: Vec<String> = Vec::new();
-    // 仍被关联组引用的会话不能删：删掉后关联立即失效，且 dedup 会连正文一起删除、
-    // 无法恢复。这里跨档位取并集，避免只保护当前档位而误伤另一档的关联。
+    // 仍被关联组引用的会话不能删：软删后关联立即失效。这里跨档位取并集，
+    // 避免只保护当前档位而误伤另一档的关联。JSONL 正文不会删除，可恢复。
     let linked = match session_link::protected_session_ids(paths) {
         Ok(ids) => ids,
         Err(reason) => return json!({ "ok": false, "reason": reason, "removed": 0 }),
@@ -659,12 +659,12 @@ fn common_prefix_len(seqs: &[&Vec<String>]) -> usize {
 
 /// 软隐藏一个已审计重复组中除 `keep_session_id` 外的别名。
 ///
-/// 只写 `sessions.deleted_at`；不删除 JSONL、不改 edge mapping、不改关联表。
+/// 只写 `sessions.deleted_at`；不删除 JSONL、不改 edge mapping。
 /// - exact：保留任意一条；其余软隐藏。
 /// - fastForward：必须保留最长副本。
 /// - divergent：允许用户显式指定保留项。
 /// - unavailable / independent：拒绝执行。
-/// - 关联中的 active 成员跳过。
+/// - 默认跳过 active 关联成员；`unlink_linked` 为 true 时改为标记 stale，保留映射。
 pub fn hide_duplicate_group_for_user(
     variant: WbVariant,
     uid: &str,
@@ -721,6 +721,33 @@ pub(crate) fn hide_duplicate_group_for_user_at(
     }
     if kind == "fastForward" && group["suggestedKeepSessionId"] != keep_session_id {
         return json!({ "ok": false, "reason": "快进副本必须保留最长副本" });
+    }
+    // 审计到执行之间可能发生并发修改：在写库/解关联前重新审计并比对。
+    let verify = audit_session_duplicates_for_user_at(paths, variant, uid);
+    let Some(verify_group) = verify["groups"].as_array().and_then(|groups| {
+        groups
+            .iter()
+            .find(|item| item["uid"] == uid && item["cwd"] == cwd && item["title"] == title)
+    }) else {
+        return json!({ "ok": false, "reason": "重复组已变化，请刷新审计后重试" });
+    };
+    if verify_group["kind"] != kind
+        || verify_group["count"] != group["count"]
+        || verify_group["suggestedKeepSessionId"] != group["suggestedKeepSessionId"]
+    {
+        return json!({ "ok": false, "reason": "重复组状态已变化，请刷新审计后重试" });
+    }
+    let verify_ids: Vec<String> = verify_group["sessions"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["sessionId"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if verify_ids.len() != ids.len() || !ids.iter().all(|id| verify_ids.contains(id)) {
+        return json!({ "ok": false, "reason": "重复组成员已变化，请刷新审计后重试" });
     }
     let linked = match session_link::protected_session_ids(paths) {
         Ok(ids) => ids,

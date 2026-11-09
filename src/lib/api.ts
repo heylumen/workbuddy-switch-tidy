@@ -1149,6 +1149,7 @@ export function restoreDuplicateHide(accountId: string, hideId: string): Promise
   reactivated?: number;
   reason?: string;
   backup?: string;
+  journalError?: string;
 }> {
   return call("restore_duplicate_hide", { accountId, hideId });
 }
@@ -1167,6 +1168,8 @@ export function hideDuplicateGroup(
   skippedLinked?: number;
   reason?: string;
   backup?: string;
+  restoreRecordSaved?: boolean;
+  restoreRecordError?: string;
 }> {
   return call("hide_duplicate_group", { accountId, cwd, title, keepSessionId, unlinkLinked });
 }
