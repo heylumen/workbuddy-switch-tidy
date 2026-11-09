@@ -168,6 +168,8 @@ export interface SessionDuplicateAuditSession {
   updatedAt: number;
   records: number | null;
   status: "ready" | "unavailable";
+  /** 该会话是 active 关联成员；软隐藏会跳过。 */
+  linked?: boolean;
 }
 
 export interface SessionDuplicateAuditGroup {

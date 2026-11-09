@@ -500,6 +500,7 @@ pub(crate) fn audit_session_duplicates_for_user_at(
     }
 
     let index = index_project_jsonls_in(&paths.projects_dir());
+    let linked = session_link::protected_session_ids(paths).unwrap_or_default();
     let mut groups = Vec::new();
     let mut counters = HashMap::<String, usize>::new();
     for ((cwd, title), candidates_members) in candidates {
@@ -534,6 +535,7 @@ pub(crate) fn audit_session_duplicates_for_user_at(
                     "updatedAt": updated_at,
                     "records": body.as_ref().map(Vec::len),
                     "status": status,
+                    "linked": linked.contains(cid),
                 })
             })
             .collect();

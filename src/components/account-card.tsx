@@ -1163,6 +1163,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                       <div className="mt-2 text-xs text-muted-foreground">
                         建议：{group.suggested === "keep-newest" ? "保留最新" : group.suggested === "fast-forward-to-longest" ? "快进到最长副本" : "人工选择分支"}
                       </div>
+                      {group.sessions.some((session) => session.linked) && (
+                        <p className="mt-1 text-xs text-amber-700">关联中的副本不会隐藏；需先在「关联会话」页解除关联。</p>
+                      )}
                       {(group.kind === "exact" || group.kind === "fastForward" || group.kind === "divergent") && (
                         <div className="mt-2 space-y-1.5">
                           {group.sessions.map((session) => {
@@ -1175,10 +1178,15 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                                 <Button
                                   size="sm"
                                   variant={fastForwardKeep ? "default" : "outline"}
-                                  disabled={!fastForwardKeep}
-                                  onClick={() => { setHideError(null); setHideTarget({ group, keep: session }); }}
+                                  disabled={!fastForwardKeep || session.linked}
+                                  title={session.linked ? "该副本仍在关联组中，需先在关联会话页解除关联" : undefined}
+                                  onClick={() => {
+                                    setHideError(null);
+                                    setAuditOpen(false);
+                                    setHideTarget({ group, keep: session });
+                                  }}
                                 >
-                                  {fastForwardKeep && group.kind === "fastForward" ? "保留最长" : "保留此条"}
+                                  {session.linked ? "关联中" : fastForwardKeep && group.kind === "fastForward" ? "保留最长" : "保留此条"}
                                 </Button>
                               </div>
                             );
@@ -1218,7 +1226,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{hideError}</div>
           )}
           <DialogFooter className="gap-2">
-            <Button variant="outline" onClick={() => setHideTarget(null)} disabled={hideBusy}>取消</Button>
+            <Button variant="outline" onClick={() => { setHideTarget(null); setAuditOpen(true); }} disabled={hideBusy}>取消</Button>
             <Button onClick={() => void confirmHide()} disabled={hideBusy}>
               {hideBusy ? <Loader2 className="size-4 animate-spin" /> : null}
               {hideBusy ? "处理中…" : "确认软隐藏"}
