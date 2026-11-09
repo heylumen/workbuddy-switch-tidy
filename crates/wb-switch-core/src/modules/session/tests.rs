@@ -2459,6 +2459,43 @@ fn cross_copy_lands_body_row_and_member_variants() {
     assert_eq!(target_member.variant, Some(WbVariant::Ai));
 }
 
+/// 跨档目标已有等价副本但没有任何关联记录时，必须复用该副本，不能新建随机 UUID。
+///
+/// 这是跨档内容兜底回归：源元数据必须从源档数据库读取；目标档数据库里没有源 cid。
+#[test]
+fn cross_copy_reuses_existing_equivalent_target_without_link() {
+    let env = CrossEnv::new("cross-equivalent-no-link");
+    env.create_db(WbVariant::Cn, "");
+    env.create_edge_db(WbVariant::Cn);
+    env.create_db(WbVariant::Ai, "");
+    env.create_edge_db(WbVariant::Ai);
+    env.add_session(WbVariant::Cn, "sess-1", "uid-a", "标题一");
+    env.add_body(WbVariant::Cn, "sess-1", &body_text("sess-1"));
+    // 目标账号已有同 cwd、同标题、正文等价的历史副本，但没有关联组。
+    env.add_session(WbVariant::Ai, "sess-b", "uid-b", "标题一");
+    env.add_body(WbVariant::Ai, "sess-b", &body_text("sess-b"));
+
+    let report = cross_copy(
+        &env,
+        WbVariant::Cn,
+        "uid-a",
+        WbVariant::Ai,
+        "uid-b",
+        &["sess-1"],
+    );
+    assert_eq!(report["copied"].as_array().unwrap().len(), 0, "{report}");
+    assert_eq!(
+        report["alreadyLinked"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    assert_eq!(report["alreadyLinked"][0]["sessionId"], "sess-b");
+    assert_eq!(
+        env.rows_for(WbVariant::Ai, "uid-b"),
+        vec!["sess-b".to_string()]
+    );
+}
+
 /// 目标档列集合与源档不同（双向缺列）时按目标列取交集：不写 NULL、不报错。
 #[test]
 fn cross_copy_uses_target_columns_intersection() {

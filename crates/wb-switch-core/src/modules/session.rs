@@ -192,7 +192,8 @@ fn delete_edge_sync_mappings(db_path: &Path, cids: &[String]) {
 /// 做内容比对；若双方都无正文（空会话），退化为「同 cwd + 同展示标题」判定，
 /// 仅在目标也无正文时才跳过，避免误跳正常会话。
 ///
-/// 读取失败（如 WorkBuddy 占用锁）时返回 `None`，即「不跳过」，保持包容行为。
+/// **失败即阻止**：目标数据库、正文索引或任一候选正文无法读取时返回 `Err`，
+/// 由复制入口终止本次复制；绝不以“无法证明重复”为理由新建副本。
 #[allow(clippy::too_many_arguments)] // 参数语义独立；抽结构体会牵动全部调用点
 fn target_has_equivalent_session(
     db: &Path,
@@ -203,32 +204,33 @@ fn target_has_equivalent_session(
     source_title: &str,
     source_jsonl_norm: &str,
     source_has_jsonl: bool,
-) -> Option<String> {
-    let conn = open_db(db, true)?;
+) -> Result<Option<String>, String> {
+    let conn = open_db(db, true).ok_or_else(|| "无法打开目标会话数据库，已阻止复制".to_string())?;
     if !table_exists(&conn, "sessions") {
-        return None;
+        return Err("目标会话数据库缺少 sessions 表，已阻止复制".to_string());
     }
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT id, cwd, title, custom_title FROM sessions \
-         WHERE user_id = ?1 AND deleted_at IS NULL",
-    ) else {
-        return None;
-    };
-    let Ok(rows) = stmt.query_map([target_uid], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    }) else {
-        return None;
-    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, cwd, title, custom_title FROM sessions \
+             WHERE user_id = ?1 AND deleted_at IS NULL",
+        )
+        .map_err(|_| "无法读取目标会话列表，已阻止复制".to_string())?;
+    let rows = stmt
+        .query_map([target_uid], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .map_err(|_| "无法读取目标会话列表，已阻止复制".to_string())?;
 
     let data_root = db.parent().unwrap_or_else(|| Path::new("."));
     let index = index_project_jsonls_in(&data_root.join("projects"));
-    for r in rows.flatten() {
-        let (cid, cwd, title, custom_title) = r;
+    for r in rows {
+        let (cid, cwd, title, custom_title) =
+            r.map_err(|_| "目标会话记录读取失败，已阻止复制".to_string())?;
         let cid = cid.unwrap_or_default();
         let cwd = cwd.unwrap_or_default();
         if is_claw_workspace(&cwd) {
@@ -240,20 +242,20 @@ fn target_has_equivalent_session(
         let target_has_jsonl = index.contains_key(&cid);
         if source_has_jsonl && target_has_jsonl {
             if let Some(p) = index.get(&cid) {
-                if let Ok(text) = std::fs::read_to_string(p) {
-                    if normalize_jsonl(&text, &cid) == source_jsonl_norm {
-                        return Some(cid.clone());
-                    }
+                let text = std::fs::read_to_string(p)
+                    .map_err(|_| "目标会话正文不可读，已阻止复制".to_string())?;
+                if normalize_jsonl(&text, &cid) == source_jsonl_norm {
+                    return Ok(Some(cid.clone()));
                 }
             }
         } else if !source_has_jsonl
             && !target_has_jsonl
             && session_display_title(title, custom_title) == source_title
         {
-            return Some(cid.clone());
+            return Ok(Some(cid.clone()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// 目标账号是否已存在与源会话「逐字等价」的会话；有则返回其 id。
@@ -262,42 +264,46 @@ fn target_has_equivalent_session(
 /// （旧版本复制留下的副本、关联表缺失等），上游会再次新建副本导致重复行累积。
 /// 这里按「同 cwd + 同标题 + 正文抹平各自 id 后一致」再判一次，命中即跳过新增。
 ///
-/// 仅对 WorkBuddy 命名空间生效（`paths.data_root` 非空）；VS Code 命名空间返回 None。
+/// 跨档复制时必须从**源档**数据库读取源 cwd/title，不能用目标档数据库。
+/// 正文使用调用方已经校验过的源快照文本，避免二次读取产生 TOCTOU。
 fn equivalent_target_session_id(
     context: &CopyContext,
     cid: &str,
-    source_path: &Path,
-) -> Option<String> {
-    if context.paths.data_root.as_os_str().is_empty() {
-        return None;
+    snapshot: &session_link::ContentSnapshot,
+) -> Result<Option<String>, String> {
+    if context.paths.data_root.as_os_str().is_empty()
+        || context.source_paths.data_root.as_os_str().is_empty()
+    {
+        return Err("无法确定会话数据目录，已阻止复制".to_string());
     }
     let db = context.paths.data_root.join("workbuddy.db");
-    let conn = open_db(&db, true)?;
+    let source_db = context.source_paths.data_root.join("workbuddy.db");
+    let conn =
+        open_db(&source_db, true).ok_or_else(|| "无法打开源会话数据库，已阻止复制".to_string())?;
     if !table_exists(&conn, "sessions") {
-        return None;
+        return Err("源会话数据库缺少 sessions 表，已阻止复制".to_string());
     }
     let has_custom = column_exists(&conn, "sessions", "custom_title");
     let sql = if has_custom {
-        "SELECT cwd, title, custom_title FROM sessions WHERE id = ?1"
+        "SELECT cwd, title, custom_title FROM sessions WHERE id = ?1 AND user_id = ?2"
     } else {
-        "SELECT cwd, title, NULL FROM sessions WHERE id = ?1"
+        "SELECT cwd, title, NULL FROM sessions WHERE id = ?1 AND user_id = ?2"
     };
-    let mut stmt = conn.prepare(sql).ok()?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|_| "无法读取源会话元数据，已阻止复制".to_string())?;
     let (cwd, title, custom_title) = stmt
-        .query_row([cid], |row| {
+        .query_row([cid, context.source_uid], |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
             ))
         })
-        .ok()?;
+        .map_err(|_| "源会话元数据不存在，已阻止复制".to_string())?;
     let source_cwd = cwd.unwrap_or_default();
     let source_title = session_display_title(title, custom_title);
-    let (source_norm, source_has) = match std::fs::read_to_string(source_path) {
-        Ok(text) => (normalize_jsonl(&text, cid), true),
-        Err(_) => (String::new(), false),
-    };
+    let source_norm = normalize_jsonl(&snapshot.text, cid);
     target_has_equivalent_session(
         &db,
         cid,
@@ -306,7 +312,7 @@ fn equivalent_target_session_id(
         &source_cwd,
         &source_title,
         &source_norm,
-        source_has,
+        true,
     )
 }
 
@@ -1230,7 +1236,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     // 上游的「已关联则跳过」只覆盖有关联组记录的复制；目标账号若已存在「同 cwd + 同标题 +
     // 正文一致」的会话（旧版本遗留副本、关联表缺失等），这里同样跳过新增，返回 AlreadyLinked，
     // 由调用方计入 alreadyLinked（既不报错，也不产生第二个副本）。
-    if let Some(existing_id) = equivalent_target_session_id(context, cid, &source_path) {
+    if let Some(existing_id) = equivalent_target_session_id(context, cid, &snapshot)? {
         // 目标已有等价副本但尚未入组：直接复用该副本建立关联与基线，不重复写正文/数据库。
         let group_id = resolution
             .group_id
