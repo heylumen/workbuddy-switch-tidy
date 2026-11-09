@@ -134,11 +134,42 @@ async fn main() {
     match cmd {
         "status" => print_status(variant_arg(&args)),
         "repair-links" => repair_links(),
+        "audit-duplicates" => audit_duplicates(&args),
         "version" | "--version" | "-V" => {
             println!("workbuddy-switch {}", env!("CARGO_PKG_VERSION"));
         }
         _ => serve(&args).await,
     }
+}
+
+/// 只读审计同名会话：不修改数据库/正文/关联表。
+fn audit_duplicates(args: &[String]) {
+    let variant = variant_arg(args);
+    let accounts = account::load_accounts();
+    let mut reports = Vec::new();
+    for acct in accounts {
+        if account::variant_of(&acct) != variant {
+            continue;
+        }
+        let uid = acct
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if uid.is_empty() {
+            continue;
+        }
+        reports.push(session::audit_session_duplicates_for_user(variant, &uid));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "variant": variant.as_str(),
+            "accounts": reports,
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    );
 }
 
 /// 修复三套关联主表：仅清理可丢弃的历史元数据，备份后原子写回。

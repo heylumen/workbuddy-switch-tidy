@@ -423,3 +423,190 @@ pub(crate) fn list_sessions_for_user_at(paths: &SessionPaths, uid: &str) -> Valu
     }
     json!(sessions)
 }
+
+// ---------------------------------------------------------------------------
+// P1a：重复候选只读分析（不写数据库）
+// ---------------------------------------------------------------------------
+
+type AuditMember = (String, i64, Option<Vec<String>>, String);
+type AuditGroups = HashMap<(String, String), Vec<AuditMember>>;
+
+/// 只读分析某账号的同名会话候选组。
+///
+/// 判定基于归一化消息序列，不修改 `deleted_at`、不删正文、不改关联表。
+/// 输出可按 `kind` 直接驱动后续预览页：
+/// - `exact`：消息序列完全相同
+/// - `fastForward`：所有较短序列都是最长序列的前缀
+/// - `divergent`：有公共前缀，但存在互不为前缀的分支
+/// - `independent`：没有可用的公共前缀
+/// - `unavailable`：有会话正文无法读取/解析，不能安全分类
+pub fn audit_session_duplicates_for_user(variant: WbVariant, uid: &str) -> Value {
+    audit_session_duplicates_for_user_at(&SessionPaths::for_variant(variant), variant, uid)
+}
+
+pub(crate) fn audit_session_duplicates_for_user_at(
+    paths: &SessionPaths,
+    _variant: WbVariant,
+    uid: &str,
+) -> Value {
+    let db = paths.workbuddy_db();
+    if !db.is_file() {
+        return json!({ "ok": false, "reason": "workbuddy.db 不存在", "groups": [], "summary": {} });
+    }
+    let Some(conn) = open_db(&db, true) else {
+        return json!({ "ok": false, "reason": "无法读取 workbuddy.db", "groups": [], "summary": {} });
+    };
+    if !table_exists(&conn, "sessions") {
+        return json!({ "ok": false, "reason": "sessions 表不存在", "groups": [], "summary": {} });
+    }
+    let has_custom = column_exists(&conn, "sessions", "custom_title");
+    let sql = if has_custom {
+        "SELECT id, cwd, title, custom_title, updated_at FROM sessions \
+         WHERE user_id = ?1 AND deleted_at IS NULL"
+    } else {
+        "SELECT id, cwd, title, NULL, updated_at FROM sessions \
+         WHERE user_id = ?1 AND deleted_at IS NULL"
+    };
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return json!({ "ok": false, "reason": "查询会话失败", "groups": [], "summary": {} });
+    };
+    let Ok(rows) = stmt.query_map([uid], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+        ))
+    }) else {
+        return json!({ "ok": false, "reason": "查询会话失败", "groups": [], "summary": {} });
+    };
+
+    let index = index_project_jsonls_in(&paths.projects_dir());
+    let mut grouped: AuditGroups = HashMap::new();
+    for r in rows.flatten() {
+        let (cid, cwd, title, custom_title, updated_at) = r;
+        let cid = cid.unwrap_or_default();
+        let cwd = cwd.unwrap_or_default();
+        if is_claw_workspace(&cwd) {
+            continue;
+        }
+        let title = session_display_title(title, custom_title);
+        let body = index.get(&cid).and_then(|path| {
+            match session_link::read_content_snapshot(path, &cid) {
+                ContentState::Ready(snapshot) => Some(snapshot.normalized.line_digests),
+                ContentState::Missing | ContentState::Unavailable(_) => None,
+            }
+        });
+        let status = if body.is_some() {
+            "ready"
+        } else {
+            "unavailable"
+        };
+        grouped
+            .entry((normalize_cwd(&cwd), title))
+            .or_default()
+            .push((cid, updated_at.unwrap_or(0), body, status.to_string()));
+    }
+
+    let mut groups = Vec::new();
+    let mut counters = HashMap::<String, usize>::new();
+    for ((cwd, title), members) in grouped {
+        if members.len() <= 1 {
+            continue;
+        }
+        let kind = classify_duplicate_group(&members);
+        *counters.entry(kind.to_string()).or_default() += 1;
+        let sessions: Vec<Value> = members
+            .iter()
+            .map(|(cid, updated_at, body, status)| {
+                json!({
+                    "sessionId": cid,
+                    "updatedAt": updated_at,
+                    "records": body.as_ref().map(Vec::len),
+                    "status": status,
+                })
+            })
+            .collect();
+        groups.push(json!({
+            "uid": uid,
+            "cwd": cwd,
+            "title": title,
+            "count": members.len(),
+            "kind": kind,
+            "suggested": match kind {
+                "exact" => "keep-newest",
+                "fastForward" => "fast-forward-to-longest",
+                "divergent" | "independent" | "unavailable" => "manual",
+                _ => "manual",
+            },
+            "sessions": sessions,
+        }));
+    }
+    groups.sort_by(|a, b| {
+        b["count"].as_u64().cmp(&a["count"].as_u64()).then_with(|| {
+            a["title"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["title"].as_str().unwrap_or(""))
+        })
+    });
+    json!({
+        "ok": true,
+        "uid": uid,
+        "groups": groups,
+        "summary": {
+            "groups": counters.values().sum::<usize>(),
+            "exact": counters.get("exact").copied().unwrap_or(0),
+            "fastForward": counters.get("fastForward").copied().unwrap_or(0),
+            "divergent": counters.get("divergent").copied().unwrap_or(0),
+            "independent": counters.get("independent").copied().unwrap_or(0),
+            "unavailable": counters.get("unavailable").copied().unwrap_or(0),
+        }
+    })
+}
+
+fn classify_duplicate_group(
+    members: &[(String, i64, Option<Vec<String>>, String)],
+) -> &'static str {
+    let mut seqs: Vec<&Vec<String>> = Vec::new();
+    for (_, _, body, _) in members {
+        match body {
+            Some(body) => seqs.push(body),
+            None => return "unavailable",
+        }
+    }
+    if seqs.len() <= 1 {
+        return "independent";
+    }
+    if seqs.windows(2).all(|w| w[0] == w[1]) {
+        return "exact";
+    }
+    let longest = seqs.iter().max_by_key(|seq| seq.len()).unwrap();
+    if seqs.iter().all(|seq| seq_is_prefix(seq, longest)) {
+        return "fastForward";
+    }
+    if common_prefix_len(&seqs) > 0 {
+        "divergent"
+    } else {
+        "independent"
+    }
+}
+
+fn seq_is_prefix(short: &[String], long: &[String]) -> bool {
+    short.len() <= long.len() && short.iter().zip(long.iter()).all(|(a, b)| a == b)
+}
+
+fn common_prefix_len(seqs: &[&Vec<String>]) -> usize {
+    let Some(first) = seqs.first() else { return 0 };
+    let mut len = 0usize;
+    'outer: for (i, digest) in first.iter().enumerate() {
+        for seq in seqs.iter().skip(1) {
+            if seq.get(i) != Some(digest) {
+                break 'outer;
+            }
+        }
+        len += 1;
+    }
+    len
+}
