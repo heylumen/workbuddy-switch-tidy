@@ -1526,6 +1526,41 @@ pub async fn audit_session_duplicates(account_id: String) -> Result<Value, Strin
     .map_err(|e| e.to_string())?
 }
 
+/// 只软隐藏一个重复组中除保留项外的别名；正文不删除。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn hide_duplicate_group(
+    account_id: String,
+    cwd: String,
+    title: String,
+    keep_session_id: String,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let target = account::find_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
+        let variant = account::variant_of(&target);
+        let uid = target
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if uid.is_empty() {
+            return Err("账号缺少 uid".to_string());
+        }
+        Ok(session::hide_duplicate_group_for_user(
+            variant,
+            &uid,
+            &cwd,
+            &title,
+            &keep_session_id,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// POST /api/sessions/dedup —— 清理指定账号下重复会话（复制累积的副本）。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn dedup_sessions(account_id: String) -> Result<Value, String> {

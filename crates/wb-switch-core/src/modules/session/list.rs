@@ -549,6 +549,20 @@ pub(crate) fn audit_session_duplicates_for_user_at(
                 "divergent" | "independent" | "unavailable" => "manual",
                 _ => "manual",
             },
+            "suggestedKeepSessionId": if kind == "fastForward" {
+                members
+                    .iter()
+                    .filter(|(_, _, body, _)| body.is_some())
+                    .max_by_key(|(_, _, body, _)| body.as_ref().map(Vec::len).unwrap_or(0))
+                    .map(|(cid, _, _, _)| cid.clone())
+            } else if kind == "exact" {
+                members
+                    .iter()
+                    .max_by_key(|(_, updated_at, _, _)| *updated_at)
+                    .map(|(cid, _, _, _)| cid.clone())
+            } else {
+                None
+            },
             "sessions": sessions,
         }));
     }
@@ -619,4 +633,123 @@ fn common_prefix_len(seqs: &[&Vec<String>]) -> usize {
         len += 1;
     }
     len
+}
+
+/// 软隐藏一个已审计重复组中除 `keep_session_id` 外的别名。
+///
+/// 只写 `sessions.deleted_at`；不删除 JSONL、不改 edge mapping、不改关联表。
+/// - exact：保留任意一条；其余软隐藏。
+/// - fastForward：必须保留最长副本。
+/// - divergent：允许用户显式指定保留项。
+/// - unavailable / independent：拒绝执行。
+/// - 关联中的 active 成员跳过。
+pub fn hide_duplicate_group_for_user(
+    variant: WbVariant,
+    uid: &str,
+    cwd: &str,
+    title: &str,
+    keep_session_id: &str,
+) -> Value {
+    hide_duplicate_group_for_user_at(
+        &SessionPaths::for_variant(variant),
+        variant,
+        uid,
+        cwd,
+        title,
+        keep_session_id,
+    )
+}
+
+pub(crate) fn hide_duplicate_group_for_user_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    uid: &str,
+    cwd: &str,
+    title: &str,
+    keep_session_id: &str,
+) -> Value {
+    let report = audit_session_duplicates_for_user_at(paths, variant, uid);
+    if report["ok"] != true {
+        return json!({ "ok": false, "reason": report["reason"].clone() });
+    }
+    let group = report["groups"].as_array().and_then(|groups| {
+        groups
+            .iter()
+            .find(|group| group["uid"] == uid && group["cwd"] == cwd && group["title"] == title)
+    });
+    let Some(group) = group else {
+        return json!({ "ok": false, "reason": "审计中未找到该重复组" });
+    };
+    let kind = group["kind"].as_str().unwrap_or("unavailable");
+    if !matches!(kind, "exact" | "fastForward" | "divergent") {
+        return json!({ "ok": false, "reason": "该组无法安全自动处理，请人工检查" });
+    }
+    let Some(sessions) = group["sessions"].as_array() else {
+        return json!({ "ok": false, "reason": "审计组缺少会话列表" });
+    };
+    let ids: Vec<String> = sessions
+        .iter()
+        .filter_map(|session| session["sessionId"].as_str().map(str::to_string))
+        .collect();
+    if !ids.iter().any(|id| id == keep_session_id) {
+        return json!({ "ok": false, "reason": "保留项不在该重复组中" });
+    }
+    if kind == "fastForward" && group["suggestedKeepSessionId"] != keep_session_id {
+        return json!({ "ok": false, "reason": "快进副本必须保留最长副本" });
+    }
+    let linked = match session_link::protected_session_ids(paths) {
+        Ok(ids) => ids,
+        Err(reason) => return json!({ "ok": false, "reason": reason }),
+    };
+    let hide_ids: Vec<String> = ids
+        .into_iter()
+        .filter(|id| id != keep_session_id && !linked.contains(id))
+        .collect();
+    let skipped_linked = sessions.len().saturating_sub(1 + hide_ids.len());
+    if hide_ids.is_empty() {
+        return json!({
+            "ok": true,
+            "hidden": 0,
+            "skippedLinked": skipped_linked,
+            "reason": "没有可隐藏的非关联别名"
+        });
+    }
+
+    let backup_root = paths
+        .store_root
+        .join("backups")
+        .join(format!("duplicate-hide-{}", now_ms()));
+    let backup = match backup_workbuddy_db(paths, &backup_root) {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(error) => return json!({ "ok": false, "reason": error }),
+    };
+    let db = paths.workbuddy_db();
+    let Some(conn) = open_db(&db, false) else {
+        return json!({ "ok": false, "reason": "无法打开 workbuddy.db", "backup": backup });
+    };
+    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        return json!({ "ok": false, "reason": format!("事务启动失败：{error}"), "backup": backup });
+    }
+    for id in &hide_ids {
+        if let Err(error) = conn.execute(
+            "UPDATE sessions SET deleted_at = ?1 WHERE id = ?2 AND user_id = ?3 AND deleted_at IS NULL",
+            rusqlite::params![now_ms(), id, uid],
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return json!({ "ok": false, "reason": format!("软隐藏失败：{error}"), "backup": backup });
+        }
+    }
+    if let Err(error) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        return json!({ "ok": false, "reason": format!("提交失败：{error}"), "backup": backup });
+    }
+    json!({
+        "ok": true,
+        "hidden": hide_ids.len(),
+        "hiddenIds": hide_ids,
+        "skippedLinked": skipped_linked,
+        "keepSessionId": keep_session_id,
+        "kind": kind,
+        "backup": backup,
+    })
 }

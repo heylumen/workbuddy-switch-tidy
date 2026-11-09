@@ -2497,6 +2497,47 @@ fn cross_copy_reuses_existing_equivalent_target_without_link() {
 }
 
 /// P1a 只读审计：按消息序列公共前缀分类，不修改会话。
+/// P1c：软隐藏精确重复组时保留正文与保留项，只写 deleted_at。
+#[test]
+fn hide_duplicate_group_soft_hides_exact_aliases_and_keeps_jsonl() {
+    let env = Env::new("hide-exact");
+    env.create_db();
+    env.create_edge_db(WbVariant::Cn);
+    for id in ["keep", "alias"] {
+        env.add_session(id, "uid-a", "same");
+        env.add_body(id, &body_text(id));
+    }
+    let report = hide_duplicate_group_for_user_at(
+        &env.paths(),
+        WbVariant::Cn,
+        "uid-a",
+        "/ws/a",
+        "same",
+        "keep",
+    );
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["hidden"], 1, "{report}");
+    assert_eq!(report["skippedLinked"], 0, "{report}");
+    // 两条正文都仍在；只软隐藏 alias。
+    assert!(env.body_path("keep").is_file());
+    assert!(env.body_path("alias").is_file());
+    let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+    let keep_deleted: Option<i64> = conn
+        .query_row("SELECT deleted_at FROM sessions WHERE id='keep'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let alias_deleted: Option<i64> = conn
+        .query_row(
+            "SELECT deleted_at FROM sessions WHERE id='alias'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(keep_deleted.is_none());
+    assert!(alias_deleted.is_some());
+}
+
 #[test]
 fn audit_session_duplicates_classifies_exact_fast_forward_divergent_and_independent() {
     let env = Env::new("audit-duplicates");

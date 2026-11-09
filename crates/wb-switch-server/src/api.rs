@@ -161,6 +161,10 @@ fn routes() -> Router {
             post(api_audit_session_duplicates),
         )
         .route(
+            "/api/sessions/hide-duplicate-group",
+            post(api_hide_duplicate_group),
+        )
+        .route(
             "/api/session-links/preview",
             post(api_session_links_preview),
         )
@@ -1118,6 +1122,49 @@ async fn api_audit_session_duplicates(Json(body): Json<Value>) -> Response {
         Ok(report) => json_ok(report),
         Err(error) => json_err(
             format!("审计失败：{error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/sessions/hide-duplicate-group —— 软隐藏重复组别名，正文保留。
+async fn api_hide_duplicate_group(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cwd = body
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let keep = body
+        .get("keepSessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = account::variant_of(&target);
+    let Some(uid) = account::get_str(&target, "uid").map(|v| v.trim().to_string()) else {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match tokio::task::spawn_blocking(move || {
+        session::hide_duplicate_group_for_user(variant, &uid, &cwd, &title, &keep)
+    })
+    .await
+    {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(
+            format!("软隐藏失败：{error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
