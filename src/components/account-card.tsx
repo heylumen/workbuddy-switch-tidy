@@ -24,7 +24,7 @@ import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import { formatFullDateTime } from "@/lib/format-time";
-import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateKind, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateAuditGroup, SessionDuplicateAuditSession, SessionDuplicateKind, TravelStatus } from "@/lib/types";
 
 const AUDIT_KIND_LABEL: Record<SessionDuplicateKind, string> = {
   exact: "精确重复",
@@ -416,6 +416,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
   const [auditBusy, setAuditBusy] = useState(false);
   const [auditReport, setAuditReport] = useState<SessionDuplicateAudit | null>(null);
   const [auditError, setAuditError] = useState<string | null>(null);
+  const [hideTarget, setHideTarget] = useState<{ group: SessionDuplicateAuditGroup; keep: SessionDuplicateAuditSession } | null>(null);
+  const [hideBusy, setHideBusy] = useState(false);
+  const [hideError, setHideError] = useState<string | null>(null);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
   const [dedupResult, setDedupResult] = useState<string | null>(null);
@@ -491,6 +494,50 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
       {!compact && activeProductCount >= 2 && <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>{activeProductCount} 个工具正在使用</Badge>}
     </>
   );
+
+  async function loadAudit() {
+    setAuditOpen(true);
+    setAuditError(null);
+    setAuditReport(null);
+    setAuditBusy(true);
+    try {
+      setAuditReport(await api.auditSessionDuplicates(account.id));
+    } catch (e) {
+      setAuditError(api.asError(e));
+    } finally {
+      setAuditBusy(false);
+    }
+  }
+
+  async function confirmHide() {
+    if (!hideTarget) return;
+    setHideBusy(true);
+    setHideError(null);
+    try {
+      const result = await api.hideDuplicateGroup(
+        account.id,
+        hideTarget.group.cwd,
+        hideTarget.group.title,
+        hideTarget.keep.sessionId,
+      );
+      if (!result.ok) {
+        setHideError(result.reason || "软隐藏失败");
+        return;
+      }
+      toast.success(
+        result.hidden
+          ? `已软隐藏 ${result.hidden} 个别名（正文保留）`
+          : "没有可隐藏的非关联别名",
+        { description: result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : undefined },
+      );
+      setHideTarget(null);
+      await loadAudit();
+    } catch (e) {
+      setHideError(api.asError(e));
+    } finally {
+      setHideBusy(false);
+    }
+  }
 
   return (
     <TooltipProvider>
@@ -591,16 +638,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                 <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => { setCollapseResult(null); setCollapseOpen(true); }}>
                   <Layers />折叠同名会话
                 </DropdownMenuItem>
-                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => {
-                  setAuditOpen(true);
-                  setAuditError(null);
-                  setAuditReport(null);
-                  setAuditBusy(true);
-                  void api.auditSessionDuplicates(account.id)
-                    .then((report) => setAuditReport(report))
-                    .catch((e) => setAuditError(api.asError(e)))
-                    .finally(() => setAuditBusy(false));
-                }}>
+                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => void loadAudit()}>
                   <Search />重复审计
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
@@ -1125,6 +1163,28 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                       <div className="mt-2 text-xs text-muted-foreground">
                         建议：{group.suggested === "keep-newest" ? "保留最新" : group.suggested === "fast-forward-to-longest" ? "快进到最长副本" : "人工选择分支"}
                       </div>
+                      {(group.kind === "exact" || group.kind === "fastForward" || group.kind === "divergent") && (
+                        <div className="mt-2 space-y-1.5">
+                          {group.sessions.map((session) => {
+                            const fastForwardKeep = group.kind !== "fastForward" || session.sessionId === group.suggestedKeepSessionId;
+                            return (
+                              <div key={session.sessionId} className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-muted/30 px-2 py-1.5 text-xs">
+                                <span className="min-w-0 truncate font-mono text-muted-foreground">
+                                  {session.sessionId.slice(0, 8)} · {session.records ?? "?"} 条 · {formatFullDateTime(session.updatedAt)}
+                                </span>
+                                <Button
+                                  size="sm"
+                                  variant={fastForwardKeep ? "default" : "outline"}
+                                  disabled={!fastForwardKeep}
+                                  onClick={() => { setHideError(null); setHideTarget({ group, keep: session }); }}
+                                >
+                                  {fastForwardKeep && group.kind === "fastForward" ? "保留最长" : "保留此条"}
+                                </Button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   ))}
                   {auditReport.groups.length > 50 && <p className="text-xs text-muted-foreground">仅显示前 50 组，共 {auditReport.groups.length} 组。</p>}
@@ -1134,6 +1194,35 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
           )}
           <DialogFooter>
             <Button onClick={() => setAuditOpen(false)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!hideTarget}
+        onOpenChange={(open) => {
+          if (!open && !hideBusy) {
+            setHideTarget(null);
+            setHideError(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>软隐藏其他副本？</DialogTitle>
+            <DialogDescription>
+              {hideTarget ? `保留 ${hideTarget.group.title} 的 ${hideTarget.keep.sessionId.slice(0, 8)}；其余别名仅从数据库软隐藏，JSONL 正文保留，可恢复。关联中的副本会跳过。` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          {hideError && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{hideError}</div>
+          )}
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setHideTarget(null)} disabled={hideBusy}>取消</Button>
+            <Button onClick={() => void confirmHide()} disabled={hideBusy}>
+              {hideBusy ? <Loader2 className="size-4 animate-spin" /> : null}
+              {hideBusy ? "处理中…" : "确认软隐藏"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

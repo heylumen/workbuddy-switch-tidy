@@ -148,6 +148,7 @@ const ROUTES: Record<string, Route> = {
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
   copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
   audit_session_duplicates: { method: "POST", path: "/api/sessions/audit-duplicates" },
+  hide_duplicate_group: { method: "POST", path: "/api/sessions/hide-duplicate-group" },
   session_links_preview: { method: "POST", path: "/api/session-links/preview" },
   session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
   session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
@@ -1131,6 +1132,22 @@ export function collapseSessions(
 /** 只读审计同名会话；不修改数据库、正文或关联表。 */
 export function auditSessionDuplicates(accountId: string): Promise<SessionDuplicateAudit> {
   return call("audit_session_duplicates", { accountId });
+}
+
+/** 软隐藏重复组别名（正文保留、仅改 deleted_at）。 */
+export function hideDuplicateGroup(
+  accountId: string,
+  cwd: string,
+  title: string,
+  keepSessionId: string,
+): Promise<{
+  ok: boolean;
+  hidden?: number;
+  skippedLinked?: number;
+  reason?: string;
+  backup?: string;
+}> {
+  return call("hide_duplicate_group", { accountId, cwd, title, keepSessionId });
 }
 // ---------------------------------------------------------------------------
 // 通知存档（toast 事后可查）

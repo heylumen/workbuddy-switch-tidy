@@ -177,6 +177,7 @@ export interface SessionDuplicateAuditGroup {
   count: number;
   kind: SessionDuplicateKind;
   suggested: string;
+  suggestedKeepSessionId?: string | null;
   sessions: SessionDuplicateAuditSession[];
 }
 
