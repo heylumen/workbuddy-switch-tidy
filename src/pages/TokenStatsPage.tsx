@@ -35,6 +35,7 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { DemoAction } from "@/components/demo-action";
+import { TokenAccountsPanel } from "@/components/token-accounts-panel";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import {
   Dialog,
@@ -64,14 +65,31 @@ import type {
   TokenStatsRequestRow,
   TokenStatsSource,
   TokenStatsTotals,
+  AccountMeta,
 } from "@/lib/types";
 
 type SourceKey = TokenStatsSource["source"];
 type RangeKey = "30d" | "today" | "7d" | "month";
 type OverviewRangeKey = "today" | "7d" | "30d" | "total";
 type DistributionKey = "projects" | "models";
+type ScanRangeKey = "all" | "today" | "7d" | "30d";
+
+const SCAN_RANGE_OPTIONS: { key: ScanRangeKey; label: string; days?: number }[] = [
+  { key: "all", label: "全部" },
+  { key: "today", label: "近24小时", days: 1 },
+  { key: "7d", label: "近7天", days: 7 },
+  { key: "30d", label: "近30天", days: 30 },
+];
+
+function scanRangeLabel(value: ScanRangeKey): string {
+  return SCAN_RANGE_OPTIONS.find((option) => option.key === value)?.label ?? "全部";
+}
 
 const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
+/** 页面重挂载时复用最近结果，避免每次进入都触发全量扫描。 */
+const TOKEN_STATS_CACHE_MS = 30_000;
+const tokenStatsCache = new Map<string, { at: number; value: TokenStatistics }>();
+const tokenStatsInflight = new Map<string, Promise<TokenStatistics>>();
 const RANKING_LIMIT = 10;
 const REQUEST_PAGE_SIZE = 50;
 
@@ -105,7 +123,7 @@ function persistPreferredTokenSource(source: SourceKey): void {
 
 const RANGE_OPTIONS: { key: RangeKey; label: string }[] = [
   { key: "30d", label: "近 30 天" },
-  { key: "today", label: "今天" },
+  { key: "today", label: "近24小时" },
   { key: "7d", label: "近 7 天" },
   { key: "month", label: "本月" },
 ];
@@ -369,7 +387,13 @@ function CompactComposition({ value }: { value: TokenStatsTotals }) {
   );
 }
 
-function Overview({ source }: { source: TokenStatsSource }) {
+function Overview({
+  source,
+  scanRange,
+}: {
+  source: TokenStatsSource;
+  scanRange: ScanRangeKey;
+}) {
   const [range, setRange] = useState<OverviewRangeKey>("today");
   const summary = useMemo(() => overviewTotals(source, range), [range, source]);
   const cacheRate = summary.cacheHitRate;
@@ -395,7 +419,7 @@ function Overview({ source }: { source: TokenStatsSource }) {
               >
                 {OVERVIEW_RANGE_OPTIONS.map((option) => (
                   <TabsTrigger key={option.key} value={option.key} className="px-2">
-                    {option.label}
+                    {option.key === "total" && scanRange !== "all" ? "范围内" : option.label}
                   </TabsTrigger>
                 ))}
               </TabsList>
@@ -1362,10 +1386,16 @@ function RequestDetailDialog({
   open,
   onOpenChange,
   source,
+  loading,
+  error,
+  onRetry,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   source: TokenStatsSource;
+  loading: boolean;
+  error: string | null;
+  onRetry: () => void;
 }) {
   const rows = source.requests ?? [];
 
@@ -1378,7 +1408,19 @@ function RequestDetailDialog({
             每次模型调用一行，按时间倒序展示本地 CodeBuddy CLI 日志记录。
           </DialogDescription>
         </DialogHeader>
-        {rows.length === 0 ? (
+        {loading ? (
+          <div className="flex items-center justify-center rounded-lg border border-dashed px-4 py-10 text-sm text-muted-foreground" role="status">
+            <Loader2 className="mr-2 size-4 animate-spin" />
+            正在加载请求明细…
+          </div>
+        ) : error ? (
+          <div className="rounded-lg border border-dashed px-4 py-8 text-center text-sm">
+            <p className="text-destructive">{error}</p>
+            <Button variant="outline" size="sm" className="mt-3" onClick={onRetry}>
+              重试
+            </Button>
+          </div>
+        ) : rows.length === 0 ? (
           <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
             该来源暂无可展示的请求明细。
           </div>
@@ -1390,7 +1432,15 @@ function RequestDetailDialog({
   );
 }
 
-function Dashboard({ source }: { source: TokenStatsSource }) {
+function Dashboard({
+  source,
+  accounts,
+  scanRange,
+}: {
+  source: TokenStatsSource;
+  accounts: AccountMeta[];
+  scanRange: ScanRangeKey;
+}) {
   const denominator = tokenTotal(source.summary);
 
   if (source.summary.records === 0) {
@@ -1398,7 +1448,11 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
       <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
         <div>
           {source.filesScanned > 0
-            ? `已扫描 ${exact.format(source.filesScanned)} 个会话文件，但没有可用的 usage。`
+            ? `已扫描 ${exact.format(source.filesScanned)} 个会话文件（解析 ${exact.format(source.filesParsed ?? source.filesScanned)} 个${
+                (source.filesSkipped ?? 0) > 0
+                  ? `，跳过 ${exact.format(source.filesSkipped ?? 0)} 个`
+                  : ""
+              }），但没有可用的 usage。`
             : "尚未发现该来源的本地会话日志。"}
         </div>
         {source.source === "workbuddy-ai" && (
@@ -1418,7 +1472,8 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
 
   return (
     <div className="min-w-0 space-y-12">
-      <Overview source={source} />
+      <Overview source={source} scanRange={scanRange} />
+      <TokenAccountsPanel source={source} accounts={accounts} />
       <TrendChart source={source} />
       <Heatmap groups={source.daily} />
       <Distribution source={source} />
@@ -1433,7 +1488,7 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
   );
 }
 
-function TokenStatsLoadingSkeleton() {
+function TokenStatsLoadingSkeleton({ elapsedSeconds }: { elapsedSeconds: number }) {
   return (
     <div
       className="min-w-0 space-y-12"
@@ -1443,7 +1498,9 @@ function TokenStatsLoadingSkeleton() {
       <span className="sr-only">正在扫描本地会话日志…</span>
       <p className="flex items-center gap-2 text-sm text-muted-foreground" aria-hidden="true">
         <span className="size-1.5 rounded-full bg-primary/70" />
-        正在扫描本地会话日志…
+        {elapsedSeconds >= 3
+          ? `正在扫描本地会话日志… 已等待 ${elapsedSeconds}s，首次扫描可能需要数分钟`
+          : "正在扫描本地会话日志…"}
       </p>
 
       <section className="min-w-0 space-y-2.5" aria-hidden="true">
@@ -1551,16 +1608,56 @@ export default function TokenStatsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [scanRange, setScanRange] = useState<ScanRangeKey>("all");
+  const [cacheHit, setCacheHit] = useState(false);
+  const [scanSeconds, setScanSeconds] = useState(0);
   const [detailOpen, setDetailOpen] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailReload, setDetailReload] = useState(0);
+  const [accounts, setAccounts] = useState<AccountMeta[]>([]);
 
   useEffect(() => {
     let disposed = false;
     setLoading(true);
     setError(null);
-    api
-      .getTokenStatistics()
+    setCacheHit(false);
+    const days = SCAN_RANGE_OPTIONS.find((option) => option.key === scanRange)?.days;
+    const cacheKey = `${scanRange}:${days ?? "all"}`;
+    const inflightKey = `${cacheKey}:${reload}`;
+    const cachedEntry = tokenStatsCache.get(cacheKey);
+    const cached =
+      reload === 0 && cachedEntry && Date.now() - cachedEntry.at < TOKEN_STATS_CACHE_MS
+        ? cachedEntry.value
+        : null;
+    if (cached) {
+      setStats(cached);
+      setCacheHit(true);
+      setLoading(false);
+      return () => {
+        disposed = true;
+      };
+    }
+    const request =
+      tokenStatsInflight.get(inflightKey) ??
+      api
+        .getTokenStatistics(days, undefined, reload > 0)
+        .then((result) => {
+          tokenStatsCache.set(cacheKey, { at: Date.now(), value: result });
+          return result;
+        })
+        .finally(() => {
+          if (tokenStatsInflight.get(inflightKey) === request) {
+            tokenStatsInflight.delete(inflightKey);
+          }
+        });
+    tokenStatsInflight.set(inflightKey, request);
+    request
       .then((result) => {
-        if (!disposed) setStats(result);
+        if (!disposed) {
+          setStats(result);
+          setCacheHit(false);
+        }
       })
       .catch((cause) => {
         if (!disposed) setError(api.asError(cause));
@@ -1571,7 +1668,7 @@ export default function TokenStatsPage() {
     return () => {
       disposed = true;
     };
-  }, [reload]);
+  }, [reload, scanRange]);
 
   useEffect(() => {
     if (!stats || stats.sources.length === 0) return;
@@ -1586,7 +1683,76 @@ export default function TokenStatsPage() {
     persistPreferredTokenSource(next);
   }, [active, stats]);
 
+  useEffect(() => {
+    let disposed = false;
+    api
+      .getAccounts()
+      .then((result) => { if (!disposed) setAccounts(result.accounts); })
+      .catch(() => { if (!disposed) setAccounts([]); });
+    return () => { disposed = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!loading || stats) {
+      setScanSeconds(0);
+      return;
+    }
+    const startedAt = Date.now();
+    const timer = window.setInterval(() => {
+      setScanSeconds(Math.floor((Date.now() - startedAt) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [loading, stats]);
+
   const source = stats?.sources.find((item) => item.source === active);
+
+  // 请求明细按需加载：默认不把 500 行明细常驻内存，打开弹窗时才补拉。
+  useEffect(() => {
+    if (!detailOpen || active !== "codebuddy-cli") return;
+    if (source?.requests && detailReload === 0) return;
+    let disposed = false;
+    setDetailLoading(true);
+    setDetailError(null);
+    api
+      .getTokenRequests(
+        SCAN_RANGE_OPTIONS.find((option) => option.key === scanRange)?.days,
+        detailReload > 0 || reload > 0,
+      )
+      .then((result) => {
+        if (!disposed) {
+          setStats((previous) =>
+            previous
+              ? {
+                  ...previous,
+                  sources: previous.sources.map((item) =>
+                    item.source === "codebuddy-cli"
+                      ? {
+                          ...item,
+                          requests: result.requests,
+                          filesScanned: result.filesScanned,
+                          parseErrors: result.parseErrors,
+                        }
+                      : item,
+                  ),
+                }
+              : previous,
+          );
+          // 成功后清掉重试标记：effect 再次因 requests 变化触发时会命中缓存提前返回。
+          setDetailReload(0);
+        }
+      })
+      .catch((reason) => {
+        if (!disposed) {
+          setDetailError(reason instanceof Error ? reason.message : "请求明细加载失败");
+        }
+      })
+      .finally(() => {
+        if (!disposed) setDetailLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [active, detailOpen, detailReload, scanRange, source?.requests]);
 
   return (
     <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
@@ -1602,11 +1768,33 @@ export default function TokenStatsPage() {
               <h1 className="text-[28px] font-semibold tracking-tight">Token 统计</h1>
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
                 当前数据更新于 {stats ? formatDateTime(stats.generatedAt) : "—"}
+                · 统计范围 {scanRangeLabel(scanRange)}
+                {cacheHit ? " · 结果来自 30 秒内缓存" : ""}
               </p>
             </>
           )}
         </div>
         <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
+          <div
+            className="flex max-w-full flex-wrap gap-1 rounded-lg bg-muted p-1"
+            aria-label="统计范围"
+          >
+            {SCAN_RANGE_OPTIONS.map((option) => (
+              <button
+                key={option.key}
+                type="button"
+                className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
+                  scanRange === option.key
+                    ? "bg-background font-medium text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+                onClick={() => setScanRange(option.key)}
+                aria-pressed={scanRange === option.key}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
           {active === "codebuddy-cli" && (
             <Button
               className="shrink-0"
@@ -1696,8 +1884,8 @@ export default function TokenStatsPage() {
         </Alert>
       )}
 
-      {loading && !stats ? <TokenStatsLoadingSkeleton /> : source ? (
-        <Dashboard source={source} />
+      {loading && !stats ? <TokenStatsLoadingSkeleton elapsedSeconds={scanSeconds} /> : source ? (
+        <Dashboard source={source} accounts={accounts} scanRange={scanRange} />
       ) : (
         !error && (
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
@@ -1711,6 +1899,9 @@ export default function TokenStatsPage() {
           open={detailOpen}
           onOpenChange={setDetailOpen}
           source={source}
+          loading={detailLoading}
+          error={detailError}
+          onRetry={() => setDetailReload((value) => value + 1)}
         />
       )}
     </div>

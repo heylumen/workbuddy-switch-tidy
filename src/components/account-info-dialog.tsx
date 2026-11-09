@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import * as api from "@/lib/api";
 import { accountIdentity } from "@/lib/account-display";
+import { formatFullDateTime } from "@/lib/format-time";
 import { avatarTone } from "@/lib/avatar-tone";
 import { cn } from "@/lib/utils";
 import { accountVariant, variantLabel } from "@/lib/variant";
@@ -175,6 +176,12 @@ export function AccountInfoDialog({ open, onOpenChange, account, onSaved }: Prop
                 {uidCopied ? <Check className="size-3.5 text-primary" /> : <Copy className="size-3.5" />}
               </button>
             )}
+          </div>
+          <div className="flex items-center gap-3 px-3 py-2.5">
+            <dt className="w-12 shrink-0 text-muted-foreground">最后使用</dt>
+            <dd className="min-w-0 flex-1 truncate font-medium">
+              {formatFullDateTime(current.lastUsedAt)}
+            </dd>
           </div>
         </dl>
 

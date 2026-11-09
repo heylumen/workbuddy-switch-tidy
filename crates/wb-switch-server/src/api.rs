@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Query, RawQuery, Request};
+use axum::extract::{Extension, Query, RawQuery, Request};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -19,7 +19,7 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    account, account_memory, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
@@ -58,10 +58,31 @@ struct Assets;
 static SWITCH_PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
 
+/// 无认证路由：仅供单元测试/嵌入式调用；生产 `serve` 使用 `router_with_token`。
+#[allow(dead_code)] // 单测/嵌入式调用入口；生产走 router_with_token
 pub fn router() -> Router {
+    routes().layer(middleware::from_fn(local_only))
+}
+
+/// WebUI 生产路由：API 必须携带一次性启动 token（HttpOnly cookie 或 header）。
+pub fn router_with_token(token: String) -> Router {
+    let auth_token = token.clone();
+    routes()
+        .layer(Extension(WebUiToken(token)))
+        .layer(middleware::from_fn(move |req, next| {
+            require_webui_token(auth_token.clone(), req, next)
+        }))
+        .layer(middleware::from_fn(local_only))
+}
+
+#[derive(Clone)]
+struct WebUiToken(String);
+
+fn routes() -> Router {
     Router::new()
         .route("/api/status", get(api_status))
         .route("/api/accounts", get(api_accounts))
+        .route("/api/accounts/copy-memory", post(api_copy_account_memory))
         .route("/api/codebuddy-cli/status", get(api_codebuddy_cli_status))
         .route(
             "/api/codebuddy-cli/install-helper",
@@ -179,6 +200,7 @@ pub fn router() -> Router {
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
         .route("/api/token-stats", get(api_token_statistics))
+        .route("/api/token-stats/requests", get(api_token_requests))
         .route("/api/rate-limits", get(api_rate_limits))
         .route(
             "/api/rate-limits/hook-status",
@@ -224,9 +246,35 @@ pub fn router() -> Router {
             "/api/update/config",
             get(api_update_config).post(api_save_update_config),
         )
-        .fallback(static_handler)
-        // 防 DNS rebinding：仅接受回环 Host / Origin。桌面 Tauri IPC 不经过此层。
-        .layer(middleware::from_fn(local_only))
+        .fallback(static_handler_with_auth)
+}
+
+/// 只保护 `/api/*`；静态资源由页面 token cookie 放行，避免每个 chunk 都带 query。
+async fn require_webui_token(token: String, req: Request, next: Next) -> Response {
+    if req.uri().path().starts_with("/api/") && !request_has_token(&req, &token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                json!({ "ok": false, "error": "WebUI 认证失败，请使用启动日志中的带 token 链接" }),
+            ),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn request_has_token(req: &Request, token: &str) -> bool {
+    if header_text(req.headers(), header::COOKIE).is_some_and(|value| {
+        value
+            .split(';')
+            .any(|part| part.trim() == format!("wb_webui_token={token}"))
+    }) {
+        return true;
+    }
+    req.headers()
+        .get("x-wb-webui-token")
+        .and_then(|value| value.to_str().ok())
+        == Some(token)
 }
 
 /// 仅允许本机回环访问的中间件。
@@ -383,6 +431,21 @@ async fn api_accounts(RawQuery(query): RawQuery) -> Response {
             .and_then(|a| a.get("account").and_then(|x| x.get("uid")).and_then(|x| x.as_str()).map(String::from)),
         "variant": variant.as_str(),
     }))
+}
+
+async fn api_copy_account_memory(Json(body): Json<Value>) -> Response {
+    let source = body
+        .get("sourceAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let target = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match account_memory::copy_memory(source, target) {
+        Ok(result) => json_ok(result),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 async fn api_codebuddy_cli_status() -> Response {
@@ -787,41 +850,20 @@ async fn api_import_local(body: Option<Json<Value>>) -> Response {
 // 导出 / 导入账号
 // ---------------------------------------------------------------------------
 
-async fn api_export_accounts(Json(body): Json<Value>) -> Response {
-    let ids: Vec<String> = body
-        .get("accountIds")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    match export_import::export_accounts(&ids) {
-        Ok(records) => json_ok(json!({ "ok": true, "accounts": records })),
-        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
-    }
+/// WebUI 不提供账号导出：响应含完整 token，不能暴露给同机其它进程。
+fn webui_export_disabled() -> Response {
+    json_err(
+        "WebUI 不提供账号导出，请在桌面端使用导出功能".to_string(),
+        StatusCode::FORBIDDEN,
+    )
 }
 
-async fn api_export_accounts_to_path(Json(body): Json<Value>) -> Response {
-    let ids: Vec<String> = body
-        .get("accountIds")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let path = body
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    match export_import::export_accounts_to_path(&ids, &path) {
-        Ok(path) => json_ok(json!({ "ok": true, "path": path })),
-        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
-    }
+async fn api_export_accounts(Json(_body): Json<Value>) -> Response {
+    webui_export_disabled()
+}
+
+async fn api_export_accounts_to_path(Json(_body): Json<Value>) -> Response {
+    webui_export_disabled()
 }
 
 async fn api_preview_import(Json(body): Json<Value>) -> Response {
@@ -1477,10 +1519,32 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
             .split('&')
             .find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
     });
-    match tokio::task::spawn_blocking(move || token_stats::get_statistics(days)).await {
+    let include_requests = query_flag_enabled(query.as_deref(), "requests");
+    let refresh = query_flag_enabled(query.as_deref(), "refresh");
+    match tokio::task::spawn_blocking(move || {
+        token_stats::get_statistics(days, include_requests, refresh)
+    })
+    .await
+    {
         Ok(statistics) => json_ok(statistics),
         Err(error) => json_err(
             format!("扫描 Token 统计失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+async fn api_token_requests(RawQuery(query): RawQuery) -> Response {
+    let days = query.as_deref().and_then(|value| {
+        value
+            .split('&')
+            .find_map(|part| part.strip_prefix("days=")?.parse::<i64>().ok())
+    });
+    let refresh = query_flag_enabled(query.as_deref(), "refresh");
+    match tokio::task::spawn_blocking(move || token_stats::get_requests(days, refresh)).await {
+        Ok(requests) => json_ok(requests),
+        Err(error) => json_err(
+            format!("扫描 Token 明细失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
@@ -1724,10 +1788,74 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// 去掉 query 中的 `token`，保留其它参数，供首次启动链接跳转到干净 URL。
+fn query_without_token(query: Option<&str>) -> Option<String> {
+    let filtered = query?
+        .split('&')
+        .filter(|part| part.split_once('=').map(|(key, _)| key) != Some("token"))
+        .collect::<Vec<_>>()
+        .join("&");
+    (!filtered.is_empty()).then_some(filtered)
+}
+
+#[allow(dead_code)] // 单测直接调用；生产路由走 static_handler_with_auth
 async fn static_handler(uri: Uri) -> Response {
+    static_handler_with_auth(uri, HeaderMap::new(), None).await
+}
+
+async fn static_handler_with_auth(
+    uri: Uri,
+    headers: HeaderMap,
+    auth: Option<Extension<WebUiToken>>,
+) -> Response {
     let mut path = uri.path().trim_start_matches('/').to_string();
     if path.is_empty() || path == "index.html" {
         path = "index.html".to_string();
+    }
+    let token = auth.as_ref().map(|value| value.0 .0.as_str());
+    let cookie_token = header_text(&headers, header::COOKIE).and_then(|value| {
+        value.split(';').find_map(|part| {
+            part.trim()
+                .strip_prefix("wb_webui_token=")
+                .map(str::to_string)
+        })
+    });
+    let query_token = uri.query().and_then(|query| {
+        query.split('&').find_map(|part| {
+            let (key, value) = part.split_once('=')?;
+            (key == "token").then(|| value.to_string())
+        })
+    });
+    let authorized =
+        token.is_none() || cookie_token.as_deref() == token || query_token.as_deref() == token;
+    if !authorized {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("请使用启动日志中的带 token 链接打开 WebUI"))
+            .unwrap();
+    }
+    // 首次链接携带 token 时只用于换取 HttpOnly cookie；立刻 302 到去掉 token 的
+    // 干净地址，避免它留在地址栏、浏览器历史、截图或旧浏览器的 Referer 中。
+    if token.is_some() && query_token.as_deref() == token {
+        let mut location = uri.path().to_string();
+        if location.is_empty() {
+            location.push('/');
+        }
+        if let Some(query) = query_without_token(uri.query()) {
+            location.push('?');
+            location.push_str(&query);
+        }
+        let cookie = format!(
+            "wb_webui_token={}; Path=/; HttpOnly; SameSite=Strict",
+            token.unwrap_or_default()
+        );
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, location)
+            .header(header::SET_COOKIE, cookie)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap();
     }
     // 前端路由回退到 index.html。Content-Type 必须按**实际命中的文件**给：按请求路径算
     // 会把 `/sessions` 这类前端路由标成 application/octet-stream，浏览器直接当下载。
@@ -1743,11 +1871,13 @@ async fn static_handler(uri: Uri) -> Response {
             }
         },
     };
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type(&served))
-        .body(Body::from(data.data.into_owned()))
-        .unwrap()
+        .header(header::CONTENT_TYPE, content_type(&served));
+    if served == "index.html" {
+        builder = builder.header(header::CACHE_CONTROL, "no-store");
+    }
+    builder.body(Body::from(data.data.into_owned())).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,10 +1915,12 @@ async fn api_clear_notifications() -> Response {
 mod tests {
     use super::{
         body_variant, checkin_status_item, is_loopback_authority, is_loopback_origin,
-        query_variant, router, static_handler,
+        query_variant, query_without_token, router, router_with_token, static_handler,
+        static_handler_with_auth, WebUiToken,
     };
     use axum::body::Body;
-    use axum::http::{header, Request, StatusCode, Uri};
+    use axum::extract::Extension;
+    use axum::http::{header, HeaderMap, Request, StatusCode, Uri};
     use serde_json::json;
     use tower::ServiceExt;
     use wb_switch_core::modules::variant::WbVariant;
@@ -1897,6 +2029,112 @@ mod tests {
             StatusCode::FORBIDDEN
         );
         assert_ne!(status(None, None).await, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn webui_export_endpoints_are_disabled() {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/export-accounts")
+            .header(header::HOST, "127.0.0.1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        assert_eq!(
+            router().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "WebUI 不得导出含 token 的账号记录"
+        );
+    }
+
+    #[tokio::test]
+    async fn webui_index_with_token_sets_cookie_and_without_token_is_rejected() {
+        let response = static_handler_with_auth(
+            Uri::from_static("/?token=test-token"),
+            HeaderMap::new(),
+            Some(Extension(WebUiToken("test-token".to_string()))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(cookie.contains("wb_webui_token=test-token"), "{cookie}");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, "wb_webui_token=test-token".parse().unwrap());
+        let response = static_handler_with_auth(
+            Uri::from_static("/"),
+            headers,
+            Some(Extension(WebUiToken("test-token".to_string()))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = static_handler_with_auth(
+            Uri::from_static("/"),
+            HeaderMap::new(),
+            Some(Extension(WebUiToken("test-token".to_string()))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn token_removal_preserves_other_query_parameters() {
+        assert_eq!(query_without_token(Some("token=x")), None);
+        assert_eq!(
+            query_without_token(Some("token=x&variant=ai")),
+            Some("variant=ai".to_string())
+        );
+        assert_eq!(
+            query_without_token(Some("refresh=1&token=x")),
+            Some("refresh=1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn webui_token_is_required_for_api() {
+        async fn status(headers: Option<&str>) -> StatusCode {
+            let mut builder = Request::builder()
+                .uri("/api/accounts")
+                .header(header::HOST, "127.0.0.1");
+            if let Some(cookie) = headers {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            let request = builder.body(Body::empty()).unwrap();
+            router_with_token("test-token".to_string())
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status()
+        }
+
+        assert_eq!(status(None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status(Some("wb_webui_token=wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            status(Some("wb_webui_token=test-token")).await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     /// 缺省档位必须与改造前一致（不传 variant 即国内版）。

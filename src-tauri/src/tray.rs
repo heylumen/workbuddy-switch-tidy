@@ -881,10 +881,12 @@ fn format_checkin_tooltip(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, taskbar_uses_light_theme,
-        tray_icon_variant, MouseButton, MouseButtonState, TrayIconVariant,
+        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
+        MouseButtonState, TrayIconVariant,
     };
     use serde_json::json;
 

@@ -34,7 +34,9 @@ static TRAVEL_CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serialize travel-cache read-modify-write across depart and claim cycles.
 pub fn with_travel_cache_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = TRAVEL_CACHE_WRITE_LOCK.lock().unwrap();
+    let _guard = TRAVEL_CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     f()
 }
 
@@ -308,7 +310,9 @@ pub fn clear_codebuddy_ide_app_cache() {
 ///
 /// `enabled` 默认关闭：全新安装需用户在设置页显式开启；已有用户在
 /// [`load_checkin_config`] 中沿用历史默认（开启），升级不改其状态。
-/// `checkin_start` / `checkin_end` 为空串 = 不限制签到时间段（与改动前行为一致）。
+/// `checkin_start` / `checkin_end` 默认 `08:00`~`22:00`：账号按 (本地日期, 账号)
+/// 哈希分散到窗口内的某一分钟，避免宿主一启动就把全部账号连续打完；把窗口设成
+/// `00:00`~`23:59` 即可恢复「不限时段」的旧行为。
 pub fn default_checkin_config() -> Value {
     checkin_config_with_enabled(false)
 }
@@ -322,8 +326,8 @@ fn checkin_config_with_enabled(enabled: bool) -> Value {
     json!({
         "enabled": enabled,
         "excluded_account_ids": [],
-        "checkin_start": "",
-        "checkin_end": "",
+        "checkin_start": "08:00",
+        "checkin_end": "22:00",
         "start_hour": 6,
         "end_hour": 12,
         // 保活临期窗口（天）：默认 7 天，避免每天无条件轮换全部 refresh token。
@@ -387,11 +391,15 @@ fn apply_checkin_config(merged: &mut Value, input: &Value) {
             merged[key] = json!(value);
         }
     }
-    // 时间段保存归一化：合法值零填充后落盘，非法/非字符串归一为空串（= 不限制）。
+    // 时间段保存归一化：合法值零填充后落盘，非法/非字符串归一为空串
+    // （空串在调度侧按 DEFAULT_CHECKIN_WINDOW 解释）。字段缺失时保留默认窗口，
+    // 避免「用户只改了其他字段」把窗口意外重置成空、退化成不限时段。
     for key in ["checkin_start", "checkin_end"] {
-        let normalized = map
-            .get(key)
-            .and_then(Value::as_str)
+        let Some(raw) = map.get(key) else {
+            continue;
+        };
+        let normalized = raw
+            .as_str()
             .and_then(parse_clock)
             .map(|(hour, minute)| format!("{hour:02}:{minute:02}"))
             .unwrap_or_default();
@@ -463,7 +471,9 @@ fn save_checkin_logs_unlocked(logs: &[Value]) -> std::io::Result<()> {
 
 /// 保存签到日志（30 天过滤 + 保留最近 500 条，保持插入顺序）。
 pub fn save_checkin_logs(logs: &[Value]) -> std::io::Result<()> {
-    let _guard = CHECKIN_LOG_WRITE_LOCK.lock().unwrap();
+    let _guard = CHECKIN_LOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     save_checkin_logs_unlocked(logs)
 }
 
@@ -580,7 +590,9 @@ fn compact_checkin_logs_at(path: &Path, at_ms: i64) -> std::io::Result<bool> {
 /// read-only operation; both hosts invoke this explicit migration before their
 /// first automatic verification cycle.
 pub fn compact_checkin_logs() -> std::io::Result<bool> {
-    let _guard = CHECKIN_LOG_WRITE_LOCK.lock().unwrap();
+    let _guard = CHECKIN_LOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     compact_checkin_logs_at(&checkin_logs_file(), now_ms())
 }
 
@@ -588,7 +600,9 @@ pub fn compact_checkin_logs() -> std::io::Result<bool> {
 pub fn add_checkin_log(entry: &Value) {
     // Account-scoped check-in coordination permits unrelated accounts to run
     // concurrently. Serialize the file read-modify-write so neither entry is lost.
-    let _guard = CHECKIN_LOG_WRITE_LOCK.lock().unwrap();
+    let _guard = CHECKIN_LOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut logs = load_checkin_logs();
     logs.push(entry.clone());
     let _ = save_checkin_logs_unlocked(&logs);
@@ -868,7 +882,9 @@ fn rotate_notify_count_at(path: &Path, today: &str) -> u32 {
 /// 同自然日上限 [`ROTATE_NOTIFY_DAILY_LIMIT`]，跨日按本地日期清零；读取失败/损坏视为 0，
 /// 不阻塞轮换。预算文件写不进去时不投递——宁可少一条通知，也不要每轮都弹。
 pub fn try_consume_rotate_notify(at_ms: i64) -> bool {
-    let _guard = ROTATE_NOTIFY_LOCK.lock().unwrap();
+    let _guard = ROTATE_NOTIFY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = auto_rotate_notify_file();
     try_consume_rotate_notify_at(&path, &local_date(at_ms))
 }
@@ -1028,7 +1044,9 @@ fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
         http_client_builder()
             .build()
-            .expect("failed to build reqwest client")
+            // 极端环境（TLS 后端初始化失败）不应让进程 panic：退回默认 client，
+            // 让具体请求以可读错误返回。
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
@@ -1441,7 +1459,7 @@ mod tests {
             existing.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)
         );
-        assert_eq!(existing.get("checkin_start"), Some(&json!("")));
+        assert_eq!(existing.get("checkin_start"), Some(&json!("08:00")));
 
         // 显式值优先于痕迹。
         for existing_install in [false, true] {
@@ -1628,10 +1646,10 @@ mod tests {
     }
 
     #[test]
-    fn checkin_window_defaults_to_unset_and_normalizes_on_save() {
+    fn checkin_window_defaults_to_spread_window_and_normalizes_on_save() {
         let defaults = default_checkin_config();
-        assert_eq!(defaults.get("checkin_start"), Some(&json!("")));
-        assert_eq!(defaults.get("checkin_end"), Some(&json!("")));
+        assert_eq!(defaults.get("checkin_start"), Some(&json!("08:00")));
+        assert_eq!(defaults.get("checkin_end"), Some(&json!("22:00")));
 
         // 合法值零填充后落盘。
         let merged = merge_checkin_config(&json!({
@@ -1644,10 +1662,10 @@ mod tests {
 
     #[test]
     fn checkin_window_invalid_values_normalize_to_empty_and_keep_other_fields() {
-        // 缺失 → 空串。
+        // 缺失 → 保留默认的分散窗口（不再重置成空串）。
         let missing = merge_checkin_config(&json!({}));
-        assert_eq!(missing.get("checkin_start"), Some(&json!("")));
-        assert_eq!(missing.get("checkin_end"), Some(&json!("")));
+        assert_eq!(missing.get("checkin_start"), Some(&json!("08:00")));
+        assert_eq!(missing.get("checkin_end"), Some(&json!("22:00")));
 
         // 非字符串 / 越界 / 格式错误 → 空串，不落盘未知值。
         for bad in [json!(1234), json!(null), json!(true), json!("25:00")] {

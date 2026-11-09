@@ -88,8 +88,14 @@ export function JetbrainsSwitchDialog({ open, onOpenChange, account, jetbrainsSt
   }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+    <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next); }}>
+      <DialogContent
+        showCloseButton={!busy}
+        onEscapeKeyDown={(event) => { if (busy) event.preventDefault(); }}
+        onPointerDownOutside={(event) => { if (busy) event.preventDefault(); }}
+        onInteractOutside={(event) => { if (busy) event.preventDefault(); }}
+        className="sm:max-w-md"
+      >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <JetbrainsMark size={20} />
@@ -106,7 +112,7 @@ export function JetbrainsSwitchDialog({ open, onOpenChange, account, jetbrainsSt
 
         {targets.length === 0 ? (
           <p className="rounded-lg bg-muted/60 px-3 py-2 text-sm text-muted-foreground">
-            未检测到已安装 CodeBuddy 插件的 JetBrains IDE。请先在 IDEA / PyCharm 中安装「Tencent Cloud
+            未检测到已安装 CodeBuddy 插件的 JetBrains IDE。请先在 IntelliJ IDEA / PyCharm / GoLand / Android Studio 等 IDE 中安装「Tencent Cloud
             CodeBuddy」插件后重试。
           </p>
         ) : (
@@ -132,7 +138,7 @@ export function JetbrainsSwitchDialog({ open, onOpenChange, account, jetbrainsSt
                   onCheckedChange={(on) => toggle(t.configDir, Boolean(on))}
                   aria-label={`写入 ${t.configDir}`}
                 />
-                <span className="min-w-0 flex-1 truncate">{t.configDir}</span>
+                <span className="min-w-0 flex-1 truncate">{t.product ?? t.configDir}</span>
                 {t.running && (
                   <span className="flex-none rounded-full bg-primary/10 px-2 py-0.5 text-xs text-primary">
                     运行中

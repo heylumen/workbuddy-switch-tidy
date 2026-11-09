@@ -147,6 +147,22 @@
         }, timeoutMs);
       })();
     </script>
+    <script>
+      // 旧 WebKit（Safari < 15.4）不支持 @layer，Tailwind v4 的样式会被整块丢弃；
+      // 生产构建同时产出 legacy.css（已扁平化 @layer），仅在旧内核加载。
+      (function () {
+        var layerSupported = typeof window.CSSLayerBlockRule !== "undefined";
+        var colorMixSupported =
+          window.CSS &&
+          typeof window.CSS.supports === "function" &&
+          window.CSS.supports("color", "color-mix(in srgb, red, blue)");
+        if (layerSupported && colorMixSupported) return;
+        var link = document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = "legacy.css";
+        document.head.appendChild(link);
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

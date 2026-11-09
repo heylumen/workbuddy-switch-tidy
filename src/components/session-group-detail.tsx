@@ -357,7 +357,7 @@ export function GroupDetailPanel(props: GroupDetailPanelProps) {
 function MemberStatus({ status, equal }: { status: SessionGroupMemberDetail["versionStatus"]; equal: boolean }) {
   const labels: Record<typeof status, string> = {
     latest: equal ? "内容一致" : "内容最新", behind: "内容落后", diverge: "存在分歧",
-    missing: "内容缺失", unknown: "无法确认", stale: "已失效", superseded: "已替代",
+    missing: "内容缺失", unknown: "无法确认", pending: "待确认", single: "仅一个副本", stale: "已失效", superseded: "已替代",
   };
   const variant = status === "latest" ? "success" : ["behind", "diverge", "missing"].includes(status) ? "warning" : "outline";
   return <Badge variant={variant} className="text-[10px] font-medium">{labels[status]}</Badge>;

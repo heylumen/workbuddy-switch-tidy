@@ -23,9 +23,11 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::ErrorKind;
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::modules::config::{atomic_write, now_ms};
@@ -155,7 +157,7 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
         if line.trim().is_empty() {
             return Err(format!("第 {} 行为空，内容可能不完整", index + 1));
         }
-        serde_json::from_str::<serde_json::Value>(line)
+        serde_json::from_str::<serde::de::IgnoredAny>(line)
             .map_err(|_| format!("第 {} 行的格式无法识别，内容可能不完整", index + 1))?;
         line_digests.push(line_digest_of(
             &line.replace(own_session_id, SESSION_ID_MARKER),
@@ -166,6 +168,224 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
         record_count: line_digests.len(),
         line_digests,
         total_digest,
+    })
+}
+
+/// 正文摘要缓存：列表页反复进入时避免重复整文件解析。
+///
+/// key = (路径, 文件长度, mtime nanos)；只缓存可解析结果的摘要与行摘要，
+/// 不保存正文文本。命中后返回的 text 为空，仅可用于判定/统计，
+/// 需要正文的写入或预览路径必须改用 read_content_snapshot。
+/// 摘要缓存的内存边界：条目数 + 单文件大小/记录数，避免长会话把进程内存撑大。
+const SUMMARY_CACHE_MAX_ENTRIES: usize = 32;
+const SUMMARY_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const SUMMARY_CACHE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SUMMARY_CACHE_MAX_RECORDS: usize = 10_000;
+/// 详情页自动校验的硬上限：真实数据中存在数百 MB 的副本，逐行扫描会让界面失去响应。
+/// 超过该值只保留尾部预览，并明确显示“文件过大、未自动校验”，不静默假装一致。
+pub(crate) const SUMMARY_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+type SummaryKey = (PathBuf, u64, u128, String);
+type SummaryValue = (String, NormalizedContent);
+
+struct SummaryCacheState {
+    entries: std::collections::HashMap<SummaryKey, (SummaryValue, usize)>,
+    order: VecDeque<SummaryKey>,
+    bytes: usize,
+}
+
+impl SummaryCacheState {
+    fn touch(&mut self, key: &SummaryKey) {
+        if let Some(position) = self.order.iter().position(|item| item == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key.clone());
+    }
+
+    fn insert(&mut self, key: SummaryKey, value: SummaryValue, size: usize) {
+        if size > SUMMARY_CACHE_MAX_BYTES / 4 {
+            return;
+        }
+        if let Some((_, old_size)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old_size);
+        }
+        while (self.bytes.saturating_add(size) > SUMMARY_CACHE_MAX_BYTES
+            || self.entries.len() >= SUMMARY_CACHE_MAX_ENTRIES)
+            && !self.order.is_empty()
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some((_, old_size)) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(old_size);
+                }
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, (value, size));
+    }
+}
+
+type SummaryCache = Mutex<SummaryCacheState>;
+
+static SUMMARY_CACHE: OnceLock<SummaryCache> = OnceLock::new();
+
+fn summary_cache_key(path: &Path, own_session_id: &str) -> Option<SummaryKey> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some((
+        path.to_path_buf(),
+        meta.len(),
+        mtime,
+        own_session_id.to_string(),
+    ))
+}
+
+/// 读取只用于判定/统计的正文摘要；命中缓存时不读文件，未命中则读一次并缓存。
+pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
+    let Some(key) = summary_cache_key(path, own_session_id) else {
+        return match std::fs::metadata(path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => ContentState::Missing,
+            Err(error) => ContentState::Unavailable(format!("内容无法读取：{error}")),
+            Ok(_) => ContentState::Unavailable("内容元数据无法读取".to_string()),
+        };
+    };
+    // 超大文件只保留尾部预览，禁止在详情页逐行扫描数百 MB 副本。
+    if key.1 > SUMMARY_SCAN_MAX_BYTES {
+        return ContentState::Unavailable(format!(
+            "会话文件过大（{:.1} MB），已跳过内容校验",
+            key.1 as f64 / 1024.0 / 1024.0
+        ));
+    }
+    // 2MB–32MB 不进缓存，但仍流式计算摘要，避免整文件读入造成峰值。
+    if key.1 > SUMMARY_CACHE_MAX_FILE_BYTES {
+        return read_content_summary_streaming(path, own_session_id);
+    }
+    if let Some(cache) = SUMMARY_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            let cached = guard.entries.get(&key).map(|(value, _)| value.clone());
+            if let Some((full_digest, normalized)) = cached {
+                guard.touch(&key);
+                return ContentState::Ready(ContentSnapshot {
+                    text: String::new(),
+                    full_digest,
+                    normalized,
+                });
+            }
+        }
+    }
+    match read_content_summary_streaming(path, own_session_id) {
+        ContentState::Ready(snapshot) => {
+            let cacheable = snapshot.normalized.record_count <= SUMMARY_CACHE_MAX_RECORDS;
+            if cacheable {
+                if let Some(cache) = SUMMARY_CACHE.get() {
+                    let size = snapshot.full_digest.len()
+                        + snapshot
+                            .normalized
+                            .line_digests
+                            .iter()
+                            .map(|digest| digest.len() + 24)
+                            .sum::<usize>()
+                        + snapshot.normalized.total_digest.len()
+                        + 128;
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(
+                            key,
+                            (snapshot.full_digest.clone(), snapshot.normalized.clone()),
+                            size,
+                        );
+                    }
+                }
+            }
+            ContentState::Ready(ContentSnapshot {
+                text: String::new(),
+                full_digest: snapshot.full_digest,
+                normalized: snapshot.normalized,
+            })
+        }
+        other => other,
+    }
+}
+
+/// 流式读取正文摘要：逐行读取、边读边 hash，不把整份正文读进内存。
+///
+/// 与 read_content_snapshot 的判定口径一致：空正文/中间空行/非法 JSON/读取期间
+/// 文件变化都返回 Unavailable；返回的 text 恒为空，只用于判定与统计。
+fn read_content_summary_streaming(path: &Path, own_session_id: &str) -> ContentState {
+    let before = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == ErrorKind::NotFound => return ContentState::Missing,
+        Err(error) => return ContentState::Unavailable(format!("内容无法读取：{error}")),
+    };
+    let Ok(file) = File::open(path) else {
+        return ContentState::Unavailable("内容读取失败".to_string());
+    };
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut line_digests: Vec<String> = Vec::new();
+    let mut pending_empty = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => return ContentState::Unavailable(format!("内容读取失败：{error}")),
+        }
+        hasher.update(&buf);
+        let mut line = &buf[..];
+        if line.ends_with(b"\n") {
+            line = &line[..line.len() - 1];
+        }
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        if line.is_empty() {
+            pending_empty += 1;
+            continue;
+        }
+        if pending_empty > 0 {
+            return ContentState::Unavailable(format!(
+                "第 {} 行为空，内容可能不完整",
+                line_digests.len() + 1
+            ));
+        }
+        let Ok(text) = std::str::from_utf8(line) else {
+            return ContentState::Unavailable("内容格式异常，无法读取".to_string());
+        };
+        if serde_json::from_str::<serde::de::IgnoredAny>(text).is_err() {
+            return ContentState::Unavailable(format!(
+                "第 {} 行的格式无法识别，内容可能不完整",
+                line_digests.len() + 1
+            ));
+        }
+        line_digests.push(line_digest_of(
+            &text.replace(own_session_id, SESSION_ID_MARKER),
+        ));
+    }
+    let after = std::fs::metadata(path);
+    let changed = match after {
+        Ok(meta) => meta.len() != before.len() || meta.modified().ok() != before.modified().ok(),
+        Err(_) => true,
+    };
+    if changed {
+        return ContentState::Unavailable("内容在读取过程中发生变化，无法确认完整".to_string());
+    }
+    if line_digests.is_empty() {
+        return ContentState::Unavailable("内容为空".to_string());
+    }
+    ContentState::Ready(ContentSnapshot {
+        text: String::new(),
+        full_digest: to_hex(&hasher.finalize()),
+        normalized: NormalizedContent {
+            record_count: line_digests.len(),
+            total_digest: total_digest_of(&line_digests),
+            line_digests,
+        },
     })
 }
 
@@ -1006,10 +1226,107 @@ pub fn load_store(paths: &SessionPaths) -> StoreState {
     }
     // 旧存储兼容：成员缺 `variant` 时用组级 `variant` 回填（跨档组成员显式保存）。
     backfill_member_variants(&mut store);
+    // 历史手工清理可能留下“基线引用已删成员/空组”的可恢复脏元数据：
+    // 只丢弃不可用的同步基线，不碰会话正文；其余结构错误仍按 Unavailable 保留现场。
+    sanitize_store(&mut store);
     if let Err(reason) = validate_store(&store) {
         return StoreState::Unavailable(format!("同步记录内容不一致：{reason}"));
     }
     StoreState::Ready(store)
+}
+
+/// 丢弃无法再解析的同步基线/空组（旧版本手工清理遗留）。
+///
+/// 只处理可安全丢弃的元数据：pairBases 成员不存在/长度不是 2/重复，以及没有任何成员的组。
+/// 不修组 ID、重复成员身份等无法安全推断的结构错误。
+fn sanitize_store(store: &mut LinkStore) {
+    store.groups.retain(|group| !group.members.is_empty());
+    for group in &mut store.groups {
+        let member_ids = group
+            .members
+            .iter()
+            .map(|member| member.member_id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut seen_pairs = std::collections::HashSet::new();
+        group.pair_bases.retain(|pair| {
+            pair.member_ids.len() == 2
+                && pair
+                    .member_ids
+                    .iter()
+                    .all(|member_id| member_ids.contains(member_id.as_str()))
+                && seen_pairs.insert(pair_key(&pair.member_ids[0], &pair.member_ids[1]))
+        });
+    }
+}
+
+/// 对关联主表做一次可回滚的维护：丢弃无效基线/空组并原子写回。
+///
+/// 只处理可安全丢弃的元数据，不碰 `.jsonl` 会话正文。原文件先复制到备份目录，
+/// 备份校验大小后才写回；无变化时不产生备份、不推进 revision。
+pub fn repair_store(paths: &SessionPaths) -> Result<serde_json::Value, String> {
+    let _guard = acquire_link_store_lock(paths)?;
+    let file = paths.session_links_file();
+    let text =
+        std::fs::read_to_string(&file).map_err(|error| format!("同步记录无法读取：{error}"))?;
+    let mut store = serde_json::from_str::<LinkStore>(&text)
+        .map_err(|_| "同步记录已损坏，未执行修复".to_string())?;
+    if store.version != LINK_STORE_VERSION {
+        return Err(format!(
+            "同步记录版本 {} 不受支持（当前支持 {}），未执行修复",
+            store.version, LINK_STORE_VERSION
+        ));
+    }
+    backfill_member_variants(&mut store);
+    let before_groups = store.groups.len();
+    let before_pairs = store
+        .groups
+        .iter()
+        .map(|group| group.pair_bases.len())
+        .sum::<usize>();
+    sanitize_store(&mut store);
+    let after_groups = store.groups.len();
+    let after_pairs = store
+        .groups
+        .iter()
+        .map(|group| group.pair_bases.len())
+        .sum::<usize>();
+    validate_store(&store).map_err(|reason| format!("修复后仍不一致：{reason}"))?;
+    if before_groups == after_groups && before_pairs == after_pairs {
+        return Ok(serde_json::json!({
+            "changed": false,
+            "groups": after_groups,
+            "pairBases": after_pairs,
+        }));
+    }
+
+    let backup = paths
+        .backup_root()
+        .join(format!("session_links-before-repair-{}.json", now_ms()));
+    std::fs::create_dir_all(paths.backup_root())
+        .map_err(|error| format!("备份目录创建失败：{error}"))?;
+    std::fs::copy(&file, &backup).map_err(|error| format!("同步记录备份失败：{error}"))?;
+    let (source_len, backup_len) = (
+        std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0),
+        std::fs::metadata(&backup).map(|m| m.len()).unwrap_or(0),
+    );
+    if source_len != backup_len {
+        return Err("同步记录备份校验失败，未写回".to_string());
+    }
+
+    store.version = LINK_STORE_VERSION;
+    store.revision = store.revision.saturating_add(1);
+    let content = serde_json::to_string_pretty(&store).map_err(|error| error.to_string())?;
+    session_backup::durable_write_str(&file, &content)
+        .map_err(|error| format!("同步记录写回失败：{error}"))?;
+    Ok(serde_json::json!({
+        "changed": true,
+        "groupsBefore": before_groups,
+        "groupsAfter": after_groups,
+        "pairBasesBefore": before_pairs,
+        "pairBasesAfter": after_pairs,
+        "backup": backup.to_string_lossy(),
+        "revision": store.revision,
+    }))
 }
 
 /// 不变量校验（写入前与读取后都执行）：
@@ -1718,6 +2035,39 @@ mod tests {
 
     struct TempDir(PathBuf);
 
+    #[test]
+    fn streaming_summary_matches_full_snapshot_and_invalidates() {
+        let dir = TempDir::new("stream_summary");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            b"{\"sessionId\":\"own\",\"text\":\"a\"}\r\n{\"text\":\"b\"}\r\n",
+        )
+        .unwrap();
+        let (summary, full) = (
+            read_content_summary(&path, "own"),
+            read_content_snapshot(&path, "own"),
+        );
+        let (ContentState::Ready(summary), ContentState::Ready(full)) = (summary, full) else {
+            panic!("fixture 必须可验证");
+        };
+        assert_eq!(summary.full_digest, full.full_digest);
+        assert_eq!(summary.normalized, full.normalized);
+        assert!(summary.text.is_empty(), "摘要不得保留正文");
+
+        // 追加一行后，元数据签名变化，缓存必须失效并重新计算。
+        std::fs::write(
+            &path,
+            b"{\"sessionId\":\"own\",\"text\":\"a\"}\r\n{\"text\":\"b\"}\r\n{\"text\":\"c\"}\r\n",
+        )
+        .unwrap();
+        let ContentState::Ready(updated) = read_content_summary(&path, "own") else {
+            panic!("更新后的 fixture 必须可验证");
+        };
+        assert_eq!(updated.normalized.record_count, 3);
+        assert_ne!(updated.full_digest, summary.full_digest);
+    }
+
     impl TempDir {
         fn new(name: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
@@ -2151,6 +2501,59 @@ mod tests {
     }
 
     /// 旧存储（成员没有 `variant` 字段）载入时用组级档位回填，行为与改造前一致。
+    #[test]
+    fn sanitize_drops_invalid_pair_bases_and_empty_groups() {
+        let mut group = group_with_members(
+            "g-valid",
+            vec![member("uid-a", "sess-1", MemberState::Active)],
+        );
+        group.pair_bases.push(PairBase {
+            member_ids: ["m-a".to_string(), "m-missing".to_string()],
+            baseline_ref: "base-missing".to_string(),
+            normalization_version: 1,
+        });
+        let mut store = LinkStore {
+            version: LINK_STORE_VERSION,
+            revision: 1,
+            groups: vec![group, group_with_members("g-empty", Vec::new())],
+        };
+
+        sanitize_store(&mut store);
+
+        assert_eq!(store.groups.len(), 1);
+        assert_eq!(store.groups[0].id, "g-valid");
+        assert!(store.groups[0].pair_bases.is_empty());
+        validate_store(&store).expect("清理后的存储应通过不变量校验");
+    }
+
+    #[test]
+    fn repair_store_backs_up_and_prunes_invalid_metadata() {
+        let dir = TempDir::new("repair-store");
+        let paths = temp_paths(&dir);
+        std::fs::create_dir_all(&paths.store_root).unwrap();
+        let mut group = group_with_members(
+            "g-valid",
+            vec![member("uid-a", "sess-1", MemberState::Active)],
+        );
+        group.pair_bases.push(PairBase {
+            member_ids: ["m-a".to_string(), "m-missing".to_string()],
+            baseline_ref: "base-missing".to_string(),
+            normalization_version: 1,
+        });
+        std::fs::write(paths.session_links_file(), json_store(vec![group])).unwrap();
+
+        let report = repair_store(&paths).unwrap();
+        assert_eq!(report["changed"], true);
+        assert_eq!(report["pairBasesAfter"], 0);
+        assert!(std::path::Path::new(report["backup"].as_str().unwrap()).is_file());
+
+        let StoreState::Ready(store) = load_store(&paths) else {
+            panic!("修复后的存储应可读");
+        };
+        assert_eq!(store.revision, 2);
+        assert!(store.groups[0].pair_bases.is_empty());
+    }
+
     #[test]
     fn load_backfills_member_variant_from_group() {
         let dir = TempDir::new("member-variant-backfill");

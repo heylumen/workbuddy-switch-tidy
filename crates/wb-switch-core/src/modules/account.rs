@@ -6,6 +6,7 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::modules::config::{accounts_file, atomic_write, now_ms};
 use crate::modules::variant::WbVariant;
@@ -41,6 +42,23 @@ fn load_accounts_from_path(path: &Path) -> Vec<Value> {
     vec![]
 }
 
+/// 写路径专用读取：只有文件不存在才允许空库，其他 IO/解析错误必须中止。
+fn load_accounts_for_update_at(path: &Path) -> Result<Vec<Value>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Array(accounts)) => Ok(accounts),
+            Ok(_) => Err("账号库不是 JSON 数组，已中止写入".to_string()),
+            Err(error) => Err(format!("账号库 JSON 解析失败，已中止写入：{error}")),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("账号库读取失败，已中止写入：{error}")),
+    }
+}
+
+pub(crate) fn load_accounts_for_update() -> Result<Vec<Value>, String> {
+    load_accounts_for_update_at(&accounts_file())
+}
+
 fn save_accounts_to_path(path: &Path, accounts: &[Value]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -60,7 +78,7 @@ fn find_account_in(accounts: &[Value], account_id: &str) -> Option<Value> {
 }
 
 fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String> {
-    let mut accounts = load_accounts_from_path(path);
+    let mut accounts = load_accounts_for_update_at(path)?;
     let before = accounts.len();
     accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
     if accounts.len() == before {
@@ -84,9 +102,30 @@ pub fn load_accounts_at(path: &Path) -> Vec<Value> {
     load_accounts_from_path(path)
 }
 
-/// 写回账号库（原子写），保持原 JSON 数组结构。
-pub fn save_accounts(accounts: &[Value]) -> std::io::Result<()> {
+static ACCOUNTS_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+fn accounts_write_guard() -> MutexGuard<'static, ()> {
+    ACCOUNTS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn save_accounts_unlocked(accounts: &[Value]) -> std::io::Result<()> {
     save_accounts_to_path(&accounts_file(), accounts)
+}
+
+/// 在同一把账号写锁内执行「读-改-写」；调用方必须使用 `save_accounts_unlocked`。
+pub(crate) fn with_accounts_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = accounts_write_guard();
+    f()
+}
+
+/// 写回账号库（原子写），保持原 JSON 数组结构。
+///
+/// 进程内写锁覆盖「读-改-写」序列；调用方不要再嵌套持有本锁。
+pub fn save_accounts(accounts: &[Value]) -> std::io::Result<()> {
+    let _guard = accounts_write_guard();
+    save_accounts_unlocked(accounts)
 }
 
 /// 按 id 或 uid 查找账号。
@@ -143,6 +182,8 @@ pub fn account_meta(acc: &Value) -> Value {
         "last_refresh_error": display_value(acc, "last_refresh_error"),
         "last_refresh_error_at": display_value(acc, "last_refresh_error_at"),
         "createdAt": display_value(acc, "createdAt"),
+        // 最近一次成功切换/使用该账号的时间；从未使用为 Null。
+        "lastUsedAt": display_value(acc, "lastUsedAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
         "needsReloginReason": display_value(acc, "needs_relogin_reason"),
         // 企业版标记（issue #167）：读取时判定，供前端展示「企业版」徽标，历史数据零迁移。
@@ -280,7 +321,7 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
             }
         }
         // 本地展示字段（备注 / 显示选择）不来自官方采集：采集结果缺失时保留已有值。
-        for key in ["note", "displayField"] {
+        for key in ["note", "displayField", "lastUsedAt"] {
             if collected.get(key).is_none() {
                 if let Some(v) = existing.get(key) {
                     collected[key] = v.clone();
@@ -321,17 +362,21 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
 
 /// 使用统一身份规则保存采集到的账号。
 pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
-    let mut accounts = load_accounts();
+    let _guard = accounts_write_guard();
+    let mut accounts = load_accounts_for_update()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     let saved = upsert_collected_account(&mut accounts, collected);
-    save_accounts(&accounts)?;
+    save_accounts_unlocked(&accounts)?;
     Ok(saved)
 }
 
 /// 按 id 覆盖；id 缺失或未命中时按 uid 回退覆盖，仍未命中则补 id 追加。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
-    let mut accounts = load_accounts();
+    let _guard = accounts_write_guard();
+    let mut accounts = load_accounts_for_update()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     upsert_account_in(&mut accounts, updated);
-    save_accounts(&accounts)
+    save_accounts_unlocked(&accounts)
 }
 
 /// 备注长度上限（字符数），与前端输入框 maxLength 保持一致。
@@ -342,9 +387,10 @@ const NOTE_MAX_CHARS: usize = 24;
 /// 只触碰本地展示字段，不修改 uid / token / profile_raw 等官方数据。
 /// 先整体校验再写入，避免部分更新。返回更新后的 `account_meta`。
 pub fn update_account_display(account_id: &str, patch: &Value) -> Result<Value, String> {
-    let mut accounts = load_accounts();
+    let _guard = accounts_write_guard();
+    let mut accounts = load_accounts_for_update()?;
     let updated = update_account_display_in(&mut accounts, account_id, patch)?;
-    save_accounts(&accounts).map_err(|error| error.to_string())?;
+    save_accounts_unlocked(&accounts).map_err(|error| error.to_string())?;
     Ok(account_meta(&updated))
 }
 
@@ -430,7 +476,7 @@ fn upsert_account_in(accounts: &mut Vec<Value>, updated: &Value) {
         inherit_existing_variant(&accounts[index], &mut next);
         // 本地展示字段（备注 / 显示选择）不从官方数据来：updated 缺失时保留已有值。
         if let Some(obj) = next.as_object_mut() {
-            for key in ["note", "displayField"] {
+            for key in ["note", "displayField", "lastUsedAt"] {
                 if !obj.contains_key(key) {
                     if let Some(v) = accounts[index].get(key) {
                         obj.insert(key.to_string(), v.clone());
@@ -507,7 +553,46 @@ pub fn build_auth_headers(account: &Value) -> HashMap<String, String> {
 
 /// 删除账号（按 id）。
 pub fn delete_account(account_id: &str) -> Result<(), String> {
+    let _guard = accounts_write_guard();
     delete_account_from_path(&accounts_file(), account_id)
+}
+
+/// 记录一次成功使用/切换；id 或 uid 均可传入。
+///
+/// 失败不返回错误：调用方刚完成的切号不应因台账写失败而回滚。
+pub fn touch_last_used(account_id: &str) {
+    let _guard = accounts_write_guard();
+    let mut accounts = match load_accounts_for_update() {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            crate::modules::error_log::record("account", "读取账号库失败，未记录最后使用", &error);
+            return;
+        }
+    };
+    if touch_last_used_in(&mut accounts, account_id).is_none() {
+        return;
+    }
+    if let Err(error) = save_accounts_unlocked(&accounts) {
+        crate::modules::error_log::record("account", "记录最后使用失败", &error.to_string());
+    }
+}
+
+/// 内存实现：匹配 id 或 uid；时间只增不减，避免乱序写入回退。
+pub fn touch_last_used_in(accounts: &mut [Value], account_id: &str) -> Option<i64> {
+    let index = accounts.iter().position(|account| {
+        account.get("id").and_then(Value::as_str) == Some(account_id)
+            || account.get("uid").and_then(Value::as_str) == Some(account_id)
+    })?;
+    let now = now_ms();
+    let previous = accounts[index]
+        .get("lastUsedAt")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if now <= previous {
+        return Some(previous);
+    }
+    accounts[index]["lastUsedAt"] = json!(now);
+    Some(now)
 }
 
 /// 导入本机当前账号（从该档位的登录态文件读取）。
@@ -522,6 +607,19 @@ pub fn import_local(variant: WbVariant) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn corrupt_accounts_file_is_not_treated_as_empty_for_updates() {
+        let path = std::env::temp_dir().join(format!(
+            "wb-switch-accounts-corrupt-{}.json",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&path, "{not-json").unwrap();
+        let error = load_accounts_for_update_at(&path).unwrap_err();
+        assert!(error.contains("解析失败"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
+        let _ = std::fs::remove_file(path);
+    }
 
     /// 回归 issue #94：信封凭据要能被识别并给出可读错误，明文/缺字段不误报。
     #[test]
@@ -1181,6 +1279,71 @@ mod tests {
         upsert_account_in(&mut accounts, &refreshed);
         assert_eq!(accounts[0]["note"], "工作号");
         assert_eq!(accounts[0]["displayField"], "phone");
+    }
+
+    #[test]
+    fn touch_last_used_matches_uid_and_is_monotonic() {
+        let mut accounts = vec![
+            account("a-1", Some("uid-1"), "小明", None),
+            account("a-2", Some("uid-2"), "小红", None),
+        ];
+        let first = touch_last_used_in(&mut accounts, "uid-1").expect("应命中 uid-1");
+        assert!(first > 0);
+        assert!(accounts[0]["lastUsedAt"].as_i64().unwrap() >= first);
+        assert!(accounts[1].get("lastUsedAt").is_none());
+
+        let second = touch_last_used_in(&mut accounts, "a-1").expect("应命中 id");
+        assert!(second >= first);
+    }
+
+    #[test]
+    fn touch_last_used_never_regresses() {
+        let mut accounts = vec![account("a-1", Some("uid-1"), "小明", None)];
+        let future = now_ms() + 60_000;
+        accounts[0]["lastUsedAt"] = json!(future);
+        let value = touch_last_used_in(&mut accounts, "a-1").expect("应命中");
+        assert_eq!(value, future);
+        assert_eq!(accounts[0]["lastUsedAt"], future);
+    }
+
+    #[test]
+    fn touch_last_used_returns_none_for_unknown_account() {
+        let mut accounts = vec![account("a-1", Some("uid-1"), "小明", None)];
+        assert!(touch_last_used_in(&mut accounts, "missing").is_none());
+        assert!(accounts[0].get("lastUsedAt").is_none());
+    }
+
+    #[test]
+    fn refresh_upsert_preserves_last_used() {
+        let mut existing = account("a-1", Some("uid-1"), "小明", None);
+        existing["lastUsedAt"] = json!(1234);
+        let mut accounts = vec![existing];
+        upsert_account_in(&mut accounts, &account("a-1", Some("uid-1"), "小明", None));
+        assert_eq!(accounts[0]["lastUsedAt"], 1234);
+    }
+
+    #[test]
+    fn collected_upsert_preserves_last_used() {
+        let mut existing = account("a-1", Some("uid-1"), "小明", None);
+        existing["lastUsedAt"] = json!(5678);
+        let mut accounts = vec![existing];
+        let saved = upsert_collected_account(
+            &mut accounts,
+            account("a-1", Some("uid-1"), "小明（官方更新）", None),
+        );
+        assert_eq!(saved["lastUsedAt"], 5678);
+        assert_eq!(accounts[0]["lastUsedAt"], 5678);
+    }
+
+    #[test]
+    fn account_meta_exposes_last_used() {
+        let mut acc = account("a-1", Some("uid-1"), "小明", None);
+        acc["lastUsedAt"] = json!(1234);
+        assert_eq!(account_meta(&acc)["lastUsedAt"], 1234);
+        assert_eq!(
+            account_meta(&account("a-2", None, "小红", None))["lastUsedAt"],
+            Value::Null
+        );
     }
 }
 

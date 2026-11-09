@@ -101,6 +101,42 @@ fn conversation_index(
     out
 }
 
+/// 某账号每个会话目录的字节数（只读元数据，不读正文）。
+///
+/// 供列表的轻量降级判定使用：插件/IDE 没有 WorkBuddy 的 `projects/*.jsonl`，
+/// 不能复用 `find_project_jsonl`，但会话目录本身就是天然的大小单位。
+pub(crate) fn session_sizes(
+    spec: SessionStoreSpec,
+    root: &Path,
+    uid: &str,
+    wanted: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    for (id, locator) in conversation_index(spec, root, uid) {
+        if !wanted.contains(&id) {
+            continue;
+        }
+        let dir = conversation_dir(spec, root, uid, &locator.workspace_hash, &id);
+        out.insert(id, directory_size(&dir).unwrap_or(u64::MAX));
+    }
+    out
+}
+
+fn directory_size(dir: &Path) -> Option<u64> {
+    let mut total = 0u64;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() {
+            total = total.saturating_add(directory_size(&path)?);
+        } else {
+            total = total.saturating_add(entry.metadata().ok()?.len());
+        }
+    }
+    Some(total)
+}
+
 /// 某账号某会话的目录：`history/<workspaceHash>/<conversationId>`。
 fn conversation_dir(
     spec: SessionStoreSpec,
@@ -376,12 +412,13 @@ fn register_one(
             Some(member_id) => {
                 session_link::set_member_state(group, &member_id, MemberState::Active);
                 if let Some(value) = source_variant {
-                    group
+                    if let Some(member) = group
                         .members
                         .iter_mut()
                         .find(|member| member.member_id == member_id)
-                        .unwrap()
-                        .variant = Some(value);
+                    {
+                        member.variant = Some(value);
+                    }
                 }
                 member_id
             }
@@ -409,12 +446,13 @@ fn register_one(
             Some(member_id) => {
                 session_link::set_member_state(group, &member_id, MemberState::Active);
                 if let Some(value) = target_variant {
-                    group
+                    if let Some(member) = group
                         .members
                         .iter_mut()
                         .find(|member| member.member_id == member_id)
-                        .unwrap()
-                        .variant = Some(value);
+                    {
+                        member.variant = Some(value);
+                    }
                 }
                 member_id
             }
@@ -2929,5 +2967,17 @@ mod tests {
             composed.contains(&backup_dir.to_string_lossy().to_string()),
             "{composed}"
         );
+    }
+
+    #[test]
+    fn directory_size_sums_nested_files_only() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-size-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 3]).unwrap();
+        std::fs::write(dir.join("nested/b.bin"), vec![0u8; 5]).unwrap();
+        assert_eq!(directory_size(&dir), Some(8));
+        assert_eq!(directory_size(&dir.join("missing")), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

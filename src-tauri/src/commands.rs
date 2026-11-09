@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    account, account_memory, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
@@ -73,6 +73,15 @@ pub fn get_accounts() -> Value {
         .map(account::account_meta)
         .collect();
     json!({ "accounts": metas })
+}
+
+/// POST /api/accounts/copy-memory —— 复制一个账号的本地工作记忆到另一个账号。
+#[tauri::command(rename_all = "camelCase")]
+pub fn copy_account_memory(
+    source_account_id: String,
+    target_account_id: String,
+) -> Result<Value, String> {
+    account_memory::copy_memory(&source_account_id, &target_account_id)
 }
 
 /// GET /api/codebuddy-cli/status —— CodeBuddy CLI helper 轮换状态（不含 token）。
@@ -639,7 +648,17 @@ pub fn list_account_sessions(account_id: String, client: Option<String>) -> Resu
             Ok(session::list_sessions_for_account(&account))
         }
         session_groups::SessionClient::CodebuddyIde => {
-            Err("当前客户端暂不支持列出账号会话".to_string())
+            let uid = account::get_str(&account, "uid")
+                .map(|uid| uid.trim().to_string())
+                .filter(|uid| !uid.is_empty())
+                .ok_or("账号缺少 uid")?;
+            let root =
+                codebuddy_ide_session::ide_data_root().ok_or("未找到 CodeBuddy IDE 数据目录")?;
+            Ok(vscode_session::list_sessions_in_store(
+                vscode_session::CODEBUDDY_IDE_STORE,
+                &root,
+                &uid,
+            ))
         }
     }
 }
@@ -1013,10 +1032,26 @@ pub async fn get_credit_statistics(refresh: Option<bool>) -> Value {
 }
 
 #[tauri::command]
-pub async fn get_token_statistics(days: Option<i64>) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || token_stats::get_statistics(days))
-        .await
-        .map_err(|error| format!("扫描 Token 统计失败: {error}"))
+pub async fn get_token_statistics(
+    days: Option<i64>,
+    requests: Option<bool>,
+    refresh: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        token_stats::get_statistics(days, requests.unwrap_or(false), refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("扫描 Token 统计失败: {error}"))
+}
+
+/// GET /api/token-stats/requests —— 只扫描 CodeBuddy CLI 的请求明细。
+#[tauri::command]
+pub async fn get_token_requests(days: Option<i64>, refresh: Option<bool>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        token_stats::get_requests(days, refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|error| format!("扫描 Token 明细失败: {error}"))
 }
 
 /// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。
@@ -1483,6 +1518,9 @@ pub async fn dedup_sessions(account_id: String) -> Result<Value, String> {
             .to_string();
         if uid.is_empty() {
             return Err("账号缺少 uid".to_string());
+        }
+        if process::is_workbuddy_running(variant) {
+            return Err("请先退出 WorkBuddy 再清理重复会话".to_string());
         }
         Ok(session::dedup_sessions_for_user(variant, &uid))
     })

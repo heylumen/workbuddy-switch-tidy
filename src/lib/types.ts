@@ -28,6 +28,8 @@ export interface AccountMeta {
   refreshExpiresAt: number | null;
   refreshedAt: number | null;
   createdAt: number | null;
+  /** 最近一次成功切换/使用该账号的时间；从未使用为 null / 缺省。 */
+  lastUsedAt?: number | null;
   needsRelogin: boolean;
   needsReloginReason: string | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
@@ -37,6 +39,16 @@ export interface AccountMeta {
    * 缺省（旧后端/历史账号）按非企业处理。
    */
   isEnterprise?: boolean;
+}
+
+/** 复制本地工作记忆（#209）的返回报告。 */
+export interface MemoryCopyResult {
+  ok: boolean;
+  changed: boolean;
+  bytes: number;
+  source: { id: string | null; uid: string; name: string };
+  target: { id: string | null; uid: string; name: string };
+  backup: string | null;
 }
 
 export interface AppStatus {
@@ -292,7 +304,7 @@ export interface SessionSyncReport {
 // ---------------------------------------------------------------------------
 
 export type SessionGroupClient = "workbuddy" | "codebuddyIde" | "vscodeExt";
-export type SessionGroupStatus = "latest" | "behind" | "diverge" | "missing" | "unknown";
+export type SessionGroupStatus = "latest" | "behind" | "diverge" | "missing" | "unknown" | "pending" | "single";
 export type SessionMemberVersionStatus = SessionGroupStatus | "stale" | "superseded";
 
 export interface SessionGroupSummary {
@@ -329,6 +341,7 @@ export interface SessionGroupMemberDetail {
   contentPreview?: { speaker: string; text: string }[];
   contentState: "ready" | "missing" | "unavailable";
   reason: string;
+  targetAvailable?: boolean;
   canBeSource: boolean;
 }
 
@@ -337,6 +350,8 @@ export interface SessionGroupList {
   variantScope: WbVariant | null;
   storeStatus: "missing" | "ready" | "unavailable";
   storeError?: string;
+  /** 数据量过大时列表先只返回元数据，状态由详情接口后台回填。 */
+  lightweight?: boolean;
   groups: SessionGroupSummary[];
 }
 
@@ -744,11 +759,27 @@ export interface CreditStatistics {
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
+/** 单个账号在一个来源下的聚合；无法归因的记录不进入此数组。 */
+export interface TokenStatsAccount {
+  key: string;
+  summary: TokenStatsTotals;
+  models: TokenStatsGroup[];
+  daily: TokenStatsGroup[];
+}
 /** 一次模型调用的明细行；`total = input + output + cacheWrite`，`uncachedInput = max(0, input - cacheRead)`，`thinking` 是 `output` 中思考过程的 token 数（回复内容 = max(0, output - thinking)），均与聚合口径一致。 */
 export interface TokenStatsRequestRow { timestamp: number; model: string; project: string; sessionId: string; title?: string | null; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; thinking: number; total: number; }
 /** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集。 */
-export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; /** 实际加载/解析的文件数；旧后端缺失时回退到 filesScanned。 */ filesParsed?: number; /** 因范围索引整文件跳过的文件数。 */ filesSkipped?: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; /** 按账号归因的聚合；旧后端缺失时按空数组处理。 */ accounts?: TokenStatsAccount[]; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
+/** 只包含 CodeBuddy CLI 请求明细的轻量响应。 */
+export interface TokenRequests {
+  generatedAt: number;
+  rangeDays?: number | null;
+  requests: TokenStatsRequestRow[];
+  filesScanned: number;
+  parseErrors: number;
+}
+
 
 export interface CodeBuddyCliStatus {
   configured: boolean;
@@ -933,6 +964,8 @@ export interface VscodeExtSwitchResult {
 export interface JetbrainsTargetStatus {
   /** 配置目录名（如 "PyCharm2026.2"）。 */
   configDir: string;
+  /** 用户可读的产品名（含版本号），如 `GoLand 2026.1`。 */
+  product?: string;
   /** 是否安装了 CodeBuddy 插件（plugins/coding-copilot* 目录存在）。 */
   pluginInstalled: boolean;
   running: boolean;
@@ -951,6 +984,8 @@ export interface JetbrainsStatus {
   /** 是否任一装了插件的目标存在登录态。 */
   loggedIn: boolean;
   configRoot: string | null;
+  /** JetBrains 与 Google（Android Studio）配置根列表。 */
+  configRoots?: string[];
   targets: JetbrainsTargetStatus[];
   activeAccountId: string | null;
   activeAccountName: string | null;

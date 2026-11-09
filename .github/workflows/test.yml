@@ -1,6 +1,6 @@
 name: test
 
-# 测试必须独立于发布流程：build.yml 仅由 tag push / workflow_dispatch 触发，
+# 测试必须独立于发布流程：发布流程仅由 tag push / workflow_dispatch 触发，
 # 测试若挂在它下面，就只在发版时执行——2026-09 的 Windows「os error 5」回归
 # 正是这样漏到 0.1.43 的。本 workflow 在 push 与 PR 上即触发。
 on:
@@ -24,7 +24,7 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - macos-14
+          - macos-latest
           - ubuntu-latest
           - windows-latest
     steps:
@@ -66,7 +66,7 @@ jobs:
   # clippy 必须带 --no-deps：仅检查本仓库代码，依赖告警不归本仓库。
   lint:
     name: lint (tsc + fmt + clippy + server tests)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -97,4 +97,83 @@ jobs:
       - name: Type-check and build frontend
         run: npm run build
 
-      # tauri-build 还要求 externalBin 存在。这里只放占位文件让编译检查通过；
+      - name: Check formatting
+        run: cargo fmt --check -p wb-switch-core -p wb-switch-server -p wb-switch-rust
+
+      - name: Clippy
+        run: cargo clippy -p wb-switch-core -p wb-switch-server -p wb-switch-rust --all-targets --no-deps -- -D warnings
+
+      # server 的测试此前从不运行（rust-tests 只覆盖 core）。
+      - name: Server tests
+        run: cargo test -p wb-switch-server
+
+      # src-tauri 的测试此前从不运行（rust-tests 只覆盖 core）。
+      # 前置 dist 已由上方前端构建就位；本 fork 已移除 companion externalBin。
+      - name: Desktop app tests
+        run: cargo test -p wb-switch-rust
+
+  # 轻量门禁：不依赖 Tauri/WebKit，适合所有 PR 快速阻断版本漂移、依赖漏洞和发布文案泄密。
+  quality-gates:
+    name: quality-gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 台账校验需要祖先提交；浅克隆会让 merge-base 误报。
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Version consistency
+        run: python scripts/check-version-consistency.py
+
+      - name: Portability gate
+        run: python scripts/check-portability.py
+
+      - name: Demo command coverage
+        run: python scripts/check-demo-commands.py
+
+      - name: Repair ledger consistency
+        run: python scripts/check-repair-ledger.py
+
+      - name: Legacy color fallbacks
+        run: python scripts/check-legacy-colors.py
+
+      - name: PII scan (README / release body)
+        run: python scripts/check-pii.py README.md
+
+      - name: Install frontend deps for audit
+        run: npm ci
+
+      - name: npm audit (high+)
+        run: npm audit --audit-level=high
+
+      - name: cargo audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # 前端行为测试：纯逻辑单测（node 环境），不依赖 Rust 工具链。
+  frontend-tests:
+    name: frontend-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+

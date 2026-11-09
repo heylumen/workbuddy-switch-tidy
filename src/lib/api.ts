@@ -19,10 +19,12 @@ import type {
   CreditStatistics,
   DisplayField,
   TokenStatistics,
+  TokenRequests,
   ErrorLogKind,
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
+  MemoryCopyResult,
   OAuthPollResult,
   OAuthStartResult,
   RateLimitConfig,
@@ -66,7 +68,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
-  "get_token_statistics",
+  "get_token_statistics", "get_token_requests",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config", "get_rate_limits",
@@ -102,6 +104,7 @@ type Route = { method: "GET" | "POST"; path: string };
 const ROUTES: Record<string, Route> = {
   get_status: { method: "GET", path: "/api/status" },
   get_accounts: { method: "GET", path: "/api/accounts" },
+  copy_account_memory: { method: "POST", path: "/api/accounts/copy-memory" },
   get_codebuddy_cli_status: { method: "GET", path: "/api/codebuddy-cli/status" },
   install_codebuddy_cli_helper: { method: "POST", path: "/api/codebuddy-cli/install-helper" },
   switch_codebuddy_cli_account: { method: "POST", path: "/api/codebuddy-cli/switch" },
@@ -161,6 +164,7 @@ const ROUTES: Record<string, Route> = {
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
   get_token_statistics: { method: "GET", path: "/api/token-stats" },
+  get_token_requests: { method: "GET", path: "/api/token-stats/requests" },
   get_rate_limits: { method: "GET", path: "/api/rate-limits" },
   get_rate_limit_hook_status: { method: "GET", path: "/api/rate-limits/hook-status" },
   install_rate_limit_hook: { method: "POST", path: "/api/rate-limits/install-hook" },
@@ -271,6 +275,14 @@ export function getStatus(variant?: WbVariant): Promise<AppStatus> {
 /** 返回全部档位的账号，由调用方按 `variant` 过滤。 */
 export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
   return call("get_accounts");
+}
+
+/** 复制一个账号的本地工作记忆（MEMORY.md）到另一个账号；目标已有内容时后端先备份。 */
+export function copyAccountMemory(
+  sourceAccountId: string,
+  targetAccountId: string,
+): Promise<MemoryCopyResult> {
+  return call("copy_account_memory", { sourceAccountId, targetAccountId });
 }
 
 export function getCodebuddyCliStatus(): Promise<CodeBuddyCliStatus> {
@@ -804,7 +816,25 @@ export function getCreditStatistics(refresh = false): Promise<CreditStatistics> 
   return call("get_credit_statistics", refresh ? { refresh: true } : undefined);
 }
 
-export function getTokenStatistics(days?: number): Promise<TokenStatistics> { return call("get_token_statistics", days ? { days } : undefined); }
+export function getTokenStatistics(
+  days?: number,
+  requests?: boolean,
+  refresh?: boolean,
+): Promise<TokenStatistics> {
+  const args: Record<string, unknown> = {};
+  if (days) args.days = days;
+  if (requests) args.requests = true;
+  if (refresh) args.refresh = true;
+  return call("get_token_statistics", Object.keys(args).length ? args : undefined);
+}
+
+/** 只取 CodeBuddy CLI 明细，不重算其他来源。 */
+export function getTokenRequests(days?: number, refresh?: boolean): Promise<TokenRequests> {
+  const args: Record<string, unknown> = {};
+  if (days) args.days = days;
+  if (refresh) args.refresh = true;
+  return call("get_token_requests", Object.keys(args).length ? args : undefined);
+}
 
 /**
  * 模型限额台账：一次返回**全部账号**当前受限的模型与官方恢复时刻。

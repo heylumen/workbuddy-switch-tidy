@@ -18,7 +18,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
-import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
+import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupList, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
 import { accountVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -36,6 +36,9 @@ export default function SessionsPage() {
   const [client, setClient] = useState<SessionGroupClient>("workbuddy");
   const [variantScope, setVariantScope] = useState<WbVariant>("cn");
   const [groups, setGroups] = useState<SessionGroupSummary[]>([]);
+  const [groupsRevision, setGroupsRevision] = useState(0);
+  const [lightweight, setLightweight] = useState(false);
+  const [enriching, setEnriching] = useState(false);
   const [storeStatus, setStoreStatus] = useState<"missing" | "ready" | "unavailable">("missing");
   const [storeError, setStoreError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -74,6 +77,16 @@ export default function SessionsPage() {
     setDetailOpen(false);
     requestAnimationFrame(() => openerRef.current?.focus({ preventScroll: true }));
   }
+  // 弹窗关闭动画结束后释放详情正文与预览数据：详情对象包含每个成员的正文预览，
+  // 长时间保留会让“关掉弹窗后内存不回收”的体感非常明显。重新打开会走加载流程。
+  useEffect(() => {
+    if (detailOpen) return;
+    const timer = window.setTimeout(() => {
+      setDetail(null);
+      setDetailError(null);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [detailOpen]);
   function openDetail(id: string) {
     openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setDetail(null);
@@ -119,11 +132,20 @@ export default function SessionsPage() {
       if (live) setCurrentAccounts(results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []));
     });
     return () => { live = false; };
-  }, [client, selectedGroupId, detail]);
+    // 依赖只取「客户端 / 选中组 / 弹窗开关」：detail 内容变化不需要重新探测本机登录态。
+  }, [client, selectedGroupId, detailOpen]);
 
   useEffect(() => {
     if (accounts.length === 0) void fetchAll();
   }, [accounts.length, fetchAll]);
+
+  const applyListResult = useCallback((result: SessionGroupList) => {
+    setGroups(result.groups);
+    setLightweight(Boolean(result.lightweight));
+    setGroupsRevision((value) => value + 1);
+    setStoreStatus(result.storeStatus);
+    setStoreError(result.storeError ?? null);
+  }, []);
 
   const reloadGroups = useCallback(async () => {
     const key = `${client}:${scope ?? "all"}`;
@@ -134,9 +156,7 @@ export default function SessionsPage() {
     try {
       const result = await api.listSessionGroups(client, scope);
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key || listRequestId.current !== requestId) return;
-      setGroups(result.groups);
-      setStoreStatus(result.storeStatus);
-      setStoreError(result.storeError ?? null);
+      applyListResult(result);
     } catch (error) {
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key || listRequestId.current !== requestId) return;
       setGroups([]);
@@ -144,7 +164,7 @@ export default function SessionsPage() {
     } finally {
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}` === key && listRequestId.current === requestId) setLoading(false);
     }
-  }, [client, scope]);
+  }, [client, scope, applyListResult]);
 
   useEffect(() => {
     let live = true;
@@ -159,9 +179,7 @@ export default function SessionsPage() {
     setUnifyLoading(null);
     api.listSessionGroups(client, scope).then((result) => {
       if (!live || listRequestId.current !== requestId || `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key) return;
-      setGroups(result.groups);
-      setStoreStatus(result.storeStatus);
-      setStoreError(result.storeError ?? null);
+      applyListResult(result);
     }).catch((error) => {
       if (!live || listRequestId.current !== requestId || `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` !== key) return;
       setGroups([]);
@@ -170,7 +188,7 @@ export default function SessionsPage() {
       if (live && listRequestId.current === requestId && `${contextRef.current.client}:${contextRef.current.scope ?? "all"}` === key) setLoading(false);
     });
     return () => { live = false; };
-  }, [client, scope, listContextKey]);
+  }, [client, scope, listContextKey, applyListResult]);
 
   useEffect(() => {
     // 只有弹窗打开且已选中会话组才需要详情：关闭时同样进入这里，作废在途请求并停掉加载态，
@@ -222,8 +240,51 @@ export default function SessionsPage() {
   const pageCount = Math.max(1, Math.ceil(filteredGroups.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
   const visibleGroups = filteredGroups.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+  const visibleGroupKey = visibleGroups.map((group) => group.groupId).join("|");
 
   useEffect(() => { setPage(1); }, [statusFilter, sortOrder, client, scope]);
+
+  // 轻量列表只回填当前页可见组；翻页/刷新时作废旧请求，避免后台扫描全部组。
+  useEffect(() => {
+    const visibleIds = new Set(visibleGroups.map((group) => group.groupId));
+    const pending = groups.filter((group) => (group.summaryStatus === "unknown" || group.summaryStatus === "pending") && visibleIds.has(group.groupId));
+    if (!lightweight || pending.length === 0) return;
+    let cancelled = false;
+    let cursor = 0;
+    setEnriching(true);
+    const revision = groupsRevision;
+    const worker = async () => {
+      while (!cancelled) {
+        const group = pending[cursor++];
+        if (!group) return;
+        try {
+          const next = await api.getSessionGroup(client, group.groupId, scope);
+          if (cancelled || groupsRevision !== revision) return;
+          setGroups((current) => current.map((item) => item.groupId === group.groupId ? {
+            ...item,
+            title: next.title,
+            projectLabel: next.projectLabel,
+            latestActivityAt: next.latestActivityAt,
+            summaryStatus: next.summaryStatus,
+            summaryText: next.summaryText,
+            safeSourceMemberId: next.safeSourceMemberId,
+            hasSafeSource: next.hasSafeSource,
+          } : item));
+        } catch {
+          // 单组确认失败保留“无法确认”，不影响其它组。
+        }
+      }
+    };
+    void Promise.all([worker(), worker()]).finally(() => {
+      if (!cancelled) setEnriching(false);
+    });
+    return () => {
+      cancelled = true;
+      setEnriching(false);
+    };
+    // 只看当前页；groups 更新由 revision/visibleGroupKey 触发，避免每次回填重启任务。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, scope, groupsRevision, lightweight, visibleGroupKey]);
 
   function changeClient(value: string) {
     const next = value as SessionGroupClient;
@@ -501,7 +562,7 @@ export default function SessionsPage() {
     />
   );
   const statusOptions = [
-    ["all", "全部"], ["behind", "待同步"], ["diverge", "有分歧"], ["latest", "内容一致"],
+    ["all", "全部"], ["behind", "待同步"], ["diverge", "有分歧"], ["latest", "内容一致"], ["single", "单副本"], ["pending", "待确认"],
     ["missing", "内容缺失"], ["unknown", "无法确认"],
   ];
   const pages = Array.from({ length: pageCount }, (_, index) => index + 1)
@@ -551,7 +612,7 @@ export default function SessionsPage() {
           </div>
           {(storeStatus === "unavailable" || storeError) && <p role="status" className="mb-3 rounded-lg border border-amber-500/30 p-3 text-sm text-muted-foreground">{storeError ?? "关联组存储暂不可用，当前只展示可读取的数据。"}</p>}
           {loadError && <div role="alert" className="mb-3 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{loadError}<Button variant="outline" size="sm" className="ml-2" onClick={() => void reloadGroups()}>重试</Button></div>}
-          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
+          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} confirming={lightweight && enriching} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
           {!loading && filteredGroups.length > PAGINATION_HIDE_MAX && <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"><span>显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredGroups.length)}，共 {filteredGroups.length} 个会话</span><nav aria-label="会话分页" className="flex flex-wrap items-center gap-1.5"><Button variant="outline" size="icon" className="size-8" aria-label="上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft /></Button>{pages.map((value, index) => <span key={value} className="flex items-center gap-1.5">{index > 0 && value - pages[index - 1] > 1 && <span>…</span>}<Button variant={value === currentPage ? "default" : "outline"} className={`size-8 p-0 ${value === currentPage ? "bg-brand text-brand-foreground hover:bg-brand/90" : ""}`} aria-label={`第 ${value} 页`} aria-current={value === currentPage ? "page" : undefined} onClick={() => setPage(value)}>{value}</Button></span>)}<Button variant="outline" size="icon" className="size-8" aria-label="下一页" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight /></Button></nav></div>}
         </section>
       </div>
@@ -619,6 +680,9 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
   requestRestartConfirm: (actionLabel: string, run: () => Promise<void>) => void;
 }) {
   const accounts = useAccountsStore((state) => state.accounts);
+  const accountsLoading = useAccountsStore((state) => state.loading);
+  const accountsError = useAccountsStore((state) => state.error);
+  const fetchAll = useAccountsStore((state) => state.fetchAll);
   const [open, setOpen] = useState(false);
   const [sourceAccountId, setSourceAccountId] = useState("");
   const [targetAccountId, setTargetAccountId] = useState("");
@@ -639,10 +703,11 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
   const sourceAccount = workbuddyAccounts.find((account) => account.id === sourceAccountId) ?? null;
   const targetAccount = workbuddyAccounts.find((account) => account.id === targetAccountId) ?? null;
   const targetOptions = workbuddyAccounts.filter((account) => account.id !== sourceAccountId);
-  const supported = client === "workbuddy" || client === "vscodeExt";
+  // 三个客户端都走各自的数据通道；IDE 仅要求先退出，不做自动重启。
+  const supported = client === "workbuddy" || client === "vscodeExt" || client === "codebuddyIde";
   const unsupportedTitle = "当前客户端暂不支持新增关联会话";
   /** 弹窗文案用：来源账号的客户端称呼。 */
-  const clientAccountLabel = client === "workbuddy" ? "WorkBuddy 账号" : "CodeBuddy 插件账号";
+  const clientAccountLabel = client === "workbuddy" ? "WorkBuddy 账号" : client === "codebuddyIde" ? "CodeBuddy IDE 账号" : "CodeBuddy 插件账号";
 
   async function loadSessions(account: AccountMeta) {
     const id = ++requestId.current;
@@ -743,18 +808,26 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
         requestRestartConfirm("关闭并复制", () => copyAndLinkPlugin(true));
         return;
       }
-      await copyAndLinkPlugin(false);
+      await copyAndLinkPlugin(false, "vscodeExt");
+      return;
+    }
+    if (client === "codebuddyIde") {
+      // IDE 运行中后端会拒绝写入；这里不自动重启，错误会原样反馈给用户。
+      await copyAndLinkPlugin(false, "codebuddyIde");
       return;
     }
     await copyAndLinkWorkbuddy();
   }
-  async function copyAndLinkPlugin(restart: boolean) {
+  async function copyAndLinkPlugin(
+    restart: boolean,
+    pluginClient: "vscodeExt" | "codebuddyIde" = "vscodeExt",
+  ) {
     if (!sourceAccount || !targetAccountId || sourceAccount.id === targetAccountId || selected.size === 0 || busy) return;
     const copyId = ++copyRequestId.current;
     setBusy(true);
     try {
       const report = await api.copyLinkedSessions({
-        client: "vscodeExt",
+        client: pluginClient,
         sourceAccountId: sourceAccount.id,
         targetAccountId,
         sessionIds: [...selected],
@@ -863,7 +936,11 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
             <SelectTrigger size="sm" className="w-full min-w-0 bg-background text-xs" aria-label="选择来源账号"><SelectValue placeholder={`选择${clientAccountLabel}`} /></SelectTrigger>
             <SelectContent>{workbuddyAccounts.map((account) => <SelectItem key={account.id} value={account.id} className="text-xs">{displayName(account)} · {variantLabel(accountVariant(account))}</SelectItem>)}</SelectContent>
           </Select>
-          {workbuddyAccounts.length === 0 && <p className="text-xs text-muted-foreground">账号库里还没有{clientAccountLabel}。</p>}
+          {accountsLoading
+            ? <p className="text-xs text-muted-foreground">正在加载账号库…</p>
+            : accountsError
+              ? <p className="flex flex-wrap items-center gap-2 text-xs text-destructive">账号加载失败：{accountsError}<Button variant="outline" size="sm" onClick={() => void fetchAll()}>重试</Button></p>
+              : workbuddyAccounts.length === 0 && <p className="text-xs text-muted-foreground">账号库里还没有{clientAccountLabel}。</p>}
         </div>
         <div className="min-w-0 space-y-1.5"><p className="text-xs font-medium">来源会话</p>
           {!sourceAccountId
@@ -911,13 +988,13 @@ function GroupSkeleton() {
   </div>;
 }
 
-function SessionGroupCard({ group, selected, onSelect, onRequestDelete }: { group: SessionGroupSummary; selected: boolean; onSelect: () => void; onRequestDelete: () => void }) {
+function SessionGroupCard({ group, confirming, selected, onSelect, onRequestDelete }: { group: SessionGroupSummary; confirming: boolean; selected: boolean; onSelect: () => void; onRequestDelete: () => void }) {
   // 「…」不能嵌在整卡按钮里（button 不能嵌套 button），所以绝对定位到卡片右上角。
   return <div className="relative min-w-0">
     <button type="button" onClick={onSelect} aria-pressed={selected} className={`w-full min-w-0 cursor-pointer rounded-lg border bg-card px-4 py-3.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selected ? "border-brand shadow-sm" : "border-border hover:border-brand/50"}`}>
       <div className="flex min-w-0 items-center justify-between gap-2 pr-7 text-xs text-muted-foreground"><span className="flex min-w-0 items-center gap-2"><Folder className="size-4 shrink-0" /><span className="truncate" title={group.projectLabel}>{group.projectLabel || "未标记项目"}</span></span><span className="shrink-0" title={formatDate(group.latestActivityAt)}>{relativeDate(group.latestActivityAt)}</span></div>
       <h3 className="my-3 truncate text-base font-semibold" title={group.title}>{group.title}</h3>
-      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{{ latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失", unknown: "无法确认" }[group.summaryStatus]}</span></span></div>
+      <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{groupStatusLabel(group, confirming)}</span></span></div>
     </button>
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -928,6 +1005,18 @@ function SessionGroupCard({ group, selected, onSelect, onRequestDelete }: { grou
       </DropdownMenuContent>
     </DropdownMenu>
   </div>;
+}
+
+function groupStatusLabel(group: SessionGroupSummary, confirming: boolean): string {
+  if (group.summaryText.includes("无有效副本")) return "无有效副本";
+  if (group.summaryText.includes("唯一副本内容缺失")) return "唯一副本内容缺失";
+  if (group.summaryText.includes("唯一副本不可写")) return "唯一副本不可写";
+  if (group.summaryStatus === "pending") return confirming ? "正在确认…" : "待确认";
+  if (group.summaryStatus === "unknown") {
+    if (group.summaryText.includes("文件过大")) return "文件过大";
+    return confirming ? "正在确认…" : "无法确认";
+  }
+  return { latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失", single: "仅一个副本" }[group.summaryStatus] ?? "无法确认";
 }
 
 function relativeDate(timestamp: number): string {
@@ -953,7 +1042,7 @@ function notifyResult(report: { synced?: unknown[]; skipped?: unknown[]; errors?
     : report.restartedEditor ? "，已重新打开 VS Code" : "";
   if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}` });
   if (skipped > 0) toast.warning(`有 ${skipped} 项跳过`, { description: "预览过期或复核后不再符合安全条件的项不会计为成功。" });
-  if (errors.length > 0) toast.error("部分会话同步失败", { description: errors.map((item) => item.error).join("；") });
+  if (errors.length > 0) toast.error(`已执行全部目标，${errors.length} 项失败`, { description: errors.map((item) => item.error).join("；") });
   if (report.needsRecovery) toast.error("会话操作待恢复", { description: report.temporaryFiles?.map((item) => item.reason).join("；") || "已保留恢复所需材料。" });
   if (report.editorError) toast.warning("VS Code 未能自动重新打开", { description: report.editorError });
   if (synced === 0 && skipped === 0 && errors.length === 0 && !report.needsRecovery) toast.info("当前没有需要同步的副本");

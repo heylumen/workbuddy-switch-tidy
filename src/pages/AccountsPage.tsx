@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
   Columns3,
+  Copy,
   ExternalLink,
   FileDown,
   FileUp,
@@ -10,11 +11,13 @@ import {
   QrCode,
   RefreshCw,
   Rows3,
+  SlidersHorizontal,
   Terminal,
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
 import { AccountInfoDialog } from "@/components/account-info-dialog";
+import { CopyMemoryDialog } from "@/components/copy-memory-dialog";
 import { JetbrainsSwitchDialog } from "@/components/jetbrains-switch-dialog";
 import { CodebuddyIdeSwitchAccountDialog } from "@/components/codebuddy-ide-switch-account-dialog";
 import { DemoAction } from "@/components/demo-action";
@@ -31,6 +34,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
@@ -59,8 +69,15 @@ import {
   variantUsesIntlCodebuddyIde,
 } from "@/lib/variant";
 import { useSupportedTools } from "@/lib/supported-tools";
-import type { AccountMeta, AppStatus, CheckinConfig, CreditExpiry, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
 import { displayName } from "@/lib/account-display";
+import {
+  ACCOUNT_SORT_OPTIONS,
+  hasExpiringSoonCredits,
+  readAccountSortMode,
+  sortAccounts,
+  writeAccountSortMode,
+} from "@/lib/account-sort";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -86,31 +103,6 @@ const RATE_LIMIT_FETCH_FLOOR_MS = 20 * 1000;
  * 这里再挂一个可见时轮询兜底：即使事件因窗口未挂载而错过，横幅也会自行收掉。
  */
 const CLI_STATUS_REFRESH_INTERVAL_MS = 30 * 1000;
-
-function expiringSoonAmount(credit?: CreditExpiry): number {
-  return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
-}
-
-function hasExpiringSoonCredits(credit?: CreditExpiry): boolean {
-  return credit?.ok === true && expiringSoonAmount(credit) > 0;
-}
-
-function soonestRelevantExpiry(credit?: CreditExpiry): number {
-  const soonestExpiringCredit = (credit?.resources ?? [])
-    .filter((resource) => resource.remaining > 0 && resource.expiringSoon && resource.expireAt != null)
-    .map((resource) => resource.expireAt as number)
-    .reduce((soonest, expireAt) => Math.min(soonest, expireAt), Number.POSITIVE_INFINITY);
-  return Number.isFinite(soonestExpiringCredit)
-    ? soonestExpiringCredit
-    : credit?.soonestExpireAt ?? Number.POSITIVE_INFINITY;
-}
-
-function creditPriorityRank(credit?: CreditExpiry): number {
-  if (!credit?.ok) return 3;
-  if (hasExpiringSoonCredits(credit)) return 0;
-  if (credit.expired) return 1;
-  return 2;
-}
 
 function isWorkbuddyCurrent(account: AccountMeta, current: AppStatus["current"] | undefined): boolean {
   if (!current) return false;
@@ -232,6 +224,8 @@ export default function AccountsPage() {
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
+  /** 复制本地工作记忆弹窗 */
+  const [copyMemoryOpen, setCopyMemoryOpen] = useState(false);
   /** 切换 CodeBuddy CLI 确认目标（null=关闭） */
   const [cliSwitchTarget, setCliSwitchTarget] = useState<AccountMeta | null>(null);
   /** 删除账号确认目标（null=关闭） */
@@ -268,6 +262,13 @@ export default function AccountsPage() {
       return true;
     }
   });
+
+  const [sortMode, setSortMode] = useState(readAccountSortMode);
+  function changeSortMode(value: string) {
+    const next = value as typeof sortMode;
+    setSortMode(next);
+    writeAccountSortMode(next);
+  }
 
   /**
    * 支持工具开关（设置页）：关闭的端不渲染入口、不轮询状态。
@@ -769,25 +770,10 @@ export default function AccountsPage() {
   const creditOrderingReady =
     visibleAccounts.length > 0 &&
     visibleAccounts.every((account) => Boolean(creditMap[account.id]) && !creditLoadingMap[account.id]);
-  const orderedAccounts = creditOrderingReady
-    ? visibleAccounts
-        .map((account, index) => ({ account, index }))
-        .sort((left, right) => {
-          const leftCredit = creditMap[left.account.id];
-          const rightCredit = creditMap[right.account.id];
-          const rankDifference = creditPriorityRank(leftCredit) - creditPriorityRank(rightCredit);
-          if (rankDifference !== 0) return rankDifference;
-
-          const leftExpiry = soonestRelevantExpiry(leftCredit);
-          const rightExpiry = soonestRelevantExpiry(rightCredit);
-          if (leftExpiry !== rightExpiry) return leftExpiry - rightExpiry;
-
-          const amountDifference = expiringSoonAmount(rightCredit) - expiringSoonAmount(leftCredit);
-          if (amountDifference !== 0) return amountDifference;
-          return left.index - right.index;
-        })
-        .map(({ account }) => account)
-    : visibleAccounts;
+  const orderedAccounts = sortAccounts(visibleAccounts, sortMode, {
+    creditMap,
+    creditOrderingReady,
+  });
   const priorityAccountId =
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
@@ -952,11 +938,13 @@ export default function AccountsPage() {
                 <FileUp />导入备份
               </Button>
             </DemoAction>
-            <DemoAction>
-              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
-                <FileDown />导出
-              </Button>
-            </DemoAction>
+            {!api.isWebui() && (
+              <DemoAction>
+                <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
+                  <FileDown />导出
+                </Button>
+              </DemoAction>
+            )}
           </div>
         </div>
       </div>
@@ -1030,6 +1018,38 @@ export default function AccountsPage() {
           </div>
           <TooltipProvider delayDuration={400}>
             <div className="ml-auto flex items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-9 rounded-lg"
+                    disabled={api.isDemoMode() || accounts.filter((account) => Boolean(account.uid)).length < 2}
+                    onClick={() => setCopyMemoryOpen(true)}
+                    aria-label="复制本地工作记忆"
+                  >
+                    <Copy />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top">复制本地工作记忆</TooltipContent>
+              </Tooltip>
+              <Select value={sortMode} onValueChange={changeSortMode}>
+                <SelectTrigger
+                  size="sm"
+                  className="h-9 w-auto min-w-28 gap-1.5 border-0 bg-transparent px-2 text-xs text-muted-foreground shadow-none hover:bg-accent hover:text-foreground"
+                  aria-label="账号排序方式"
+                >
+                  <SlidersHorizontal className="size-4" aria-hidden="true" />
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {ACCOUNT_SORT_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -1137,6 +1157,12 @@ export default function AccountsPage() {
         )}
       </section>
 
+      <CopyMemoryDialog
+        open={copyMemoryOpen}
+        onOpenChange={setCopyMemoryOpen}
+        accounts={accounts}
+        defaultSourceId={visibleAccounts[0]?.id}
+      />
       <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} variant={variant} />
       <ExportAccountsDialog
         open={exportOpen}
@@ -1182,6 +1208,7 @@ export default function AccountsPage() {
         ideStatus={codebuddyCnIde}
         onDone={() => {
           void refreshCodebuddyCnIdeStatus();
+          void fetchAll();
         }}
       />
       <VscodeSwitchAccountDialog
@@ -1193,6 +1220,7 @@ export default function AccountsPage() {
         vscodeExtStatus={vscodeExt}
         onDone={() => {
           void refreshVscodeExtStatus();
+          void fetchAll();
         }}
       />
       <JetbrainsSwitchDialog
@@ -1204,6 +1232,7 @@ export default function AccountsPage() {
         jetbrainsStatus={jetbrains}
         onDone={() => {
           void refreshJetbrainsStatus();
+          void fetchAll();
         }}
       />
 

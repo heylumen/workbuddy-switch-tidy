@@ -40,11 +40,102 @@ const PLUGIN_DIR_PREFIX: &str = "coding-copilot";
 const SECRET_RELATIVE: &str = "options/secret-storage.xml";
 
 /// 支持的产品：配置目录 / `product-info.json#dataDirectoryName` 前缀。
-const PRODUCT_PREFIXES: [&str; 4] = ["IntelliJIdea", "IdeaIC", "PyCharm", "PyCharmCE"];
+const PRODUCT_PREFIXES: [&str; 17] = [
+    "IntelliJIdea",
+    "IdeaIC",
+    "PyCharmCE",
+    "PyCharm",
+    "WebStorm",
+    "PhpStorm",
+    "GoLand",
+    "CLion",
+    "RubyMine",
+    "DataGrip",
+    "Rider",
+    "Aqua",
+    "DataSpell",
+    "AppCode",
+    "MPS",
+    "RustRover",
+    "AndroidStudio",
+];
+
+/// macOS `.app` 名（拼成 `<name>.app/Contents/MacOS` 进程模式）。
+#[cfg(target_os = "macos")]
+const MAC_BUNDLE_NAMES: &[&str] = &[
+    "IntelliJ IDEA",
+    "IntelliJ IDEA CE",
+    "PyCharm",
+    "PyCharm CE",
+    "WebStorm",
+    "PhpStorm",
+    "GoLand",
+    "CLion",
+    "RubyMine",
+    "DataGrip",
+    "Rider",
+    "Aqua",
+    "DataSpell",
+    "AppCode",
+    "MPS",
+    "RustRover",
+    "Android Studio",
+];
+
+/// Linux 启动器名（`<root>/bin/<name>`）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+const LINUX_BIN_NAMES: &[&str] = &[
+    "idea",
+    "pycharm",
+    "webstorm",
+    "phpstorm",
+    "goland",
+    "clion",
+    "rubymine",
+    "datagrip",
+    "rider",
+    "aqua",
+    "dataspell",
+    "appcode",
+    "mps",
+    "rustrover",
+    "studio",
+];
 
 /// Windows 主进程映像名（`<product>64.exe`；zip / exe 安装通用）。
 #[cfg(target_os = "windows")]
-const WINDOWS_IMAGE_NAMES: [&str; 4] = ["idea64.exe", "pycharm64.exe", "idea.exe", "pycharm.exe"];
+const WINDOWS_IMAGE_NAMES: &[&str] = &[
+    "idea64.exe",
+    "idea.exe",
+    "pycharm64.exe",
+    "pycharm.exe",
+    "webstorm64.exe",
+    "webstorm.exe",
+    "phpstorm64.exe",
+    "phpstorm.exe",
+    "goland64.exe",
+    "goland.exe",
+    "clion64.exe",
+    "clion.exe",
+    "rubymine64.exe",
+    "rubymine.exe",
+    "datagrip64.exe",
+    "datagrip.exe",
+    "rider64.exe",
+    "rider.exe",
+    "aqua64.exe",
+    "aqua.exe",
+    "dataspell64.exe",
+    "dataspell.exe",
+    "appcode64.exe",
+    "appcode.exe",
+    "mps64.exe",
+    "rustrover64.exe",
+    "rustrover.exe",
+    "mps.exe",
+    "studio64.exe",
+    "studio.exe",
+];
 
 fn state_path() -> PathBuf {
     store_dir().join(STATE_FILE)
@@ -89,24 +180,63 @@ fn active_account_id_from_state() -> Option<String> {
 /// - Windows: `%APPDATA%\JetBrains`
 /// - macOS: `~/Library/Application Support/JetBrains`
 /// - Linux: `$XDG_CONFIG_HOME/JetBrains`（缺省 `~/.config/JetBrains`）
-pub fn jetbrains_config_root() -> Option<PathBuf> {
+pub fn jetbrains_config_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     #[cfg(target_os = "macos")]
     {
-        Some(crate::modules::config::home_dir().join("Library/Application Support/JetBrains"))
+        let base = crate::modules::config::home_dir().join("Library/Application Support");
+        roots.push(base.join("JetBrains"));
+        // Android Studio 的配置目录在 Google 根，不在 JetBrains 根。
+        roots.push(base.join("Google"));
     }
     #[cfg(target_os = "windows")]
     {
-        dirs::data_dir().map(|d| d.join("JetBrains"))
+        if let Some(base) = dirs::data_dir() {
+            roots.push(base.join("JetBrains"));
+            roots.push(base.join("Google"));
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        dirs::config_dir().map(|d| d.join("JetBrains"))
+        if let Some(base) = dirs::config_dir() {
+            roots.push(base.join("JetBrains"));
+            roots.push(base.join("Google"));
+        }
     }
+    roots
+}
+
+/// 兼容旧调用：返回第一个配置根。
+pub fn jetbrains_config_root() -> Option<PathBuf> {
+    jetbrains_config_roots().into_iter().next()
 }
 
 /// 配置目录名是否属于受支持产品：前缀 + 纯版本号后缀（`2026.2` 形态）。
 ///
 /// 后缀严格限定数字与点，把 `PyCharm2026.2-backup` 这类迁移残留目录排除在写入范围外。
+/// 配置目录名 → 用户可读的产品名（含版本号）。
+fn product_label(name: &str) -> String {
+    let prefix = PRODUCT_PREFIXES
+        .iter()
+        .find(|prefix| name.starts_with(*prefix))
+        .copied()
+        .unwrap_or(name);
+    let version = name.strip_prefix(prefix).unwrap_or_default();
+    let label = match prefix {
+        "IntelliJIdea" => "IntelliJ IDEA Ultimate",
+        "IdeaIC" => "IntelliJ IDEA Community",
+        "PyCharm" => "PyCharm Professional",
+        "PyCharmCE" => "PyCharm Community",
+        "AndroidStudio" => "Android Studio",
+        other => other,
+    };
+    if version.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} {version}")
+    }
+}
+
 fn is_supported_config_dir_name(name: &str) -> bool {
     PRODUCT_PREFIXES.iter().any(|prefix| {
         name.len() > prefix.len()
@@ -358,9 +488,17 @@ fn running_ide_from_row(row: &process::WindowsProcessRow) -> RunningIde {
 #[cfg(target_os = "windows")]
 fn windows_ide_process_rows() -> Vec<process::WindowsProcessRow> {
     let self_pid = std::process::id();
-    let script = "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | \
-                  Where-Object { $_.Name -in 'idea64.exe','pycharm64.exe','idea.exe','pycharm.exe' } | \
-                  ForEach-Object { '{0}|{1}|{2}' -f $_.ProcessId, $_.Name, $_.ExecutablePath }";
+    let names = WINDOWS_IMAGE_NAMES
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.Name -in {names} }} | \
+         ForEach-Object {{ '{{0}}|{{1}}|{{2}}' -f $_.ProcessId, $_.Name, $_.ExecutablePath }}"
+    );
+    let script = script.as_str();
     let mut rows: Vec<_> = process::ps_output(script, 8)
         .map(|stdout| {
             process::parse_windows_process_rows(&stdout)
@@ -371,7 +509,7 @@ fn windows_ide_process_rows() -> Vec<process::WindowsProcessRow> {
         .unwrap_or_default();
     if rows.is_empty() {
         // CIM 不可用时退回 tasklist（拿到 PID 关闭，但丢失 exe 路径 → 无法重开）。
-        for image in ["idea64.exe", "pycharm64.exe", "idea.exe", "pycharm.exe"] {
+        for image in WINDOWS_IMAGE_NAMES {
             rows.extend(process::windows_tasklist_image_rows(image));
         }
     }
@@ -398,15 +536,10 @@ fn running_ides() -> Vec<RunningIde> {
         // 进程 cmdline 形如 `/Applications/IntelliJ IDEA.app/Contents/MacOS/idea`；
         // bundle 路径回溯后读 `Contents/Resources/product-info.json`。
         // 产品名集合（.app 名）：IntelliJ IDEA、IntelliJ IDEA CE、PyCharm、PyCharm CE。
-        let patterns: Vec<String> = [
-            "IntelliJ IDEA.app/Contents/MacOS",
-            "IntelliJ IDEA CE.app/Contents/MacOS",
-            "PyCharm.app/Contents/MacOS",
-            "PyCharm CE.app/Contents/MacOS",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+        let patterns: Vec<String> = MAC_BUNDLE_NAMES
+            .iter()
+            .map(|name| format!("{name}.app/Contents/MacOS"))
+            .collect();
         let mut rows = Vec::new();
         for (pid, args) in process::macos_rows_by_patterns(&patterns) {
             let bundle = process::extract_app_bundle_from_args(&args);
@@ -443,7 +576,7 @@ fn running_ides() -> Vec<RunningIde> {
                     _ => continue,
                 };
                 let lower = cmdline.to_ascii_lowercase();
-                if !["idea", "pycharm"].iter().any(|name| {
+                if !LINUX_BIN_NAMES.iter().any(|name| {
                     lower.contains(&format!("/bin/{name} "))
                         || lower.contains(&format!("/bin/{name}\""))
                         || lower.ends_with(&format!("/bin/{name}"))
@@ -790,6 +923,7 @@ impl Target {
         let logged_in = read_secret_for(&self.config_dir).ok().flatten().is_some();
         json!({
             "configDir": self.name,
+            "product": product_label(&self.name),
             "pluginInstalled": self.plugin_installed,
             "running": running_dirs.iter().any(|n| n == &self.name),
             "loggedIn": logged_in,
@@ -800,27 +934,29 @@ impl Target {
 
 /// 扫描配置根，列出受支持产品的配置目录（存在即列出，无论是否装插件）。
 fn list_targets() -> Vec<Target> {
-    let Some(root) = jetbrains_config_root() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    let mut targets: Vec<Target> = entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            (entry.path(), name)
-        })
-        .filter(|(_, name)| is_supported_config_dir_name(name))
-        .map(|(path, name)| Target {
-            plugin_installed: plugin_dir(&path).is_some(),
-            config_dir: path,
-            name,
-        })
-        .collect();
+    let mut targets = Vec::new();
+    for root in jetbrains_config_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        targets.extend(
+            entries
+                .flatten()
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    (entry.path(), name)
+                })
+                .filter(|(_, name)| is_supported_config_dir_name(name))
+                .map(|(path, name)| Target {
+                    plugin_installed: plugin_dir(&path).is_some(),
+                    config_dir: path,
+                    name,
+                }),
+        );
+    }
     targets.sort_by(|a, b| a.name.cmp(&b.name));
+    targets.dedup_by(|a, b| a.config_dir == b.config_dir);
     targets
 }
 
@@ -858,7 +994,13 @@ pub fn status() -> Value {
         "pluginInstalled": plugin_installed,
         "running": is_running,
         "loggedIn": logged_in,
-        "configRoot": jetbrains_config_root().map(|p| p.to_string_lossy().to_string()),
+        "configRoots": jetbrains_config_roots()
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        "configRoot": jetbrains_config_roots()
+            .first()
+            .map(|p| p.to_string_lossy().to_string()),
         "targets": targets.iter().map(|t| t.to_status_json(&running_dirs)).collect::<Vec<_>>(),
         "activeAccountId": active_account_id,
         "activeAccountName": active_account_name,
@@ -907,7 +1049,7 @@ fn validate_switch_target(
         return Err("账号 access_token 为空".to_string());
     }
 
-    if jetbrains_config_root().is_none() {
+    if jetbrains_config_roots().is_empty() {
         return Err("无法定位 JetBrains 配置目录".to_string());
     }
     let targets: Vec<Target> = list_targets()
@@ -943,6 +1085,7 @@ fn switch_after_close_inner(
     }
 
     set_active_account_id(account_id)?;
+    account::touch_last_used(account_id);
 
     let mut restarted = false;
     let mut relaunch_error: Option<String> = None;
@@ -1027,7 +1170,15 @@ pub fn switch_account(
         .map(|t| t.name)
         .collect();
     let selected: Option<&[String]> = Some(&target_names);
-    let matched: Vec<RunningIde> = running_ides()
+    let running = running_ides();
+    // 无法映射配置目录时不能假设“不是目标 IDE”：保守阻止写入，避免运行中覆盖凭据。
+    if running.iter().any(|inst| inst.config_dir_name.is_none()) {
+        return Err(
+            "检测到受支持的 JetBrains IDE 正在运行，但无法确认其配置目录；请先完全退出 IDE 后重试"
+                .to_string(),
+        );
+    }
+    let matched: Vec<RunningIde> = running
         .into_iter()
         .filter(|inst| {
             inst.config_dir_name
@@ -1098,12 +1249,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn product_label_maps_prefixes() {
+        assert_eq!(product_label("GoLand2026.1"), "GoLand 2026.1");
+        assert_eq!(
+            product_label("AndroidStudio2024.1"),
+            "Android Studio 2024.1"
+        );
+        assert_eq!(
+            product_label("IdeaIC2025.1"),
+            "IntelliJ IDEA Community 2025.1"
+        );
+        assert_eq!(product_label("WebStorm2026.1"), "WebStorm 2026.1");
+    }
+
+    #[test]
     fn config_dir_name_filter_accepts_products_and_rejects_noise() {
         for name in [
             "IntelliJIdea2026.2",
             "IdeaIC2025.1",
             "PyCharm2026.2",
             "PyCharmCE2025.1",
+            "WebStorm2026.1",
+            "GoLand2026.1",
+            "AndroidStudio2024.1",
         ] {
             assert!(is_supported_config_dir_name(name), "{name} 应被接受");
         }
