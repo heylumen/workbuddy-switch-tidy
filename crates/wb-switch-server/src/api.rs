@@ -157,6 +157,10 @@ fn routes() -> Router {
         .route("/api/sessions/copy", post(api_copy_sessions))
         .route("/api/sessions/copy-cross", post(api_copy_sessions_cross))
         .route(
+            "/api/sessions/audit-duplicates",
+            post(api_audit_session_duplicates),
+        )
+        .route(
             "/api/session-links/preview",
             post(api_session_links_preview),
         )
@@ -1086,6 +1090,37 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     };
     report["variant"] = json!(variant.as_str());
     json_ok(report)
+}
+
+/// POST /api/sessions/audit-duplicates —— 只读审计同名会话。
+async fn api_audit_session_duplicates(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = account::variant_of(&target);
+    let uid = account::get_str(&target, "uid")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(uid) = uid else {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match tokio::task::spawn_blocking(move || {
+        session::audit_session_duplicates_for_user(variant, &uid)
+    })
+    .await
+    {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(
+            format!("审计失败：{error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
 }
 
 /// POST /api/sessions/copy-cross —— 跨档复制：源与目标账号都显式给出（会话管理页用）。

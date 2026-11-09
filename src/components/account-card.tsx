@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Info, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, Eraser, Layers } from "lucide-react";
+import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Info, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, Eraser, Layers, Search } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -24,7 +24,15 @@ import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import { formatFullDateTime } from "@/lib/format-time";
-import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateKind, TravelStatus } from "@/lib/types";
+
+const AUDIT_KIND_LABEL: Record<SessionDuplicateKind, string> = {
+  exact: "精确重复",
+  fastForward: "快进副本",
+  divergent: "同名分叉",
+  independent: "独立同名",
+  unavailable: "无法判断",
+};
 
 function formatCredits(value: number): string {
   if (!Number.isFinite(value)) return "—";
@@ -404,6 +412,10 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
   const [refreshBusy, setRefreshBusy] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [auditReport, setAuditReport] = useState<SessionDuplicateAudit | null>(null);
+  const [auditError, setAuditError] = useState<string | null>(null);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
   const [dedupResult, setDedupResult] = useState<string | null>(null);
@@ -578,6 +590,18 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                 </DropdownMenuItem>
                 <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => { setCollapseResult(null); setCollapseOpen(true); }}>
                   <Layers />折叠同名会话
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => {
+                  setAuditOpen(true);
+                  setAuditError(null);
+                  setAuditReport(null);
+                  setAuditBusy(true);
+                  void api.auditSessionDuplicates(account.id)
+                    .then((report) => setAuditReport(report))
+                    .catch((e) => setAuditError(api.asError(e)))
+                    .finally(() => setAuditBusy(false));
+                }}>
+                  <Search />重复审计
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
@@ -1044,6 +1068,72 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             </Button>
               </>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={auditOpen} onOpenChange={setAuditOpen}>
+        <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>重复审计</DialogTitle>
+            <DialogDescription>
+              {name} · 只读分析，不修改数据库、正文或关联表
+            </DialogDescription>
+          </DialogHeader>
+          {auditBusy && (
+            <div className="flex items-center gap-2 rounded-md bg-muted/50 p-3 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              正在按消息序列分析同名会话…
+            </div>
+          )}
+          {auditError && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              审计失败：{auditError}
+            </div>
+          )}
+          {auditReport && !auditReport.ok && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              审计失败：{auditReport.reason || "未知错误"}
+            </div>
+          )}
+          {auditReport?.ok && (
+            <div className="space-y-3 text-sm">
+              <div className="flex flex-wrap gap-2">
+                {(["exact", "fastForward", "divergent", "independent", "unavailable"] as const).map((kind) => (
+                  <Badge key={kind} variant="secondary" className="gap-1">
+                    {AUDIT_KIND_LABEL[kind]}
+                    <span className="tabular-nums">{auditReport.summary[kind]}</span>
+                  </Badge>
+                ))}
+              </div>
+              {auditReport.groups.length === 0 ? (
+                <p className="rounded-md border border-dashed p-4 text-muted-foreground">没有发现同账号同工作区同标题的候选组。</p>
+              ) : (
+                <div className="space-y-2">
+                  {auditReport.groups.slice(0, 50).map((group) => (
+                    <div key={`${group.cwd}:${group.title}`} className="rounded-md border p-3">
+                      <div className="flex min-w-0 items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium">{group.title}</div>
+                          <div className="mt-1 truncate text-xs text-muted-foreground" title={group.cwd}>{group.cwd}</div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <Badge variant="outline">{AUDIT_KIND_LABEL[group.kind]}</Badge>
+                          <span className="text-xs tabular-nums text-muted-foreground">{group.count} 条</span>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-muted-foreground">
+                        建议：{group.suggested === "keep-newest" ? "保留最新" : group.suggested === "fast-forward-to-longest" ? "快进到最长副本" : "人工选择分支"}
+                      </div>
+                    </div>
+                  ))}
+                  {auditReport.groups.length > 50 && <p className="text-xs text-muted-foreground">仅显示前 50 组，共 {auditReport.groups.length} 组。</p>}
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button onClick={() => setAuditOpen(false)}>关闭</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
