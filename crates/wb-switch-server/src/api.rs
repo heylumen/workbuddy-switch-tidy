@@ -1150,6 +1150,10 @@ async fn api_hide_duplicate_group(Json(body): Json<Value>) -> Response {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let unlink_linked = body
+        .get("unlinkLinked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let Some(target) = account::find_account(&account_id) else {
         return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
     };
@@ -1158,7 +1162,7 @@ async fn api_hide_duplicate_group(Json(body): Json<Value>) -> Response {
         return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
     };
     match tokio::task::spawn_blocking(move || {
-        session::hide_duplicate_group_for_user(variant, &uid, &cwd, &title, &keep)
+        session::hide_duplicate_group_for_user(variant, &uid, &cwd, &title, &keep, unlink_linked)
     })
     .await
     {

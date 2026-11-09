@@ -2498,6 +2498,65 @@ fn cross_copy_reuses_existing_equivalent_target_without_link() {
 
 /// P1a 只读审计：按消息序列公共前缀分类，不修改会话。
 /// P1c：软隐藏精确重复组时保留正文与保留项，只写 deleted_at。
+/// P1c：解除关联并隐藏时，成员从关联组移除，但正文保留。
+#[test]
+fn hide_duplicate_group_unlinks_alias_before_soft_hide() {
+    let env = Env::new("hide-linked");
+    env.create_db();
+    env.create_edge_db(WbVariant::Cn);
+    for id in ["keep", "alias"] {
+        env.add_session(id, "uid-a", "same");
+        env.add_body(id, &body_text(id));
+    }
+    let paths = env.paths();
+    session_link::with_link_store_write(&paths, |store| {
+        for (group_id, member_id, session_id) in [
+            ("g-keep", "m-keep", "keep"),
+            ("g-alias", "m-alias", "alias"),
+        ] {
+            store.groups.push(LinkGroup {
+                id: group_id.to_string(),
+                variant: WbVariant::Cn,
+                created_at: 1,
+                members: vec![LinkMember {
+                    member_id: member_id.to_string(),
+                    account_id: None,
+                    uid: "uid-a".to_string(),
+                    session_id: session_id.to_string(),
+                    variant: None,
+                    state: MemberState::Active,
+                    linked_at: 1,
+                    last_synced_at: None,
+                }],
+                pair_bases: vec![],
+            });
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let report = hide_duplicate_group_for_user_at(
+        &paths,
+        WbVariant::Cn,
+        "uid-a",
+        "/ws/a",
+        "same",
+        "keep",
+        true,
+    );
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["hidden"], 1, "{report}");
+    assert_eq!(report["unlinked"], 1, "{report}");
+    assert!(env.body_path("keep").is_file());
+    assert!(env.body_path("alias").is_file());
+    let store = match session_link::load_store(&paths) {
+        session_link::StoreState::Ready(store) => store,
+        other => panic!("关联存储应为 Ready，实际 {other:?}"),
+    };
+    assert!(store.groups.iter().any(|group| group.id == "g-keep"));
+    assert!(!store.groups.iter().any(|group| group.id == "g-alias"));
+}
+
 #[test]
 fn hide_duplicate_group_soft_hides_exact_aliases_and_keeps_jsonl() {
     let env = Env::new("hide-exact");
@@ -2514,6 +2573,7 @@ fn hide_duplicate_group_soft_hides_exact_aliases_and_keeps_jsonl() {
         "/ws/a",
         "same",
         "keep",
+        false,
     );
     assert_eq!(report["ok"], true, "{report}");
     assert_eq!(report["hidden"], 1, "{report}");

@@ -519,6 +519,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
         hideTarget.group.cwd,
         hideTarget.group.title,
         hideTarget.keep.sessionId,
+        true,
       );
       if (!result.ok) {
         setHideError(result.reason || "软隐藏失败");
@@ -527,8 +528,8 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
       toast.success(
         result.hidden
           ? `已软隐藏 ${result.hidden} 个别名（正文保留）`
-          : "没有可隐藏的非关联别名",
-        { description: result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : undefined },
+          : "没有可隐藏的别名",
+        { description: result.unlinked ? `${result.unlinked} 个关联副本已解除关联` : result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : undefined },
       );
       setHideTarget(null);
       await loadAudit();
@@ -1164,7 +1165,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                         建议：{group.suggested === "keep-newest" ? "保留最新" : group.suggested === "fast-forward-to-longest" ? "快进到最长副本" : "人工选择分支"}
                       </div>
                       {group.sessions.some((session) => session.linked) && (
-                        <p className="mt-1 text-xs text-amber-700">关联中的副本不会隐藏；需先在「关联会话」页解除关联。</p>
+                        <p className="mt-1 text-xs text-amber-700">关联中的副本会先解除关联，再软隐藏；关联表会备份。</p>
                       )}
                       {(group.kind === "exact" || group.kind === "fastForward" || group.kind === "divergent") && (
                         <div className="mt-2 space-y-1.5">
@@ -1178,15 +1179,15 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                                 <Button
                                   size="sm"
                                   variant={fastForwardKeep ? "default" : "outline"}
-                                  disabled={!fastForwardKeep || session.linked}
-                                  title={session.linked ? "该副本仍在关联组中，需先在关联会话页解除关联" : undefined}
+                                  disabled={!fastForwardKeep}
+                                  title={session.linked ? "将先解除关联，再软隐藏其他副本" : undefined}
                                   onClick={() => {
                                     setHideError(null);
                                     setAuditOpen(false);
                                     setHideTarget({ group, keep: session });
                                   }}
                                 >
-                                  {session.linked ? "关联中" : fastForwardKeep && group.kind === "fastForward" ? "保留最长" : "保留此条"}
+                                  {session.linked ? "解除关联并保留" : fastForwardKeep && group.kind === "fastForward" ? "保留最长" : "保留此条"}
                                 </Button>
                               </div>
                             );
@@ -1219,7 +1220,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
           <DialogHeader>
             <DialogTitle>软隐藏其他副本？</DialogTitle>
             <DialogDescription>
-              {hideTarget ? `保留 ${hideTarget.group.title} 的 ${hideTarget.keep.sessionId.slice(0, 8)}；其余别名仅从数据库软隐藏，JSONL 正文保留，可恢复。关联中的副本会跳过。` : ""}
+              {hideTarget ? `保留 ${hideTarget.group.title} 的 ${hideTarget.keep.sessionId.slice(0, 8)}；其余别名仅从数据库软隐藏，JSONL 正文保留，可恢复。关联中的副本会先解除关联，关联表已备份。` : ""}
             </DialogDescription>
           </DialogHeader>
           {hideError && (

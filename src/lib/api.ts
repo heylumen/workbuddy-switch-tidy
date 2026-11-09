@@ -1140,14 +1140,16 @@ export function hideDuplicateGroup(
   cwd: string,
   title: string,
   keepSessionId: string,
+  unlinkLinked = false,
 ): Promise<{
   ok: boolean;
   hidden?: number;
+  unlinked?: number;
   skippedLinked?: number;
   reason?: string;
   backup?: string;
 }> {
-  return call("hide_duplicate_group", { accountId, cwd, title, keepSessionId });
+  return call("hide_duplicate_group", { accountId, cwd, title, keepSessionId, unlinkLinked });
 }
 // ---------------------------------------------------------------------------
 // 通知存档（toast 事后可查）

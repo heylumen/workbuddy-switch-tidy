@@ -1533,6 +1533,7 @@ pub async fn hide_duplicate_group(
     cwd: String,
     title: String,
     keep_session_id: String,
+    unlink_linked: Option<bool>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -1555,6 +1556,7 @@ pub async fn hide_duplicate_group(
             &cwd,
             &title,
             &keep_session_id,
+            unlink_linked.unwrap_or(false),
         ))
     })
     .await
