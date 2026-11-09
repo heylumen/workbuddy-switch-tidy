@@ -528,7 +528,7 @@ fn take_package() -> Option<DownloadedPackage> {
 }
 
 /// 公开更新页地址（按当前更新源配置拼装，与 core 的 `update_check` 同源）。
-fn release_url() -> String {
+pub(crate) fn release_url() -> String {
     let config = update::load_github_config();
     let owner = config
         .get("owner")
