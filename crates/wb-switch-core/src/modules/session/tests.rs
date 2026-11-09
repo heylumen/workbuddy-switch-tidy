@@ -2637,6 +2637,39 @@ fn hide_duplicate_group_soft_hides_exact_aliases_and_keeps_jsonl() {
     assert!(alias_deleted.is_some());
 }
 
+/// P1c：divergent 组允许用户显式选择保留项，其他分支软隐藏但正文保留。
+#[test]
+fn hide_duplicate_group_allows_explicit_divergent_keep() {
+    let env = Env::new("hide-divergent");
+    env.create_db();
+    env.create_edge_db(WbVariant::Cn);
+    for id in ["div-a", "div-b"] {
+        env.add_session(id, "uid-a", "branch");
+        env.add_body(
+            id,
+            &format!(
+                "{}\n{}\n",
+                json!({"type": "user", "sessionId": id, "text": "共同"}),
+                json!({"type": "assistant", "sessionId": id, "text": if id == "div-a" { "A" } else { "B" }})
+            ),
+        );
+    }
+    let report = hide_duplicate_group_for_user_at(
+        &env.paths(),
+        WbVariant::Cn,
+        "uid-a",
+        "/ws/a",
+        "branch",
+        "div-a",
+        false,
+    );
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["hidden"], 1, "{report}");
+    assert_eq!(report["kind"], "divergent", "{report}");
+    assert!(env.body_path("div-a").is_file());
+    assert!(env.body_path("div-b").is_file());
+}
+
 #[test]
 fn audit_session_duplicates_classifies_exact_fast_forward_divergent_and_independent() {
     let env = Env::new("audit-duplicates");
