@@ -168,6 +168,8 @@ export interface SessionDuplicateAuditSession {
   updatedAt: number;
   records: number | null;
   status: "ready" | "unavailable";
+  /** 该会话是 active 关联成员；软隐藏会跳过。 */
+  linked?: boolean;
 }
 
 export interface SessionDuplicateAuditGroup {
@@ -176,9 +178,23 @@ export interface SessionDuplicateAuditGroup {
   title: string;
   count: number;
   kind: SessionDuplicateKind;
+  commonPrefix?: number;
   suggested: string;
   suggestedKeepSessionId?: string | null;
   sessions: SessionDuplicateAuditSession[];
+}
+
+export interface SessionDuplicateHideRecord {
+  id: string;
+  variant: string;
+  uid: string;
+  cwd: string;
+  title: string;
+  keepSessionId: string;
+  hiddenIds: string[];
+  linkRefs: { groupId: string; memberId: string }[];
+  backup: string;
+  createdAt: number;
 }
 
 export interface SessionDuplicateAudit {

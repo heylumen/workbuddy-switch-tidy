@@ -7,7 +7,7 @@
 > - **限额台账独立页**：集中查看频率限制记录、重置时间与倒计时
 > - **接入客户端 hook 默认关闭**（opt-in）：不自动改写其他客户端配置
 >
-> 版本号独立于上游（当前 **1.0.15**）；升级入口直达本仓库 Release 下载页。
+> 版本号独立于上游（当前 **1.0.16**）；升级入口直达本仓库 Release 下载页。
 WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号切换桌面 App（Tauri），四者均支持国内版 / 国际版，并提供积分到期与 Token 用量监控。
 
 <p align="center">
@@ -129,6 +129,7 @@ workbuddy-switch              # 启动本地服务 + 自动打开浏览器
 workbuddy-switch status       # 终端查看当前账号
 workbuddy-switch repair-links # 修复关联表脏元数据（自动备份）
 workbuddy-switch audit-duplicates # 只读审计同名会话（不修改数据）
+workbuddy-switch audit-duplicates --uid <uid> # 只审计指定账号，避免全量超时
 # 首次启动会打印带 token 的 WebUI 链接；直接访问无 token 地址会被拒绝
 ```
 
@@ -150,6 +151,11 @@ workbuddy-switch audit-duplicates # 只读审计同名会话（不修改数据�
 - 组内只剩一个活跃副本时显示“仅一个副本，无需同步”；数据库已软删除但正文仍在的历史会话不再误报“内容缺失”。
 - 优化 Token 统计：按文件增量缓存、请求明细按需加载、缓存字节预算 + LRU；重型页面按需加载。
 - 安全：升级 vite / vitest，移除更新器不需要的 zip 解包依赖（应用内自动安装仍不支持）。
+
+### v1.0.16
+
+- 重复审计支持软隐藏：用户选择保留项后，仅从数据库隐藏其他别名；JSONL 正文和关联表保留，关联副本跳过。
+- 继续单文件 EXE 手动更新。
 
 ### v1.0.15
 

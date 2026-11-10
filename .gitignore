@@ -54,6 +54,7 @@ npm/platform/*/bin/
 /.workbuddy/
 
 # 本地发布/构建辅助脚本与归档（不纳入开源仓库）
+scripts/oneoff/
 releases/
 check_104.sh
 test_104.sh

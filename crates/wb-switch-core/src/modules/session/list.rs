@@ -2,12 +2,12 @@ use serde_json::{json, Value};
 
 use super::*;
 
-/// 清理某账号下「同一会话被复制多次」产生的重复行（路径 B 副本）。
+/// 清理某账号下「同一会话被复制多次」产生的精确重复行。
 ///
 /// 判重键 = (归一化 cwd, 归一化 jsonl 正文)；仅正文一致才视为重复，
 /// 不依赖 (cwd + title) 这种过宽键，避免误删同工作区下「无标题 / 会议纪要」
-/// 等正常同名会话。每组保留 `updated_at` 最新一条，其余软删除
-/// （`deleted_at` 置值），并清理其孤儿 jsonl 与云端映射，避免残留。
+/// 等正常同名会话。每组保留 `updated_at` 最新一条，其余仅软删除
+/// （`deleted_at` 置值）；JSONL 正文保留，只清理对应 edge mapping。
 ///
 /// 注意：直接调用会写入 `~/.workbuddy/workbuddy.db`，请在 WorkBuddy 关闭后执行。
 pub fn dedup_sessions_for_user(variant: WbVariant, uid: &str) -> Value {
@@ -77,8 +77,8 @@ pub(crate) fn dedup_sessions_for_user_at(
     let mut removed = 0usize;
     let mut protected = 0usize;
     let mut removed_ids: Vec<String> = Vec::new();
-    // 仍被关联组引用的会话不能删：删掉后关联立即失效，且 dedup 会连正文一起删除、
-    // 无法恢复。这里跨档位取并集，避免只保护当前档位而误伤另一档的关联。
+    // 仍被关联组引用的会话不能删：软删后关联立即失效。这里跨档位取并集，
+    // 避免只保护当前档位而误伤另一档的关联。JSONL 正文不会删除，可恢复。
     let linked = match session_link::protected_session_ids(paths) {
         Ok(ids) => ids,
         Err(reason) => return json!({ "ok": false, "reason": reason, "removed": 0 }),
@@ -500,6 +500,17 @@ pub(crate) fn audit_session_duplicates_for_user_at(
     }
 
     let index = index_project_jsonls_in(&paths.projects_dir());
+    let linked = match session_link::protected_session_ids(paths) {
+        Ok(ids) => ids,
+        Err(reason) => {
+            return json!({
+                "ok": false,
+                "reason": reason,
+                "groups": [],
+                "summary": {}
+            });
+        }
+    };
     let mut groups = Vec::new();
     let mut counters = HashMap::<String, usize>::new();
     for ((cwd, title), candidates_members) in candidates {
@@ -525,6 +536,15 @@ pub(crate) fn audit_session_duplicates_for_user_at(
             })
             .collect();
         let kind = classify_duplicate_group(&members);
+        let common_prefix = if kind == "unavailable" {
+            0
+        } else {
+            let seqs: Vec<&Vec<String>> = members
+                .iter()
+                .filter_map(|(_, _, body, _)| body.as_ref())
+                .collect();
+            common_prefix_len(&seqs)
+        };
         *counters.entry(kind.to_string()).or_default() += 1;
         let sessions: Vec<Value> = members
             .iter()
@@ -534,6 +554,7 @@ pub(crate) fn audit_session_duplicates_for_user_at(
                     "updatedAt": updated_at,
                     "records": body.as_ref().map(Vec::len),
                     "status": status,
+                    "linked": linked.contains(cid),
                 })
             })
             .collect();
@@ -543,6 +564,7 @@ pub(crate) fn audit_session_duplicates_for_user_at(
             "title": title,
             "count": members.len(),
             "kind": kind,
+            "commonPrefix": common_prefix,
             "suggested": match kind {
                 "exact" => "keep-newest",
                 "fastForward" => "fast-forward-to-longest",
@@ -637,18 +659,19 @@ fn common_prefix_len(seqs: &[&Vec<String>]) -> usize {
 
 /// 软隐藏一个已审计重复组中除 `keep_session_id` 外的别名。
 ///
-/// 只写 `sessions.deleted_at`；不删除 JSONL、不改 edge mapping、不改关联表。
+/// 只写 `sessions.deleted_at`；不删除 JSONL、不改 edge mapping。
 /// - exact：保留任意一条；其余软隐藏。
 /// - fastForward：必须保留最长副本。
 /// - divergent：允许用户显式指定保留项。
 /// - unavailable / independent：拒绝执行。
-/// - 关联中的 active 成员跳过。
+/// - 默认跳过 active 关联成员；`unlink_linked` 为 true 时改为标记 stale，保留映射。
 pub fn hide_duplicate_group_for_user(
     variant: WbVariant,
     uid: &str,
     cwd: &str,
     title: &str,
     keep_session_id: &str,
+    unlink_linked: bool,
 ) -> Value {
     hide_duplicate_group_for_user_at(
         &SessionPaths::for_variant(variant),
@@ -657,6 +680,7 @@ pub fn hide_duplicate_group_for_user(
         cwd,
         title,
         keep_session_id,
+        unlink_linked,
     )
 }
 
@@ -667,6 +691,7 @@ pub(crate) fn hide_duplicate_group_for_user_at(
     cwd: &str,
     title: &str,
     keep_session_id: &str,
+    unlink_linked: bool,
 ) -> Value {
     let report = audit_session_duplicates_for_user_at(paths, variant, uid);
     if report["ok"] != true {
@@ -697,23 +722,70 @@ pub(crate) fn hide_duplicate_group_for_user_at(
     if kind == "fastForward" && group["suggestedKeepSessionId"] != keep_session_id {
         return json!({ "ok": false, "reason": "快进副本必须保留最长副本" });
     }
+    // 审计到执行之间可能发生并发修改：在写库/解关联前重新审计并比对。
+    let verify = audit_session_duplicates_for_user_at(paths, variant, uid);
+    let Some(verify_group) = verify["groups"].as_array().and_then(|groups| {
+        groups
+            .iter()
+            .find(|item| item["uid"] == uid && item["cwd"] == cwd && item["title"] == title)
+    }) else {
+        return json!({ "ok": false, "reason": "重复组已变化，请刷新审计后重试" });
+    };
+    if verify_group["kind"] != kind
+        || verify_group["count"] != group["count"]
+        || verify_group["suggestedKeepSessionId"] != group["suggestedKeepSessionId"]
+    {
+        return json!({ "ok": false, "reason": "重复组状态已变化，请刷新审计后重试" });
+    }
+    let verify_ids: Vec<String> = verify_group["sessions"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["sessionId"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if verify_ids.len() != ids.len() || !ids.iter().all(|id| verify_ids.contains(id)) {
+        return json!({ "ok": false, "reason": "重复组成员已变化，请刷新审计后重试" });
+    }
     let linked = match session_link::protected_session_ids(paths) {
         Ok(ids) => ids,
         Err(reason) => return json!({ "ok": false, "reason": reason }),
     };
-    let hide_ids: Vec<String> = ids
-        .into_iter()
-        .filter(|id| id != keep_session_id && !linked.contains(id))
-        .collect();
-    let skipped_linked = sessions.len().saturating_sub(1 + hide_ids.len());
+    let mut hide_ids: Vec<String> = Vec::new();
+    let mut linked_aliases: Vec<String> = Vec::new();
+    for id in ids.iter().filter(|id| id.as_str() != keep_session_id) {
+        if linked.contains(id) {
+            if unlink_linked {
+                linked_aliases.push(id.clone());
+                hide_ids.push(id.clone());
+            }
+        } else {
+            hide_ids.push(id.clone());
+        }
+    }
+    let skipped_linked = if unlink_linked {
+        0
+    } else {
+        linked_aliases.len()
+    };
     if hide_ids.is_empty() {
         return json!({
             "ok": true,
             "hidden": 0,
             "skippedLinked": skipped_linked,
-            "reason": "没有可隐藏的非关联别名"
+            "reason": "没有可隐藏的别名"
         });
     }
+    let link_refs = if unlink_linked && !linked_aliases.is_empty() {
+        match active_link_member_refs(paths, variant, uid, &linked_aliases) {
+            Ok(refs) => refs,
+            Err(reason) => return json!({ "ok": false, "reason": reason }),
+        }
+    } else {
+        Vec::new()
+    };
 
     let backup_root = paths
         .store_root
@@ -723,11 +795,34 @@ pub(crate) fn hide_duplicate_group_for_user_at(
         Ok(path) => path.to_string_lossy().to_string(),
         Err(error) => return json!({ "ok": false, "reason": error }),
     };
+    // 先备份关联主表；解除关联失败时按这份文件回滚。
+    let links_file = paths.session_links_file();
+    let links_backup = backup_root.join("session_links.json");
+    if links_file.is_file() {
+        if let Err(error) = std::fs::copy(&links_file, &links_backup) {
+            return json!({ "ok": false, "reason": format!("关联表备份失败：{error}"), "backup": backup });
+        }
+    }
+    let unlinked = match mark_active_link_members_stale(paths, &link_refs) {
+        Ok(count) => count,
+        Err(error) => {
+            if links_backup.is_file() {
+                let _ = std::fs::copy(&links_backup, &links_file);
+            }
+            return json!({ "ok": false, "reason": format!("解除关联失败：{error}"), "backup": backup });
+        }
+    };
     let db = paths.workbuddy_db();
     let Some(conn) = open_db(&db, false) else {
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
         return json!({ "ok": false, "reason": "无法打开 workbuddy.db", "backup": backup });
     };
     if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
         return json!({ "ok": false, "reason": format!("事务启动失败：{error}"), "backup": backup });
     }
     for id in &hide_ids {
@@ -736,20 +831,295 @@ pub(crate) fn hide_duplicate_group_for_user_at(
             rusqlite::params![now_ms(), id, uid],
         ) {
             let _ = conn.execute_batch("ROLLBACK");
+            if links_backup.is_file() {
+                let _ = std::fs::copy(&links_backup, &links_file);
+            }
             return json!({ "ok": false, "reason": format!("软隐藏失败：{error}"), "backup": backup });
         }
     }
     if let Err(error) = conn.execute_batch("COMMIT") {
         let _ = conn.execute_batch("ROLLBACK");
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
         return json!({ "ok": false, "reason": format!("提交失败：{error}"), "backup": backup });
     }
+    let record = json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "variant": variant.as_str(),
+        "uid": uid,
+        "cwd": cwd,
+        "title": title,
+        "keepSessionId": keep_session_id,
+        "hiddenIds": hide_ids,
+        "linkRefs": link_refs
+            .iter()
+            .map(|(group_id, member_id)| json!({
+                "groupId": group_id,
+                "memberId": member_id,
+            }))
+            .collect::<Vec<Value>>(),
+        "backup": backup,
+        "createdAt": now_ms(),
+    });
+    let record_error = append_hide_record(paths, record).err();
     json!({
         "ok": true,
         "hidden": hide_ids.len(),
         "hiddenIds": hide_ids,
+        "unlinked": unlinked,
         "skippedLinked": skipped_linked,
         "keepSessionId": keep_session_id,
         "kind": kind,
         "backup": backup,
+        "restoreRecordSaved": record_error.is_none(),
+        "restoreRecordError": record_error,
+    })
+}
+
+/// 收集指定会话在关联主表中的 active 成员引用。
+fn active_link_member_refs(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    uid: &str,
+    session_ids: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let store = match session_link::load_store(paths) {
+        session_link::StoreState::Ready(store) => store,
+        session_link::StoreState::Missing => return Ok(Vec::new()),
+        session_link::StoreState::Unavailable(reason) => {
+            return Err(format!("关联存储不可用（{reason}），已阻止解除关联"));
+        }
+    };
+    let mut refs = Vec::new();
+    for group in &store.groups {
+        for member in &group.members {
+            if member.state != session_link::MemberState::Active {
+                continue;
+            }
+            if member.uid != uid {
+                continue;
+            }
+            let member_variant = member.variant.unwrap_or(group.variant);
+            if member_variant != variant {
+                continue;
+            }
+            if session_ids.iter().any(|id| id == &member.session_id) {
+                refs.push((group.id.clone(), member.member_id.clone()));
+            }
+        }
+    }
+    Ok(refs)
+}
+
+/// 在关联主表内把指定成员标记为 stale，保留组、成员与 pair bases，便于恢复。
+fn mark_active_link_members_stale(
+    paths: &SessionPaths,
+    refs: &[(String, String)],
+) -> Result<usize, String> {
+    if refs.is_empty() {
+        return Ok(0);
+    }
+    session_link::with_link_store_write(paths, |store| {
+        let mut marked = 0usize;
+        for (group_id, member_id) in refs {
+            let Some(group) = store.groups.iter_mut().find(|group| &group.id == group_id) else {
+                continue;
+            };
+            let Some(member) = group
+                .members
+                .iter_mut()
+                .find(|member| &member.member_id == member_id)
+            else {
+                continue;
+            };
+            if member.state == session_link::MemberState::Active {
+                member.state = session_link::MemberState::Stale;
+                marked += 1;
+            }
+        }
+        Ok(marked)
+    })
+}
+
+fn hide_journal_path(paths: &SessionPaths) -> PathBuf {
+    paths.store_root.join("duplicate-hides.json")
+}
+
+fn read_hide_journal(paths: &SessionPaths) -> Vec<Value> {
+    let path = hide_journal_path(paths);
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<Value>>(&text).unwrap_or_default()
+}
+
+fn write_hide_journal(paths: &SessionPaths, records: &[Value]) -> Result<(), String> {
+    let path = hide_journal_path(paths);
+    let content = serde_json::to_string_pretty(records).map_err(|error| error.to_string())?;
+    crate::modules::session_backup::durable_write_str(&path, &content)
+        .map_err(|error| format!("隐藏记录保存失败：{error}"))
+}
+
+fn append_hide_record(paths: &SessionPaths, record: Value) -> Result<(), String> {
+    let mut records = read_hide_journal(paths);
+    records.push(record);
+    write_hide_journal(paths, &records)
+}
+
+/// 列出某账号由本工具软隐藏、尚未恢复的记录。
+pub fn list_duplicate_hides_for_user(variant: WbVariant, uid: &str) -> Value {
+    list_duplicate_hides_for_user_at(&SessionPaths::for_variant(variant), variant, uid)
+}
+
+pub(crate) fn list_duplicate_hides_for_user_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    uid: &str,
+) -> Value {
+    let hides: Vec<Value> = read_hide_journal(paths)
+        .into_iter()
+        .filter(|record| record["uid"] == uid && record["variant"] == variant.as_str())
+        .collect();
+    json!({ "ok": true, "hides": hides })
+}
+
+/// 恢复一次软隐藏记录：清 deleted_at 并重新激活对应 stale 关联成员。
+pub fn restore_duplicate_hide_for_user(variant: WbVariant, uid: &str, hide_id: &str) -> Value {
+    restore_duplicate_hide_for_user_at(&SessionPaths::for_variant(variant), variant, uid, hide_id)
+}
+
+pub(crate) fn restore_duplicate_hide_for_user_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    uid: &str,
+    hide_id: &str,
+) -> Value {
+    let records = read_hide_journal(paths);
+    let Some(record) = records.iter().find(|record| {
+        record["id"] == hide_id && record["uid"] == uid && record["variant"] == variant.as_str()
+    }) else {
+        return json!({ "ok": false, "reason": "隐藏记录不存在或已恢复" });
+    };
+    let hidden_ids: Vec<String> = record["hiddenIds"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if hidden_ids.is_empty() {
+        return json!({ "ok": false, "reason": "隐藏记录没有可恢复的会话" });
+    }
+    let link_refs: Vec<(String, String)> = record["linkRefs"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some((
+                        item["groupId"].as_str()?.to_string(),
+                        item["memberId"].as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let backup_root = paths
+        .store_root
+        .join("backups")
+        .join(format!("duplicate-restore-{}", now_ms()));
+    let backup = match backup_workbuddy_db(paths, &backup_root) {
+        Ok(path) => path.to_string_lossy().to_string(),
+        Err(error) => return json!({ "ok": false, "reason": error }),
+    };
+    let links_file = paths.session_links_file();
+    let links_backup = backup_root.join("session_links.json");
+    if links_file.is_file() {
+        if let Err(error) = std::fs::copy(&links_file, &links_backup) {
+            return json!({ "ok": false, "reason": format!("关联表备份失败：{error}"), "backup": backup });
+        }
+    }
+    let mut reactivated = 0usize;
+    for (group_id, member_id) in &link_refs {
+        let result = session_link::with_link_store_write(paths, |store| {
+            let Some(group) = store.groups.iter_mut().find(|group| &group.id == group_id) else {
+                return Ok(false);
+            };
+            let Some(member) = group
+                .members
+                .iter_mut()
+                .find(|member| &member.member_id == member_id)
+            else {
+                return Ok(false);
+            };
+            if member.state == session_link::MemberState::Stale {
+                member.state = session_link::MemberState::Active;
+                return Ok(true);
+            }
+            Ok(false)
+        });
+        match result {
+            Ok(true) => reactivated += 1,
+            Ok(false) => {}
+            Err(error) => {
+                if links_backup.is_file() {
+                    let _ = std::fs::copy(&links_backup, &links_file);
+                }
+                return json!({ "ok": false, "reason": format!("恢复关联失败：{error}"), "backup": backup });
+            }
+        }
+    }
+
+    let db = paths.workbuddy_db();
+    let Some(conn) = open_db(&db, false) else {
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
+        return json!({ "ok": false, "reason": "无法打开 workbuddy.db", "backup": backup });
+    };
+    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
+        return json!({ "ok": false, "reason": format!("事务启动失败：{error}"), "backup": backup });
+    }
+    let mut restored = 0usize;
+    for id in &hidden_ids {
+        match conn.execute(
+            "UPDATE sessions SET deleted_at = NULL WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL",
+            rusqlite::params![id, uid],
+        ) {
+            Ok(changed) => restored += changed,
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                if links_backup.is_file() {
+                    let _ = std::fs::copy(&links_backup, &links_file);
+                }
+                return json!({ "ok": false, "reason": format!("恢复会话失败：{error}"), "backup": backup });
+            }
+        }
+    }
+    if let Err(error) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
+        return json!({ "ok": false, "reason": format!("提交失败：{error}"), "backup": backup });
+    }
+    let remaining: Vec<Value> = read_hide_journal(paths)
+        .into_iter()
+        .filter(|item| item["id"] != hide_id)
+        .collect();
+    let journal_error = write_hide_journal(paths, &remaining).err();
+    json!({
+        "ok": true,
+        "restored": restored,
+        "reactivated": reactivated,
+        "backup": backup,
+        "journalError": journal_error,
     })
 }

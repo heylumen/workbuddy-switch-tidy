@@ -35,6 +35,7 @@ import type {
   Session,
   SessionCopyReport,
   SessionDuplicateAudit,
+  SessionDuplicateHideRecord,
   SessionLinksPreview,
   SessionSyncReport,
   SessionSyncSelection,
@@ -149,6 +150,8 @@ const ROUTES: Record<string, Route> = {
   copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
   audit_session_duplicates: { method: "POST", path: "/api/sessions/audit-duplicates" },
   hide_duplicate_group: { method: "POST", path: "/api/sessions/hide-duplicate-group" },
+  list_duplicate_hides: { method: "POST", path: "/api/sessions/duplicate-hides" },
+  restore_duplicate_hide: { method: "POST", path: "/api/sessions/restore-duplicate-hide" },
   session_links_preview: { method: "POST", path: "/api/session-links/preview" },
   session_links_preview_cross: { method: "POST", path: "/api/session-links/preview-cross" },
   session_sync_cross: { method: "POST", path: "/api/session-sync/cross" },
@@ -1134,20 +1137,41 @@ export function auditSessionDuplicates(accountId: string): Promise<SessionDuplic
   return call("audit_session_duplicates", { accountId });
 }
 
+/** 列出未恢复的软隐藏记录。 */
+export function listDuplicateHides(accountId: string): Promise<{ ok: boolean; hides: SessionDuplicateHideRecord[] }> {
+  return call("list_duplicate_hides", { accountId });
+}
+
+/** 恢复一次软隐藏；清 deleted_at 并重新激活关联。 */
+export function restoreDuplicateHide(accountId: string, hideId: string): Promise<{
+  ok: boolean;
+  restored?: number;
+  reactivated?: number;
+  reason?: string;
+  backup?: string;
+  journalError?: string;
+}> {
+  return call("restore_duplicate_hide", { accountId, hideId });
+}
+
 /** 软隐藏重复组别名（正文保留、仅改 deleted_at）。 */
 export function hideDuplicateGroup(
   accountId: string,
   cwd: string,
   title: string,
   keepSessionId: string,
+  unlinkLinked = false,
 ): Promise<{
   ok: boolean;
   hidden?: number;
+  unlinked?: number;
   skippedLinked?: number;
   reason?: string;
   backup?: string;
+  restoreRecordSaved?: boolean;
+  restoreRecordError?: string;
 }> {
-  return call("hide_duplicate_group", { accountId, cwd, title, keepSessionId });
+  return call("hide_duplicate_group", { accountId, cwd, title, keepSessionId, unlinkLinked });
 }
 // ---------------------------------------------------------------------------
 // 通知存档（toast 事后可查）

@@ -242,6 +242,8 @@ pub fn run() {
             commands::copy_sessions_cross,
             commands::audit_session_duplicates,
             commands::hide_duplicate_group,
+            commands::list_duplicate_hides,
+            commands::restore_duplicate_hide,
             commands::dedup_sessions,
             commands::collapse_sessions,
             commands::session_links_preview,

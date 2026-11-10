@@ -145,6 +145,18 @@ async fn main() {
 /// 只读审计同名会话：不修改数据库/正文/关联表。
 fn audit_duplicates(args: &[String]) {
     let variant = variant_arg(args);
+    let only_uid = args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            if let Some(value) = arg.strip_prefix("--uid=") {
+                return Some(value.trim().to_string());
+            }
+            arg.eq("--uid")
+                .then(|| args.get(index + 1).map(|value| value.trim().to_string()))
+                .flatten()
+        })
+        .filter(|value| !value.is_empty());
     let accounts = account::load_accounts();
     let mut reports = Vec::new();
     for acct in accounts {
@@ -157,7 +169,7 @@ fn audit_duplicates(args: &[String]) {
             .unwrap_or("")
             .trim()
             .to_string();
-        if uid.is_empty() {
+        if uid.is_empty() || only_uid.as_deref().is_some_and(|wanted| wanted != uid) {
             continue;
         }
         reports.push(session::audit_session_duplicates_for_user(variant, &uid));

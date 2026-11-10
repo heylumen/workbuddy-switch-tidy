@@ -379,11 +379,16 @@ pub(crate) use list::dedup_sessions_for_user_at;
 #[cfg(test)]
 pub(crate) use list::hide_duplicate_group_for_user_at;
 #[cfg(test)]
+pub(crate) use list::list_duplicate_hides_for_user_at;
+#[cfg(test)]
 pub(crate) use list::list_sessions_for_user_at;
+#[cfg(test)]
+pub(crate) use list::restore_duplicate_hide_for_user_at;
 pub(crate) use list::session_row_for_user;
 pub use list::{
     audit_session_duplicates_for_user, collapse_sessions_for_user, dedup_sessions_for_user,
-    hide_duplicate_group_for_user, list_sessions_for_account, list_sessions_for_user,
+    hide_duplicate_group_for_user, list_duplicate_hides_for_user, list_sessions_for_account,
+    list_sessions_for_user, restore_duplicate_hide_for_user,
 };
 
 /// 在 `{档位数据根}/projects/{workspace}/{cid}.jsonl` 定位会话正文。
@@ -1058,6 +1063,8 @@ enum CopyOutcome {
 struct TargetResolution {
     group_id: Option<String>,
     existing_link: Option<String>,
+    /// 目标账号在同组内被软隐藏的关联副本；复制时必须先恢复，不能新建。
+    hidden_aliases: Vec<String>,
 }
 
 /// 目标账号在关联组内的 active 成员是否真实有效：正文可验证 + 会话行归属正确。
@@ -1079,6 +1086,7 @@ fn resolve_target(context: &CopyContext, cid: &str) -> Result<TargetResolution, 
             return Ok(TargetResolution {
                 group_id: None,
                 existing_link: None,
+                hidden_aliases: Vec::new(),
             })
         }
         StoreState::Ready(store) => store,
@@ -1096,26 +1104,158 @@ fn resolve_target(context: &CopyContext, cid: &str) -> Result<TargetResolution, 
         return Ok(TargetResolution {
             group_id: None,
             existing_link: None,
+            hidden_aliases: Vec::new(),
         });
     };
     let group_id = Some(group.id.clone());
+    let hidden_aliases: Vec<String> = group
+        .members
+        .iter()
+        .filter(|member| {
+            member.state == session_link::MemberState::Stale
+                && member.uid == context.target_uid
+                && member.variant.unwrap_or(group.variant) == context.variant
+        })
+        .map(|member| member.session_id.clone())
+        .collect();
     let Some(member) = session_link::active_member_for(group, context.target_uid) else {
         return Ok(TargetResolution {
             group_id,
             existing_link: None,
+            hidden_aliases,
         });
     };
     if member_is_valid(context.paths, member) {
         return Ok(TargetResolution {
             group_id,
             existing_link: Some(member.session_id.clone()),
+            hidden_aliases: Vec::new(),
         });
     }
-    // 失效成员保留记录、不自动复活；本次会重建一个新成员。
+    // 失效成员保留记录、不自动复活；存在隐藏别名时由调用方阻止新建。
     Ok(TargetResolution {
         group_id,
         existing_link: None,
+        hidden_aliases,
     })
+}
+
+/// 目标账号存在隐藏/stale 副本时，仅当内容与源完全一致时恢复并复用。
+///
+/// 多个隐藏等价副本、正文不可读或内容不同均拒绝自动恢复；绝不新建 UUID。
+fn restore_hidden_target_alias(
+    context: &CopyContext,
+    group_id: &str,
+    candidates: &[String],
+    source: &session_link::ContentSnapshot,
+    source_cid: &str,
+) -> Result<Option<String>, String> {
+    if group_id.is_empty() {
+        return Err("目标隐藏副本缺少关联组，已阻止复制".to_string());
+    }
+    let mut exact: Vec<String> = Vec::new();
+    for candidate in candidates {
+        let Some(path) = find_project_jsonl(context.paths, candidate) else {
+            continue;
+        };
+        let ContentState::Ready(target) = session_link::read_content_snapshot(&path, candidate)
+        else {
+            continue;
+        };
+        if target.normalized.total_digest == source.normalized.total_digest
+            && target.normalized.record_count == source.normalized.record_count
+        {
+            exact.push(candidate.clone());
+        }
+    }
+    if exact.is_empty() {
+        return Err(format!(
+            "目标账号有 {} 个已隐藏关联副本，但内容与源 {} 不一致；请先恢复并选择分支后再复制",
+            candidates.len(),
+            source_cid
+        ));
+    }
+    if exact.len() > 1 {
+        return Err("目标账号有多个隐藏等价副本，请先在重复审计中恢复并选择一条".to_string());
+    }
+    let target_id = exact.remove(0);
+    let backup_root = context
+        .paths
+        .store_root
+        .join("backups")
+        .join(format!("copy-restore-{}", now_ms()));
+    let _backup = backup_workbuddy_db(context.paths, &backup_root)?;
+    let links_file = context.paths.session_links_file();
+    let links_backup = backup_root.join("session_links.json");
+    if links_file.is_file() {
+        std::fs::copy(&links_file, &links_backup)
+            .map_err(|error| format!("关联表备份失败：{error}"))?;
+    }
+    let link_result = session_link::with_link_store_write(context.paths, |store| {
+        let Some(group) = store.groups.iter_mut().find(|group| group.id == group_id) else {
+            return Err("目标隐藏副本的关联组不存在".to_string());
+        };
+        if group.members.iter().any(|member| {
+            member.uid == context.target_uid && member.state == session_link::MemberState::Active
+        }) {
+            return Err("目标账号已有 active 副本，拒绝恢复隐藏副本".to_string());
+        }
+        let Some(member) = group.members.iter_mut().find(|member| {
+            member.uid == context.target_uid
+                && member.session_id == target_id
+                && member.state == session_link::MemberState::Stale
+        }) else {
+            return Err("目标隐藏副本的 stale 成员不存在".to_string());
+        };
+        member.state = session_link::MemberState::Active;
+        Ok(())
+    });
+    if let Err(error) = link_result {
+        return Err(format!("恢复隐藏副本关联失败：{error}"));
+    }
+    let db = context.paths.workbuddy_db();
+    let Some(conn) = open_db(&db, false) else {
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
+        return Err("无法打开目标会话数据库，已回滚关联".to_string());
+    };
+    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        if links_backup.is_file() {
+            let _ = std::fs::copy(&links_backup, &links_file);
+        }
+        return Err(format!("恢复事务启动失败：{error}"));
+    }
+    let changed = conn.execute(
+        "UPDATE sessions SET deleted_at = NULL WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL",
+        rusqlite::params![&target_id, context.target_uid],
+    );
+    match changed {
+        Ok(1) => {
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                if links_backup.is_file() {
+                    let _ = std::fs::copy(&links_backup, &links_file);
+                }
+                return Err(format!("恢复隐藏副本提交失败：{error}"));
+            }
+        }
+        Ok(_) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if links_backup.is_file() {
+                let _ = std::fs::copy(&links_backup, &links_file);
+            }
+            return Err("目标隐藏副本已被并发修改，已回滚".to_string());
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            if links_backup.is_file() {
+                let _ = std::fs::copy(&links_backup, &links_file);
+            }
+            return Err(format!("恢复隐藏副本失败：{error}"));
+        }
+    }
+    Ok(Some(target_id))
 }
 
 /// 目标正文路径：目标档 `projects` 下沿用源文件所在的工作区子目录。
@@ -1234,6 +1374,21 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
             session_id,
             group_id: resolution.group_id.unwrap_or_default(),
         });
+    }
+    if !resolution.hidden_aliases.is_empty() {
+        let group_id = resolution.group_id.clone().unwrap_or_default();
+        if let Some(session_id) = restore_hidden_target_alias(
+            context,
+            &group_id,
+            &resolution.hidden_aliases,
+            &snapshot,
+            cid,
+        )? {
+            return Ok(CopyOutcome::AlreadyLinked {
+                session_id,
+                group_id,
+            });
+        }
     }
 
     // 本 fork 的内容级去重（design：从源头杜绝重复行累积）。
