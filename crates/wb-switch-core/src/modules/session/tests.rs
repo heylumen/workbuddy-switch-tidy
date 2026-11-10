@@ -310,6 +310,82 @@ fn copy(env: &Env, target_uid: &str, ids: &[&str]) -> Value {
     .unwrap()
 }
 
+/// 复制到“目标已有等价隐藏副本”的账号时，应恢复该副本并复用，不新建。
+#[test]
+fn copy_restores_hidden_equivalent_target_instead_of_creating_new() {
+    let env = ready_env("copy-hidden-equivalent");
+    env.add_session("sess-b", "uid-b", "标题一");
+    env.add_body("sess-b", &body_text("sess-b"));
+    let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+    conn.execute("UPDATE sessions SET deleted_at = 1 WHERE id = 'sess-b'", [])
+        .unwrap();
+    drop(conn);
+
+    session_link::with_link_store_write(&env.paths(), |store| {
+        store.groups.push(LinkGroup {
+            id: "g-hidden-copy".to_string(),
+            variant: WbVariant::Cn,
+            created_at: 1,
+            members: vec![
+                LinkMember {
+                    member_id: "m-a".to_string(),
+                    account_id: Some("acc-uid-a".to_string()),
+                    uid: "uid-a".to_string(),
+                    session_id: "sess-1".to_string(),
+                    variant: None,
+                    state: MemberState::Active,
+                    linked_at: 1,
+                    last_synced_at: None,
+                },
+                LinkMember {
+                    member_id: "m-b".to_string(),
+                    account_id: Some("acc-uid-b".to_string()),
+                    uid: "uid-b".to_string(),
+                    session_id: "sess-b".to_string(),
+                    variant: None,
+                    state: MemberState::Stale,
+                    linked_at: 1,
+                    last_synced_at: None,
+                },
+            ],
+            pair_bases: vec![],
+        });
+        Ok(())
+    })
+    .unwrap();
+
+    let report = copy(&env, "uid-b", &["sess-1"]);
+    assert_eq!(
+        report["alreadyLinked"][0]["sessionId"], "sess-b",
+        "{report}"
+    );
+    assert_eq!(env.body_files().len(), 2);
+    let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+    let deleted: Option<i64> = conn
+        .query_row(
+            "SELECT deleted_at FROM sessions WHERE id='sess-b'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(deleted.is_none(), "隐藏目标应已恢复");
+    let store = env.store();
+    let group = store
+        .groups
+        .iter()
+        .find(|group| group.id == "g-hidden-copy")
+        .unwrap();
+    assert_eq!(
+        group
+            .members
+            .iter()
+            .find(|m| m.uid == "uid-b")
+            .unwrap()
+            .state,
+        MemberState::Active
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 基础路径与能力探测
 // ---------------------------------------------------------------------------
