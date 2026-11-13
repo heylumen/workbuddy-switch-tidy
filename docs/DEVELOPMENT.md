@@ -1,5 +1,9 @@
 # 开发指南
 
+> **本 fork 的差异（2026-11-06）**：本项目是 `workbuddy-switch-tidy` 便携版，构建以 `build.sh` 为准（Windows 单 EXE、`bundle.active=false`），**不提供签名安装包/应用内自动升级**；下文的 `build:app`、签名密钥、`.sig` 与 updater manifest 流程属于上游安装版，仅供追溯。更新检查只做版本检测，入口是下载页。
+>
+> 当前验证基线：core 793 passed / 7 ignored；server 11；auth 集成 6；frontend 70；clippy `-D warnings`、fmt、release build 通过。CI 的 macOS/lint 若被 runner 取消，不得当作通过。
+
 ## 环境要求
 
 Node.js ≥ 20、Rust stable、macOS（或 Windows/Linux）。

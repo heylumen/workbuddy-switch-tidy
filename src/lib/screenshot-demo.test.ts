@@ -55,4 +55,22 @@ describe("企业版 demo 数据", () => {
     expect(payload.accounts.find((row) => row.id === "demo-account-d")?.isEnterprise).toBe(true);
     expect(payload.accounts.find((row) => row.id === "demo-account-a")?.isEnterprise).toBeUndefined();
   });
+
+  it("Token 明细命令有 demo 分支，不会抛缺少只读数据", () => {
+    const result = screenshotDemoResponse("get_token_requests", { days: 7 }) as {
+      rangeDays?: number | null;
+      requests?: unknown[];
+    };
+    expect(result.rangeDays).toBe(7);
+    expect(result.requests?.length).toBeGreaterThan(0);
+  });
+
+  it("JetBrains 状态命令有 demo 分支", () => {
+    const result = screenshotDemoResponse("get_jetbrains_status") as {
+      installed: boolean;
+      targets?: unknown[];
+    };
+    expect(result.installed).toBe(true);
+    expect(result.targets?.length).toBeGreaterThan(0);
+  });
 });

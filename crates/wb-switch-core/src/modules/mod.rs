@@ -1,5 +1,7 @@
 pub mod account;
+pub mod account_memory;
 pub mod auth_file;
+pub mod auth_transaction;
 pub mod checkin;
 pub mod codebuddy_cli;
 pub mod codebuddy_cn_ide;
@@ -28,6 +30,7 @@ pub mod session;
 pub mod session_backup;
 pub mod session_groups;
 pub mod session_link;
+pub mod session_pinned;
 pub mod switch;
 pub mod token_stats;
 pub mod travel;

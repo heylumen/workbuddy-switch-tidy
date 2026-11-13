@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::modules::session::{SessionPaths, SyncSelection};
@@ -17,8 +18,9 @@ use crate::modules::vscode_session::{
     CopyItem, SessionStoreSpec, CODEBUDDY_IDE_STORE, VSCODE_STORE,
 };
 use crate::modules::{
-    account, codebuddy_ide_session, codebuddy_ide_session_sync, config, process, session,
-    session_link, variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    account, codebuddy_cn_ide, codebuddy_ide, codebuddy_ide_session, codebuddy_ide_session_sync,
+    config, process, session, session_link, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,8 +104,17 @@ struct MemberView {
     project_label: String,
     updated_at: i64,
     content: ContentState,
+    writeable: bool,
     reason: String,
     version_status: &'static str,
+}
+
+struct MemberSnapshot {
+    title: String,
+    project_label: String,
+    updated_at: i64,
+    content: ContentState,
+    writeable: bool,
 }
 
 /// List lightweight searchable summaries. IDE must include its mandatory variant scope.
@@ -125,15 +136,26 @@ pub fn list(client: SessionClient, scope: Option<WbVariant>) -> Result<Value, St
         StoreState::Ready(store) => {
             result["storeStatus"] = json!("ready");
             let accounts = account::load_accounts_at(&account::accounts_file_in(&paths.store_root));
-            let mut cache = HashMap::new();
-            let groups = store
-                .groups
-                .iter()
-                .filter(|group| group_is_in_scope(client, scope, group))
-                .map(|group| {
-                    group_payload(client, scope, &paths, group, &accounts, &mut cache, false)
-                })
-                .collect::<Vec<_>>();
+            let lightweight = list_needs_lightweight(client, scope, &store);
+            result["lightweight"] = json!(lightweight);
+            let groups = if lightweight {
+                store
+                    .groups
+                    .iter()
+                    .filter(|group| group_is_in_scope(client, scope, group))
+                    .map(|group| group_list_payload(client, scope, group, &accounts))
+                    .collect::<Vec<_>>()
+            } else {
+                let mut cache = HashMap::new();
+                store
+                    .groups
+                    .iter()
+                    .filter(|group| group_is_in_scope(client, scope, group))
+                    .map(|group| {
+                        group_payload(client, scope, &paths, group, &accounts, &mut cache, false)
+                    })
+                    .collect::<Vec<_>>()
+            };
             result["groups"] = json!(groups);
         }
     }
@@ -324,7 +346,8 @@ fn sync_unify_batch_workbuddy(
                         "error": format!("{}：{error}", pair.target.uid),
                     }),
                 );
-                break;
+                // 单个目标失败不应让整组后续目标都不执行。
+                continue;
             }
         }
     }
@@ -414,7 +437,8 @@ fn sync_unify_batch_vscode(
                         "error": format!("{}：{error}", pair.target.uid),
                     }),
                 );
-                break;
+                // 单个目标失败不应让整组后续目标都不执行。
+                continue;
             }
         }
     }
@@ -475,6 +499,7 @@ pub fn sync_safe_batch(
         .flatten()
         .filter(|member| {
             member.get("memberId").and_then(Value::as_str) != Some(source_member_id.as_str())
+                && member.get("linkState").and_then(Value::as_str) == Some("active")
                 && member.get("versionStatus").and_then(Value::as_str) == Some("behind")
         })
         .filter_map(|member| {
@@ -489,14 +514,35 @@ pub fn sync_safe_batch(
     // 避免为注定失败的请求打断用户。
     let mut prepared = Vec::new();
     for target_member_id in targets {
-        let pair = resolve_pair(
+        // 单个目标复核失败只记录并继续，不能让整批在第一个失败处停止。
+        let pair = match resolve_pair(
             client,
             scope,
             group_id,
             &source_member_id,
             &target_member_id,
-        )?;
-        let preview = preview_resolved_pair(client, scope, &pair)?;
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": error }),
+                );
+                continue;
+            }
+        };
+        let preview = match preview_resolved_pair(client, scope, &pair) {
+            Ok(preview) => preview,
+            Err(error) => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": error }),
+                );
+                continue;
+            }
+        };
         if preview.get("verdict").and_then(Value::as_str) != Some("fastForward") {
             push_report_item(
                 &mut combined,
@@ -510,11 +556,28 @@ pub fn sync_safe_batch(
             );
             continue;
         }
-        let token = preview
-            .get("previewToken")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "重新预览未返回可执行凭据".to_string())?;
-        let selection = parse_selection(group_id, token, "fastForward")?;
+        let token = match preview.get("previewToken").and_then(Value::as_str) {
+            Some(token) => token,
+            None => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": "重新预览未返回可执行凭据" }),
+                );
+                continue;
+            }
+        };
+        let selection = match parse_selection(group_id, token, "fastForward") {
+            Ok(selection) => selection,
+            Err(error) => {
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": target_member_id, "error": error }),
+                );
+                continue;
+            }
+        };
         prepared.push((pair, selection));
     }
     let target_uids: Vec<&str> = prepared
@@ -523,14 +586,25 @@ pub fn sync_safe_batch(
         .collect();
     let guard = prepare_editor_window(client, restart, VSCODE_SYNC_RUNNING_HINT, &target_uids)?;
     let editor_prepared = guard.is_some();
-    let result = (|| -> Result<Value, String> {
-        for (pair, selection) in prepared {
-            let report = run_pair_sync(client, scope, &pair, &[selection], editor_prepared)?;
-            merge_sync_report(&mut combined, report);
+    for (pair, selection) in prepared {
+        match run_pair_sync(client, scope, &pair, &[selection], editor_prepared) {
+            Ok(report) => {
+                merge_sync_report(&mut combined, report);
+                if combined["needsRecovery"] == true {
+                    break;
+                }
+            }
+            Err(error) => {
+                // 普通失败不应阻断其余目标；需要恢复时下一轮会重新校验。
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({ "groupId": group_id, "targetMemberId": pair.target.member_id, "error": error }),
+                );
+            }
         }
-        Ok(combined)
-    })();
-    settle_editor_window(guard, result)
+    }
+    settle_editor_window(guard, Ok(combined))
 }
 
 /// 插件侧「复制 + 登记」共享段：复制给定会话到目标账号，并登记关联（无现成组则新建关联组）。
@@ -769,7 +843,10 @@ pub fn copy_linked_sessions(
     session_ids: &[String],
     restart: bool,
 ) -> Result<Value, String> {
-    if client != SessionClient::VscodeExt {
+    if !matches!(
+        client,
+        SessionClient::VscodeExt | SessionClient::CodebuddyIde
+    ) {
         return Err("当前客户端暂不支持新增关联会话".to_string());
     }
     if session_ids.is_empty() {
@@ -803,11 +880,22 @@ pub fn copy_linked_sessions(
     }
     let root = client
         .data_root()
-        .ok_or_else(|| "未找到 VS Code CodeBuddy 插件数据目录".to_string())?;
+        .ok_or_else(|| "未找到 CodeBuddy 插件/IDE 数据目录".to_string())?;
     let spec = client
         .store_spec()
         .ok_or_else(|| "插件数据仓不可用".to_string())?;
     let variant = account::variant_of(&target);
+    if client == SessionClient::CodebuddyIde {
+        let running = match variant {
+            WbVariant::Cn => codebuddy_cn_ide::is_codebuddy_cn_running(),
+            WbVariant::Ai => codebuddy_ide::is_codebuddy_ide_running(),
+        };
+        if running {
+            return Err(
+                "请先退出 CodeBuddy IDE 再新增关联会话，避免写入被运行中的客户端覆盖".to_string(),
+            );
+        }
+    }
     // 逐条校验来源内容：无内容 / 索引缺失的跳过并如实报告；全部无效才拒绝
     // （不为注定失败的请求关编辑器）。
     let mut items = Vec::with_capacity(session_ids.len());
@@ -1047,7 +1135,12 @@ fn preview_resolved_pair(
     let paths = client.store_paths();
     let report = match client {
         SessionClient::Workbuddy => {
-            session::session_links_preview_cross(&pair.source_account, &pair.target_account)?
+            // 单对操作只读目标组，不再遍历所有相关组（性能关键路径）。
+            session::session_links_preview_pair(
+                &pair.source_account,
+                &pair.target_account,
+                &pair.group.id,
+            )?
         }
         SessionClient::CodebuddyIde => {
             let variant = scope.ok_or_else(|| "CodeBuddy IDE 缺少档位".to_string())?;
@@ -1436,6 +1529,195 @@ fn ide_flavor(variant: WbVariant) -> codebuddy_ide_session::IdeFlavor {
     }
 }
 
+/// 真实数据可能存在数百 MB 的副本。列表精确计算摘要前先估算规模：
+/// 只读元数据/文件名即可判断，超阈值才降级为零正文列表。
+fn list_needs_lightweight(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    store: &session_link::LinkStore,
+) -> bool {
+    // 测试夹具故意构造大/异常内容；单测继续走精确路径，避免把“降级”当成正常语义。
+    if cfg!(test) {
+        return false;
+    }
+    let mut sizes = Vec::new();
+    if client == SessionClient::Workbuddy {
+        for group in store
+            .groups
+            .iter()
+            .filter(|group| group_is_in_scope(client, scope, group))
+        {
+            for member in group
+                .members
+                .iter()
+                .filter(|member| member.state == MemberState::Active)
+            {
+                let variant = session_link::member_variant(group, member);
+                let paths = SessionPaths::for_variant(variant);
+                let Some(path) = session::find_project_jsonl(&paths, &member.session_id) else {
+                    continue;
+                };
+                if let Ok(meta) = std::fs::metadata(path) {
+                    sizes.push(meta.len());
+                }
+            }
+        }
+    } else {
+        let (Some(spec), Some(root)) = (client.store_spec(), client.data_root()) else {
+            return false;
+        };
+        // 插件/IDE 的会话按 uid 分目录；只统计本次 active 成员，避免为账号全部历史会话做目录遍历。
+        let mut wanted_by_uid: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for group in store
+            .groups
+            .iter()
+            .filter(|group| group_is_in_scope(client, scope, group))
+        {
+            for member in group
+                .members
+                .iter()
+                .filter(|member| member.state == MemberState::Active)
+            {
+                wanted_by_uid
+                    .entry(member.uid.clone())
+                    .or_default()
+                    .insert(member.session_id.clone());
+            }
+        }
+        let mut by_uid: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for (uid, wanted) in &wanted_by_uid {
+            by_uid.insert(
+                uid.clone(),
+                vscode_session_sync::session_sizes(spec, &root, uid, wanted),
+            );
+        }
+        for group in store
+            .groups
+            .iter()
+            .filter(|group| group_is_in_scope(client, scope, group))
+        {
+            for member in group
+                .members
+                .iter()
+                .filter(|member| member.state == MemberState::Active)
+            {
+                if let Some(size) = by_uid
+                    .get(&member.uid)
+                    .and_then(|table| table.get(&member.session_id))
+                {
+                    sizes.push(*size);
+                }
+            }
+        }
+    }
+    list_needs_lightweight_from_sizes(sizes)
+}
+
+fn list_needs_lightweight_from_sizes<I>(sizes: I) -> bool
+where
+    I: IntoIterator<Item = u64>,
+{
+    const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+    let mut total = 0u64;
+    for size in sizes {
+        if size > session_link::SUMMARY_SCAN_MAX_BYTES {
+            return true;
+        }
+        total = total.saturating_add(size);
+        if total > MAX_TOTAL_BYTES {
+            return true;
+        }
+    }
+    false
+}
+
+/// 列表专用：只读关联元数据，不读取任何会话正文。
+///
+/// 真实数据中一个组可能有多个数百 MB 的副本；列表若逐个成员算摘要会扫描数十 GB，
+/// 打开页面直接卡死。状态/标题在打开详情时再精确计算；列表只提供数量、账号和最晚时间。
+fn group_list_payload(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    group: &LinkGroup,
+    accounts: &[Value],
+) -> Value {
+    let mut account_names = Vec::with_capacity(group.members.len());
+    let mut active_member_count = 0usize;
+    let mut latest_activity_at = group.created_at;
+    for member in &group.members {
+        if member.state == MemberState::Active {
+            active_member_count += 1;
+        }
+        let account = account_by_uid(accounts, &member.uid);
+        account_names.push(
+            account
+                .as_ref()
+                .map(account::account_display_name)
+                .unwrap_or_else(|| member.uid.clone()),
+        );
+        latest_activity_at =
+            latest_activity_at.max(member.last_synced_at.unwrap_or(member.linked_at));
+    }
+    let key = format!(
+        "{}:{}:{}",
+        client.as_str(),
+        scope.map(WbVariant::as_str).unwrap_or("all"),
+        group.id
+    );
+    let title = account_names
+        .first()
+        .map(|name| format!("{name} 等 {} 个账号", group.members.len()))
+        .unwrap_or_else(|| "会话组".to_string());
+    json!({
+        "key": key,
+        "client": client.as_str(),
+        "variantScope": scope.map(WbVariant::as_str),
+        "groupId": group.id,
+        "groupVariant": group.variant.as_str(),
+        // 标题/项目/版本状态需要正文或基线，打开详情时再计算。
+        "title": title,
+        "projectLabel": "",
+        "latestActivityAt": latest_activity_at,
+        "memberCount": group.members.len(),
+        "activeMemberCount": active_member_count,
+        "accountNames": account_names,
+        "summaryStatus": "pending",
+        "summaryText": "等待确认",
+        "safeSourceMemberId": Value::Null,
+        "hasSafeSource": false,
+    })
+}
+
+fn resolve_group_summary(
+    active: &[usize],
+    views: &[MemberView],
+    aggregate_source: Option<usize>,
+    aggregate_status: &'static str,
+) -> (Option<usize>, &'static str, Option<String>) {
+    if active.is_empty() {
+        return (None, "missing", Some("无有效副本".to_string()));
+    }
+    if active.len() == 1 {
+        let index = active[0];
+        return match &views[index].content {
+            ContentState::Ready(_) if views[index].writeable => {
+                (Some(index), "single", Some("仅一个副本".to_string()))
+            }
+            ContentState::Ready(_) => (
+                None,
+                "unknown",
+                Some("唯一副本不可写，无法同步".to_string()),
+            ),
+            ContentState::Missing => (None, "missing", Some("唯一副本内容缺失".to_string())),
+            ContentState::Unavailable(reason) if reason.contains("文件过大") => {
+                (None, "single", Some("仅一个副本（未校验）".to_string()))
+            }
+            ContentState::Unavailable(reason) => (None, "unknown", Some(reason.clone())),
+        };
+    }
+    (aggregate_source, aggregate_status, None)
+}
+
 fn group_payload(
     client: SessionClient,
     scope: Option<WbVariant>,
@@ -1461,8 +1743,15 @@ fn group_payload(
                 .and_then(|account| account::get_str(account, "id"))
                 .or_else(|| member.account_id.clone())
                 .unwrap_or_else(|| member.uid.clone());
-            let (title, project_label, updated_at, content) =
-                member_snapshot(client, &root, spec, group, member, cache);
+            let snapshot = member_snapshot(
+                client,
+                &root,
+                spec,
+                group,
+                member,
+                cache,
+                member.state == MemberState::Active,
+            );
             let mut member = member.clone();
             // Correct legacy plugin labels from the account library; region never selects its data root.
             if client == SessionClient::VscodeExt {
@@ -1474,10 +1763,11 @@ fn group_payload(
                 member,
                 account_key,
                 account_name,
-                title,
-                project_label,
-                updated_at,
-                content,
+                title: snapshot.title,
+                project_label: snapshot.project_label,
+                updated_at: snapshot.updated_at,
+                content: snapshot.content,
+                writeable: snapshot.writeable,
                 reason: String::new(),
                 version_status: "unknown",
             }
@@ -1517,12 +1807,13 @@ fn group_payload(
             );
         }
     }
-    let (safe_source, aggregate_status) = aggregate_group_state(&mut views, &active, &matrix);
-    let divergence = common_base_branches(&views, &active);
-    let summary_status = if divergence.is_some() {
-        "diverge"
+    let (aggregate_source, aggregate_status) = aggregate_group_state(&mut views, &active, &matrix);
+    let (safe_source, summary_status, summary_override) =
+        resolve_group_summary(&active, &views, aggregate_source, aggregate_status);
+    let divergence = if active.len() < 2 {
+        None
     } else {
-        aggregate_status
+        common_base_branches(&views, &active)
     };
     let title = views
         .iter()
@@ -1562,6 +1853,15 @@ fn group_payload(
         "safeSourceMemberId": safe_source.map(|index| views[index].member.member_id.clone()),
         "hasSafeSource": safe_source.is_some(),
     });
+    if let Some(text) = summary_override {
+        result["summaryText"] = json!(text);
+    } else if summary_status == "unknown"
+        && active.iter().any(|&index| {
+            matches!(&views[index].content, ContentState::Unavailable(reason) if reason.contains("文件过大"))
+        })
+    {
+        result["summaryText"] = json!("文件过大，未自动校验");
+    }
     if include_detail {
         if let Some(divergence) = divergence {
             result["divergence"] = json!({
@@ -1582,8 +1882,9 @@ fn group_payload(
             "projectLabel": view.project_label,
             "updatedAt": view.updated_at,
             "recordCount": content_count(&view.content),
-            "contentPreview": content_preview(&view.content),
+            "contentPreview": preview_for_view(client, group, view),
             "contentState": content_state_name(&view.content),
+            "targetAvailable": view.member.state == MemberState::Active && view.writeable,
             "reason": view.reason,
             "canBeSource": view.member.state == MemberState::Active && matches!(view.content, ContentState::Ready(_)),
         })).collect::<Vec<_>>();
@@ -1627,12 +1928,16 @@ fn common_base_branches(views: &[MemberView], active: &[usize]) -> Option<Common
         return None;
     }
     let common_index = versions.iter().position(|version| {
-        let common = lines(version[0]).expect("active members have readable content");
+        let Some(common) = lines(version[0]) else {
+            return false;
+        };
         versions
             .iter()
             .filter(|other| *other != version)
             .all(|other| {
-                let branch = lines(other[0]).expect("active members have readable content");
+                let Some(branch) = lines(other[0]) else {
+                    return false;
+                };
                 branch.len() > common.len() && branch.starts_with(common)
             })
     })?;
@@ -1640,8 +1945,9 @@ fn common_base_branches(views: &[MemberView], active: &[usize]) -> Option<Common
     // Each remaining version must be independently advanced from the shared snapshot.
     if versions.iter().enumerate().any(|(index, branch)| {
         versions.iter().skip(index + 1).any(|other| {
-            let left = lines(branch[0]).expect("active members have readable content");
-            let right = lines(other[0]).expect("active members have readable content");
+            let (Some(left), Some(right)) = (lines(branch[0]), lines(other[0])) else {
+                return false;
+            };
             left.starts_with(right) || right.starts_with(left)
         })
     }) {
@@ -1707,6 +2013,10 @@ fn aggregate_group_state(
             MemberState::Superseded => {
                 view.version_status = "superseded";
                 view.reason = "该副本已被更新成员替代".to_string();
+            }
+            MemberState::Active if !view.writeable => {
+                view.version_status = "stale";
+                view.reason = "目标会话已在客户端删除或归属异常，无法写入".to_string();
             }
             MemberState::Active => match &view.content {
                 ContentState::Missing => {
@@ -1793,51 +2103,50 @@ fn member_snapshot(
     group: &LinkGroup,
     member: &LinkMember,
     cache: &mut HashMap<(String, String), Vec<Value>>,
-) -> (String, String, i64, ContentState) {
+    read_content: bool,
+) -> MemberSnapshot {
     match client {
         SessionClient::Workbuddy => {
             let variant = session_link::member_variant(group, member);
-            let rows = cache
-                .entry((variant.as_str().to_string(), member.uid.clone()))
-                .or_insert_with(|| {
-                    session::list_sessions_for_user(variant, &member.uid)
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                });
-            let row = rows.iter().find(|row| {
-                row.get("id").and_then(Value::as_str) == Some(member.session_id.as_str())
-            });
+            // 只查当前 sessionId，避免列出该账号全部会话（真实数据下单次要扫上千条）。
+            let row = session::session_row_for_user(variant, &member.uid, &member.session_id);
             let title = row
+                .as_ref()
                 .and_then(|row| row.get("title"))
                 .and_then(Value::as_str)
                 .unwrap_or("会话标题暂不可用")
                 .to_string();
             let cwd = row
+                .as_ref()
                 .and_then(|row| row.get("cwd"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let project = basename(cwd);
             let updated_at = row
+                .as_ref()
                 .and_then(|row| row.get("updatedAt"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
             let member_paths = SessionPaths::for_variant(variant);
-            let content = if row.is_none() {
-                ContentState::Missing
+            // DB 行可能已被软删除，但 jsonl 正文仍在（历史副本/归档）。
+            // 只要正文可读就按可读处理，不能仅因 DB 行缺失就误报“内容缺失”。
+            let content = if !read_content {
+                ContentState::Unavailable("旧副本不参与内容校验".to_string())
             } else {
-                session::member_content_state(&member_paths, &member.session_id)
+                // WorkBuddy 详情只需要摘要做判定；正文预览单独读文件尾部。
+                session::member_content_summary(&member_paths, &member.session_id)
             };
-            (
+            MemberSnapshot {
                 title,
-                if project.is_empty() {
+                project_label: if project.is_empty() {
                     String::new()
                 } else {
                     format!("项目 {project}")
                 },
                 updated_at,
                 content,
-            )
+                writeable: row.is_some(),
+            }
         }
         SessionClient::CodebuddyIde | SessionClient::VscodeExt => {
             let variant = session_link::member_variant(group, member);
@@ -1847,7 +2156,10 @@ fn member_snapshot(
                     let Some(root) = root.as_ref() else {
                         return Vec::new();
                     };
-                    vscode_session::list_sessions_in_store(spec.unwrap(), root, &member.uid)
+                    let Some(spec) = spec else {
+                        return Vec::new();
+                    };
+                    vscode_session::list_sessions_in_store(spec, root, &member.uid)
                         .get("sessions")
                         .and_then(Value::as_array)
                         .cloned()
@@ -1874,18 +2186,28 @@ fn member_snapshot(
                 .and_then(|row| row.get("updatedAt"))
                 .and_then(Value::as_i64)
                 .unwrap_or(0);
-            let content = match (root.as_ref(), spec) {
-                (Some(root), Some(spec)) => vscode_session_sync::session_location_and_content(
-                    spec,
-                    root,
-                    &member.uid,
-                    &member.session_id,
-                )
-                .map(|(_, _, content)| content)
-                .unwrap_or(ContentState::Missing),
-                _ => ContentState::Unavailable("未找到客户端会话数据目录".to_string()),
+            let content = if !read_content {
+                ContentState::Unavailable("旧副本不参与内容校验".to_string())
+            } else {
+                match (root.as_ref(), spec) {
+                    (Some(root), Some(spec)) => vscode_session_sync::session_location_and_content(
+                        spec,
+                        root,
+                        &member.uid,
+                        &member.session_id,
+                    )
+                    .map(|(_, _, content)| content)
+                    .unwrap_or(ContentState::Missing),
+                    _ => ContentState::Unavailable("未找到客户端会话数据目录".to_string()),
+                }
             };
-            (title, project, updated_at, content)
+            MemberSnapshot {
+                title,
+                project_label: project,
+                updated_at,
+                content,
+                writeable: row.is_some(),
+            }
         }
     }
 }
@@ -1921,6 +2243,82 @@ fn content_count(content: &ContentState) -> Option<usize> {
         ContentState::Ready(snapshot) => Some(snapshot.normalized.record_count),
         _ => None,
     }
+}
+
+/// 详情页正文预览：WorkBuddy 走“文件尾部只读”，IDE 仍用已读内容。
+fn preview_for_view(client: SessionClient, group: &LinkGroup, view: &MemberView) -> Vec<Value> {
+    if client != SessionClient::Workbuddy {
+        return content_preview(&view.content);
+    }
+    let variant = session_link::member_variant(group, &view.member);
+    tail_preview(&SessionPaths::for_variant(variant), &view.member.session_id)
+}
+
+/// 只读文件尾部 256KB，取最近 6 条可展示记录；不加载整份正文。
+fn tail_preview(paths: &SessionPaths, session_id: &str) -> Vec<Value> {
+    const INITIAL_WINDOW: u64 = 256 * 1024;
+    const MAX_WINDOW: u64 = 4 * 1024 * 1024;
+    let Some(path) = session::find_project_jsonl(paths, session_id) else {
+        return Vec::new();
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Vec::new();
+    };
+    let len = meta.len();
+    let mut window = INITIAL_WINDOW;
+    loop {
+        let start = len.saturating_sub(window);
+        let recent = read_tail_records(&path, start);
+        // 长消息可能让 256KB 尾巴不足 6 条；逐步扩大窗口，最多 4MB。
+        if recent.len() >= 6 || start == 0 || window >= MAX_WINDOW {
+            return recent;
+        }
+        window = (window * 2).min(MAX_WINDOW);
+    }
+}
+
+fn read_tail_records(path: &Path, start: u64) -> Vec<Value> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if start > 0 {
+        // 丢掉从中间截断的第一行，避免把半条 JSON 当作记录。
+        lines.remove(0);
+    }
+    let mut recent = lines
+        .iter()
+        .rev()
+        .filter_map(|line| {
+            let record: Value = serde_json::from_str(line.trim()).ok()?;
+            let text = record_text(&record)?;
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let speaker = match record
+                .get("role")
+                .or_else(|| record.get("type"))
+                .and_then(Value::as_str)
+            {
+                Some("user") => "用户",
+                Some("assistant") => "助手",
+                _ => "记录",
+            };
+            Some(json!({ "speaker": speaker, "text": text.chars().take(240).collect::<String>() }))
+        })
+        .take(6)
+        .collect::<Vec<_>>();
+    recent.reverse();
+    recent
 }
 
 fn content_preview(content: &ContentState) -> Vec<Value> {
@@ -2168,6 +2566,12 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("暂不支持新增关联会话"), "{error}");
 
+        // CodeBuddy IDE 已接入，空勾选应走到参数校验而不是“暂不支持”。
+        let error =
+            copy_linked_sessions(SessionClient::CodebuddyIde, "source", "target", &[], false)
+                .unwrap_err();
+        assert!(error.contains("缺少要复制的会话"), "{error}");
+
         // 空勾选：直接拒绝。
         let error = copy_linked_sessions(SessionClient::VscodeExt, "source", "target", &[], false)
             .unwrap_err();
@@ -2218,6 +2622,7 @@ mod tests {
             project_label: String::new(),
             updated_at: 0,
             content,
+            writeable: true,
             reason: String::new(),
             version_status: "unknown",
         }
@@ -2355,6 +2760,61 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn tail_preview_expands_window_for_long_records() {
+        let store = TempStore::new("tail-long");
+        let project = store.paths.projects_dir().join("ws-long");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut body = String::new();
+        for index in 0..8 {
+            let text = format!("msg-{index}-{}", "x".repeat(50_000));
+            body.push_str(
+                &json!({"type": "user", "sessionId": "session", "text": text}).to_string(),
+            );
+            body.push('\n');
+        }
+        std::fs::write(project.join("session.jsonl"), body).unwrap();
+
+        let preview = tail_preview(&store.paths, "session");
+        assert_eq!(preview.len(), 6, "长记录时也必须尽量补足最近 6 条");
+        assert!(preview[5]["text"].as_str().unwrap().contains("msg-7-"));
+    }
+
+    #[test]
+    #[ignore = "读取本机真实关联数据，手动运行"]
+    fn real_workbuddy_detail_timing() {
+        let list = super::list(SessionClient::Workbuddy, None).expect("list real data");
+        let group = list["groups"]
+            .as_array()
+            .and_then(|groups| {
+                groups
+                    .iter()
+                    .max_by_key(|group| group["memberCount"].as_u64())
+            })
+            .expect("at least one group");
+        let group_id = group["groupId"].as_str().expect("group id").to_string();
+        let started = std::time::Instant::now();
+        let detail = super::detail(SessionClient::Workbuddy, None, &group_id).expect("detail");
+        println!(
+            "real detail: members={} elapsed={:?}",
+            detail["members"].as_array().map(Vec::len).unwrap_or(0),
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    #[ignore = "读取本机真实关联数据，手动运行"]
+    fn real_workbuddy_list_timing() {
+        let started = std::time::Instant::now();
+        let report = super::list(SessionClient::Workbuddy, None).expect("list real data");
+        let elapsed = started.elapsed();
+        println!(
+            "real list: groups={} elapsed={:?}",
+            report["groups"].as_array().map(Vec::len).unwrap_or(0),
+            elapsed
+        );
     }
 
     fn stored_member(member_id: &str, uid: &str, state: MemberState) -> LinkMember {
@@ -2708,6 +3168,93 @@ mod tests {
         assert_eq!(views[1].version_status, "latest");
         assert_eq!(views[2].version_status, "behind");
         assert_eq!(summary, "behind");
+    }
+
+    #[test]
+    fn lightweight_thresholds_cover_single_and_total_limits() {
+        assert!(!list_needs_lightweight_from_sizes([]));
+        assert!(!list_needs_lightweight_from_sizes([31 * 1024 * 1024]));
+        assert!(list_needs_lightweight_from_sizes([33 * 1024 * 1024]));
+        assert!(!list_needs_lightweight_from_sizes([30 * 1024 * 1024; 8]));
+        assert!(list_needs_lightweight_from_sizes([30 * 1024 * 1024; 9]));
+    }
+
+    #[test]
+    fn summary_handles_zero_and_single_active_copies_without_faking_latest() {
+        let stale = member_view(
+            "old",
+            "account-old",
+            MemberState::Stale,
+            ready_content("old"),
+        );
+
+        let views = vec![stale];
+        let active = active_indexes(&views);
+        let (source, status, text) = resolve_group_summary(&active, &views, None, "unknown");
+        assert_eq!(source, None);
+        assert_eq!(status, "missing");
+        assert_eq!(text.as_deref(), Some("无有效副本"));
+
+        let mut views = vec![member_view(
+            "only",
+            "account-only",
+            MemberState::Active,
+            ready_content("only"),
+        )];
+        let active = active_indexes(&views);
+        let (source, status, text) = resolve_group_summary(&active, &views, None, "unknown");
+        assert_eq!(source, Some(0));
+        assert_eq!(status, "single");
+        assert_eq!(text.as_deref(), Some("仅一个副本"));
+
+        views[0].writeable = false;
+        let (source, status, text) = resolve_group_summary(&active, &views, None, "unknown");
+        assert_eq!(source, None);
+        assert_eq!(status, "unknown");
+        assert_eq!(text.as_deref(), Some("唯一副本不可写，无法同步"));
+        views[0].writeable = true;
+
+        views[0].content = ContentState::Missing;
+        let (source, status, text) = resolve_group_summary(&active, &views, None, "unknown");
+        assert_eq!(source, None);
+        assert_eq!(status, "missing");
+        assert_eq!(text.as_deref(), Some("唯一副本内容缺失"));
+
+        views[0].content =
+            ContentState::Unavailable("会话文件过大（40 MB），已跳过内容校验".to_string());
+        let (source, status, text) = resolve_group_summary(&active, &views, None, "unknown");
+        assert_eq!(source, None);
+        assert_eq!(status, "single");
+        assert_eq!(text.as_deref(), Some("仅一个副本（未校验）"));
+    }
+
+    #[test]
+    fn aggregate_marks_non_writeable_active_member_stale_instead_of_behind() {
+        let mut views = vec![
+            member_view(
+                "source",
+                "account-a",
+                MemberState::Active,
+                ready_content("a"),
+            ),
+            member_view(
+                "ghost",
+                "account-b",
+                MemberState::Active,
+                ready_content("b"),
+            ),
+        ];
+        views[1].writeable = false;
+        let mut matrix = HashMap::new();
+        pair(&mut matrix, 0, 1, SyncVerdict::FastForward);
+        pair(&mut matrix, 1, 0, SyncVerdict::Ahead);
+
+        let active = active_indexes(&views);
+        let (_, summary) = aggregate_group_state(&mut views, &active, &matrix);
+
+        assert_eq!(summary, "latest");
+        assert_eq!(views[1].version_status, "stale");
+        assert!(views[1].reason.contains("无法写入"));
     }
 
     #[test]

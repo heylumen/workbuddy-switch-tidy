@@ -172,7 +172,9 @@ pub fn record_snapshot(
     }
 
     let at_ms = now_ms();
-    let _guard = SNAPSHOT_WRITE_LOCK.lock().unwrap();
+    let _guard = SNAPSHOT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let snapshots = load_snapshots();
     if should_suppress_duplicate(&snapshots, account_id, total, remaining, at_ms) {
         return false;

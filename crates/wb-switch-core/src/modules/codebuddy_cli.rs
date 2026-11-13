@@ -1504,6 +1504,7 @@ pub fn switch_active_account(account_id: &str) -> Result<Value, String> {
         }
     }
 
+    account::touch_last_used(&canonical_id);
     let region_changed = previous_variant != Some(variant);
 
     Ok(json!({

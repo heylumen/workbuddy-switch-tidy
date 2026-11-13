@@ -1,15 +1,17 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { BrowserRouter, HashRouter, Navigate, NavLink, Outlet, Route, Routes } from "react-router-dom";
 import { ArrowUp, Link2, Loader2, MessagesSquare, Settings, Sparkles, Timer, User } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import AccountsPage from "@/pages/AccountsPage";
-import SessionsPage from "@/pages/SessionsPage";
-import CreditStatsPage from "@/pages/CreditStatsPage";
 import LimitsPage from "@/pages/LimitsPage";
-import TokenStatsPage from "@/pages/TokenStatsPage";
-import SettingsPage from "@/pages/SettingsPage";
+
+// 重型页面按需加载：不在启动时把图表/统计/会话管理全部载入 WebView。
+const SessionsPage = lazy(() => import("@/pages/SessionsPage"));
+const CreditStatsPage = lazy(() => import("@/pages/CreditStatsPage"));
+const TokenStatsPage = lazy(() => import("@/pages/TokenStatsPage"));
+const SettingsPage = lazy(() => import("@/pages/SettingsPage"));
 import { StatusDot, AppIconMark } from "@/components/product-marks";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { Badge } from "@/components/ui/badge";
@@ -29,26 +31,17 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
   const snapshot = useUpdateState();
   const [dialogOpen, setDialogOpen] = useState(false);
 
-  // 阶段由 Rust 更新服务经 `update-state` 推送（托盘同源），前端不再轮询检查。
-  // 已知目标版本时，检查中 / 失败也要保留入口，与托盘「升级到 vX / 点击重试」对齐。
+  // 单文件版只检查版本并打开发布页，不在应用内下载或安装。
   const hasKnownTarget = Boolean(snapshot.latest);
   const hasUpdate =
     snapshot.phase === "available" ||
-    snapshot.phase === "downloading" ||
-    snapshot.phase === "readyToRestart" ||
     (hasKnownTarget && (snapshot.phase === "error" || snapshot.phase === "checking"));
   const updateHint =
-    snapshot.phase === "downloading"
-      ? snapshot.percent === null
-        ? "正在下载更新…"
-        : `正在下载更新 ${snapshot.percent}%`
-      : snapshot.phase === "readyToRestart"
-        ? "重启以完成升级"
-        : snapshot.phase === "error"
-          ? "更新失败，点击重试"
-          : snapshot.phase === "checking"
-            ? "正在检查…"
-            : "更新";
+    snapshot.phase === "checking"
+      ? "正在检查…"
+      : snapshot.phase === "error"
+        ? "更新检查失败，打开发布页"
+        : "发现新版本，打开发布页";
 
   return (
     <>
@@ -68,7 +61,7 @@ function UpdateCenter({ running }: { running: boolean | undefined }) {
                     aria-label={updateHint}
                     onClick={() => setDialogOpen(true)}
                   >
-                    {snapshot.phase === "downloading" || snapshot.phase === "checking" ? (
+                    {snapshot.phase === "checking" ? (
                       <Loader2 className="size-3 animate-spin" strokeWidth={2.5} aria-hidden="true" />
                     ) : (
                       <ArrowUp className="size-3" strokeWidth={2.5} aria-hidden="true" />
@@ -213,7 +206,16 @@ function Layout() {
           hasUnifiedTitleBar && "pt-16 [&>div]:pt-4",
         )}
       >
-        <Outlet />
+        <Suspense
+          fallback={
+            <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground" role="status">
+              <Loader2 className="mr-2 size-4 animate-spin" />
+              正在加载…
+            </div>
+          }
+        >
+          <Outlet />
+        </Suspense>
       </main>
     </div>
   );

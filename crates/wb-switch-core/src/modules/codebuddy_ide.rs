@@ -1112,6 +1112,7 @@ pub(crate) fn inject_session_and_finish(
     })?;
 
     set_active_account_id(account_id)?;
+    account::touch_last_used(account_id);
 
     if restart {
         eprintln!("[codebuddy-ide] launching CodeBuddy…");

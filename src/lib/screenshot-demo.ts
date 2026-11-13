@@ -805,6 +805,26 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       return { ...appStatus, variant };
     }
     case "get_accounts": return { accounts: demoAccounts };
+    case "get_jetbrains_status": return {
+      installed: true,
+      pluginInstalled: true,
+      running: false,
+      loggedIn: true,
+      configRoot: "/demo/JetBrains",
+      configRoots: ["/demo/JetBrains"],
+      targets: [{
+        configDir: "IntelliJIdea2026.1",
+        product: "IntelliJ IDEA 2026.1",
+        pluginInstalled: true,
+        running: false,
+        loggedIn: true,
+        secretPath: "/demo/JetBrains/IntelliJIdea2026.1/options/secret-storage.xml",
+      }],
+      activeAccountId: activeAccount.id,
+      activeAccountName: activeAccount.nickname,
+      detectedFrom: "settings",
+      statePath: "/demo/jetbrains-state.json",
+    };
     // 会话管理页：按账号返回演示会话；国际版账号给一套不同 cwd，混排时可见档位差异。
     case "list_account_sessions": {
       const account = demoAccounts.find((item) => item.id === args?.accountId) ?? demoAccounts[0];
@@ -962,6 +982,13 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));
     case "get_credit_statistics": return buildStatistics();
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
+    case "get_token_requests": return {
+      generatedAt: Date.now(),
+      rangeDays: typeof args?.days === "number" ? args.days : null,
+      requests: demoTokenRequests(1),
+      filesScanned: 1,
+      parseErrors: 0,
+    };
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));

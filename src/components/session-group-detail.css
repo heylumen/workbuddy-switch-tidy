@@ -9,7 +9,7 @@
 }
 .session-detail-modal .session-relationship { height: auto; max-height: calc(var(--session-detail-max-height) - 2px); }
 .session-detail-modal [data-detail-scroll] { scrollbar-gutter: stable; }
-.session-relationship { container-type: inline-size; --relationship-line: color-mix(in srgb, var(--brand) 85%, var(--border)); }
+.session-relationship { container-type: inline-size; --relationship-line: var(--brand); }
 .relationship-graph { position: relative; min-width: 0; }
 .relationship-connections { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
 .relationship-connections g { color: var(--relationship-line); }
@@ -27,9 +27,14 @@
 .relationship-branch[data-branch-index="2"] { --branch-color: var(--chart-1); }
 .relationship-branch[data-branch-index="3"] { --branch-color: var(--chart-5); }
 .relationship-branch[data-branch-index="4"] { --branch-color: var(--chart-4); }
-.relationship-branch [data-branch-badge] { border-color: color-mix(in srgb, var(--branch-color) 40%, transparent); background: color-mix(in srgb, var(--branch-color) 10%, transparent); color: var(--branch-color); }
+.relationship-branch [data-branch-badge] { border-color: var(--branch-color); background: transparent; color: var(--branch-color); }
 .relationship-members { position: relative; display: grid; grid-template-columns: minmax(0,1fr) 118px minmax(0,1fr); row-gap: 10px; padding: 0; margin: 0; list-style: none; }
-.relationship-root { position: absolute; z-index: 1; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 96px; min-height: 112px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 7px; border: 1px solid var(--brand); border-radius: 12px; background: var(--card); text-align: center; box-shadow: 0 6px 24px color-mix(in srgb,var(--brand) 8%,transparent); }
+.relationship-root { position: absolute; z-index: 1; left: 50%; top: 50%; transform: translate(-50%,-50%); width: 96px; min-height: 112px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 7px; border: 1px solid var(--brand); border-radius: 12px; background: var(--card); text-align: center; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12); }
+@supports (color: color-mix(in srgb, red, blue)) {
+  .session-relationship { --relationship-line: color-mix(in srgb, var(--brand) 85%, var(--border)); }
+  .relationship-branch [data-branch-badge] { border-color: color-mix(in srgb, var(--branch-color) 40%, transparent); background: color-mix(in srgb, var(--branch-color) 10%, transparent); }
+  .relationship-root { box-shadow: 0 6px 24px color-mix(in srgb,var(--brand) 8%,transparent); }
+}
 .relationship-branch { min-width: 0; align-self: center; }
 .relationship-branch article { height: 100%; }
 @media (max-width: 760px), (max-height: 580px) {

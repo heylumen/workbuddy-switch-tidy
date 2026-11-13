@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Info, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, Eraser, Layers } from "lucide-react";
+import { ArrowRight, CalendarCheck2, CalendarDays, CalendarOff, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Info, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2, Eraser, Layers, Search } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -23,7 +23,16 @@ import { accountIdentity, displayName } from "@/lib/account-display";
 import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, TravelStatus } from "@/lib/types";
+import { formatFullDateTime } from "@/lib/format-time";
+import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateAuditGroup, SessionDuplicateAuditSession, SessionDuplicateHideRecord, SessionDuplicateKind, TravelStatus } from "@/lib/types";
+
+const AUDIT_KIND_LABEL: Record<SessionDuplicateKind, string> = {
+  exact: "精确重复",
+  fastForward: "快进副本",
+  divergent: "同名分叉",
+  independent: "独立同名",
+  unavailable: "无法判断",
+};
 
 function formatCredits(value: number): string {
   if (!Number.isFinite(value)) return "—";
@@ -38,19 +47,6 @@ function formatCreditExpiry(ts: number | null): string {
   const hh = String(date.getHours()).padStart(2, "0");
   const mm = String(date.getMinutes()).padStart(2, "0");
   return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} ${hh}:${mm}`;
-}
-
-function formatFullDateTime(ts: number | null): string {
-  if (!ts) return "—";
-  const date = new Date(ts);
-  if (Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleString("zh-CN", {
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
 }
 
 function formatCreditUpdatedAt(ts: number | undefined): string {
@@ -265,7 +261,7 @@ interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
   onCheckin?: (a: AccountMeta) => void;
-  onRefresh?: (a: AccountMeta) => void;
+  onRefresh?: (a: AccountMeta) => void | Promise<void>;
   /** 打开「账号信息」弹框（查看信息、编辑备注、选择显示字段）。 */
   onShowInfo?: (a: AccountMeta) => void;
   onSwitch?: (a: AccountMeta) => void;
@@ -415,10 +411,22 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
 export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInfo, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, jetbrainsInstalled, jetbrainsPluginInstalled, jetbrainsAvailable, jetbrainsActive, jetbrainsBusy, jetbrainsLoading, onSwitchJetbrains, enabledTools, featuresDisabled = true, compact = false }: Props) {
   /** 支持工具开关：关闭的端整块不渲染（缺省视为开启）。 */
   const toolEnabled = (id: ToolId) => enabledTools?.[id] !== false;
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [auditReport, setAuditReport] = useState<SessionDuplicateAudit | null>(null);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [hideTarget, setHideTarget] = useState<{ group: SessionDuplicateAuditGroup; keep: SessionDuplicateAuditSession } | null>(null);
+  const [hideBusy, setHideBusy] = useState(false);
+  const [hideError, setHideError] = useState<string | null>(null);
+  const [hides, setHides] = useState<SessionDuplicateHideRecord[]>([]);
+  const [restoreBusy, setRestoreBusy] = useState<string | null>(null);
   const [dedupOpen, setDedupOpen] = useState(false);
   const [dedupBusy, setDedupBusy] = useState(false);
+  const [dedupResult, setDedupResult] = useState<string | null>(null);
   const [collapseOpen, setCollapseOpen] = useState(false);
   const [collapseBusy, setCollapseBusy] = useState(false);
+  const [collapseResult, setCollapseResult] = useState<string | null>(null);
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   /**
@@ -489,6 +497,85 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
     </>
   );
 
+  async function loadAudit() {
+    setAuditOpen(true);
+    setAuditError(null);
+    setAuditReport(null);
+    setAuditBusy(true);
+    try {
+      const [report, hidden] = await Promise.all([
+        api.auditSessionDuplicates(account.id),
+        api.listDuplicateHides(account.id),
+      ]);
+      setAuditReport(report);
+      setHides(hidden.hides ?? []);
+    } catch (e) {
+      setAuditError(api.asError(e));
+    } finally {
+      setAuditBusy(false);
+    }
+  }
+
+  async function confirmHide() {
+    if (!hideTarget) return;
+    setHideBusy(true);
+    setHideError(null);
+    try {
+      const result = await api.hideDuplicateGroup(
+        account.id,
+        hideTarget.group.cwd,
+        hideTarget.group.title,
+        hideTarget.keep.sessionId,
+        true,
+      );
+      if (!result.ok) {
+        setHideError(result.reason || "软隐藏失败");
+        return;
+      }
+      if (result.restoreRecordSaved === false) {
+        toast.warning("已软隐藏，但恢复记录保存失败", {
+          description: result.restoreRecordError || "请使用备份文件恢复",
+        });
+      } else {
+        toast.success(
+          result.hidden
+            ? `已软隐藏 ${result.hidden} 个别名（正文保留）`
+            : "没有可隐藏的别名",
+          { description: [result.unlinked ? `${result.unlinked} 个关联副本已标记 stale` : result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : "", result.backup ? `备份：${result.backup}` : ""].filter(Boolean).join(" · ") || undefined },
+        );
+      }
+      setHideTarget(null);
+      await loadAudit();
+    } catch (e) {
+      setHideError(api.asError(e));
+    } finally {
+      setHideBusy(false);
+    }
+  }
+
+  async function restoreHide(hideId: string) {
+    setRestoreBusy(hideId);
+    try {
+      const result = await api.restoreDuplicateHide(account.id, hideId);
+      if (!result.ok) {
+        toast.error("恢复失败", { description: result.reason || "未知错误" });
+        return;
+      }
+      if (result.journalError) {
+        toast.warning("会话已恢复，但隐藏记录清理失败", { description: result.journalError });
+      } else {
+        toast.success(`已恢复 ${result.restored ?? 0} 个会话`, {
+          description: [result.reactivated ? `${result.reactivated} 个关联已重新激活` : "", result.backup ? `备份：${result.backup}` : ""].filter(Boolean).join(" · ") || undefined,
+        });
+      }
+      await loadAudit();
+    } catch (e) {
+      toast.error("恢复失败", { description: api.asError(e) });
+    } finally {
+      setRestoreBusy(null);
+    }
+  }
+
   return (
     <TooltipProvider>
       <article className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
@@ -555,8 +642,20 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-40">
               {!demoModeEnabled && (
-                <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
-                  <RefreshCw />刷新 Token
+                <DropdownMenuItem
+                  disabled={featuresDisabled || !onRefresh || refreshBusy}
+                  onSelect={async () => {
+                    if (!onRefresh || refreshBusy) return;
+                    setRefreshBusy(true);
+                    try {
+                      await onRefresh(account);
+                    } finally {
+                      setRefreshBusy(false);
+                    }
+                  }}
+                >
+                  {refreshBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  {refreshBusy ? "刷新中…" : "刷新 Token"}
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem disabled={featuresDisabled || !onShowInfo} onSelect={() => onShowInfo?.(account)}>
@@ -570,11 +669,8 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               {!demoModeEnabled && (
                 <>
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setDedupOpen(true)}>
-                  <Eraser />清理重复会话
-                </DropdownMenuItem>
-                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => setCollapseOpen(true)}>
-                  <Layers />折叠同名会话
+                <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => void loadAudit()}>
+                  <Search />重复审计
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
@@ -930,7 +1026,19 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
             </p>
             <p>被清理的重复会话会被软删除（标记 deleted_at），不会从云端移除目标账号的已有副本。</p>
           </div>
+          {dedupResult && (
+            <div className={cn(
+              "rounded-md border p-3 text-sm",
+              dedupResult.startsWith("清理失败") ? "border-destructive/30 bg-destructive/5 text-destructive" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-800",
+            )}>
+              {dedupResult}
+            </div>
+          )}
           <DialogFooter className="gap-2">
+            {dedupResult ? (
+              <Button onClick={() => setDedupOpen(false)}>关闭</Button>
+            ) : (
+              <>
             <Button variant="outline" onClick={() => setDedupOpen(false)} disabled={dedupBusy}>
               取消
             </Button>
@@ -938,24 +1046,29 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               disabled={dedupBusy}
               onClick={async () => {
                 setDedupBusy(true);
+                const toastId = toast.loading("正在清理重复会话", { description: name });
                 try {
                   const res = await api.dedupSessions(account.id);
                   if (res.ok) {
-                    toast.success(`已清理 ${res.removed} 个重复会话`, { description: name });
+                    setDedupResult(`已清理 ${res.removed} 个重复会话`);
+                    toast.success(`已清理 ${res.removed} 个重复会话`, { id: toastId, description: name });
                   } else {
-                    toast.error("清理失败", { description: res.reason || "未知错误" });
+                    setDedupResult(`清理失败：${res.reason || "未知错误"}`);
+                    toast.error("清理失败", { id: toastId, description: res.reason || "未知错误" });
                   }
                 } catch (e) {
-                  toast.error("清理失败", { description: api.asError(e) });
+                  setDedupResult(`清理失败：${api.asError(e)}`);
+                  toast.error("清理失败", { id: toastId, description: api.asError(e) });
                 } finally {
                   setDedupBusy(false);
-                  setDedupOpen(false);
                 }
               }}
             >
               {dedupBusy ? <Loader2 className="size-4 animate-spin" /> : <Eraser className="size-4" />}
               {dedupBusy ? "清理中…" : "确认清理"}
             </Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -981,7 +1094,19 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               <strong className="text-foreground">执行前请关闭 WorkBuddy 本体</strong>，否则数据库可能被占用导致失败。
             </p>
           </div>
+          {collapseResult && (
+            <div className={cn(
+              "rounded-md border p-3 text-sm",
+              collapseResult.startsWith("折叠失败") ? "border-destructive/30 bg-destructive/5 text-destructive" : "border-emerald-500/30 bg-emerald-500/10 text-emerald-800",
+            )}>
+              {collapseResult}
+            </div>
+          )}
           <DialogFooter className="gap-2">
+            {collapseResult ? (
+              <Button onClick={() => setCollapseOpen(false)}>关闭</Button>
+            ) : (
+              <>
             <Button variant="outline" onClick={() => setCollapseOpen(false)} disabled={collapseBusy}>
               取消
             </Button>
@@ -989,23 +1114,175 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
               disabled={collapseBusy}
               onClick={async () => {
                 setCollapseBusy(true);
+                const toastId = toast.loading("正在折叠同名会话", { description: name });
                 try {
                   const res = await api.collapseSessions(account.id);
                   if (res.ok) {
-                    toast.success(`已折叠 ${res.removed} 个冗余会话（数据已保留）`, { description: name });
+                    setCollapseResult(`已折叠 ${res.removed} 个冗余会话（数据已保留）`);
+                    toast.success(`已折叠 ${res.removed} 个冗余会话（数据已保留）`, { id: toastId, description: name });
                   } else {
-                    toast.error("折叠失败", { description: res.reason || "未知错误" });
+                    setCollapseResult(`折叠失败：${res.reason || "未知错误"}`);
+                    toast.error("折叠失败", { id: toastId, description: res.reason || "未知错误" });
                   }
                 } catch (e) {
-                  toast.error("折叠失败", { description: api.asError(e) });
+                  setCollapseResult(`折叠失败：${api.asError(e)}`);
+                  toast.error("折叠失败", { id: toastId, description: api.asError(e) });
                 } finally {
                   setCollapseBusy(false);
-                  setCollapseOpen(false);
                 }
               }}
             >
               {collapseBusy ? <Loader2 className="size-4 animate-spin" /> : <Layers className="size-4" />}
               {collapseBusy ? "折叠中…" : "确认折叠"}
+            </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={auditOpen} onOpenChange={setAuditOpen}>
+        <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>重复审计</DialogTitle>
+            <DialogDescription>
+              {name} · 审计报告只读；选择保留项确认后才会写入数据库
+            </DialogDescription>
+          </DialogHeader>
+          {auditBusy && (
+            <div className="flex items-center gap-2 rounded-md bg-muted/50 p-3 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" />
+              正在按消息序列分析同名会话…
+            </div>
+          )}
+          {auditError && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              审计失败：{auditError}
+            </div>
+          )}
+          {auditReport && !auditReport.ok && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              审计失败：{auditReport.reason || "未知错误"}
+            </div>
+          )}
+          {auditReport?.ok && (
+            <div className="space-y-3 text-sm">
+              <div className="flex flex-wrap gap-2">
+                {(["exact", "fastForward", "divergent", "independent", "unavailable"] as const).map((kind) => (
+                  <Badge key={kind} variant="secondary" className="gap-1">
+                    {AUDIT_KIND_LABEL[kind]}
+                    <span className="tabular-nums">{auditReport.summary[kind]}</span>
+                  </Badge>
+                ))}
+              </div>
+              {auditReport.groups.length === 0 ? (
+                <p className="rounded-md border border-dashed p-4 text-muted-foreground">没有发现同账号同工作区同标题的候选组。</p>
+              ) : (
+                <div className="space-y-2">
+                  {auditReport.groups.slice(0, 50).map((group) => (
+                    <div key={`${group.cwd}:${group.title}`} className="rounded-md border p-3">
+                      <div className="flex min-w-0 items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="truncate font-medium">{group.title}</div>
+                          <div className="mt-1 truncate text-xs text-muted-foreground" title={group.cwd}>{group.cwd}</div>
+                          {typeof group.commonPrefix === "number" && group.commonPrefix > 0 && (
+                            <div className="mt-1 text-xs text-muted-foreground">公共前缀 {group.commonPrefix} 条消息</div>
+                          )}
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <Badge variant="outline">{AUDIT_KIND_LABEL[group.kind]}</Badge>
+                          <span className="text-xs tabular-nums text-muted-foreground">{group.count} 条</span>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-muted-foreground">
+                        建议：{group.suggested === "keep-newest" ? "保留最新" : group.suggested === "fast-forward-to-longest" ? "快进到最长副本" : "人工选择分支"}
+                      </div>
+                      {group.sessions.some((session) => session.linked) && (
+                        <p className="mt-1 text-xs text-amber-700">关联中的副本会先解除关联，再软隐藏；关联表会备份。</p>
+                      )}
+                      {(group.kind === "exact" || group.kind === "fastForward" || group.kind === "divergent") && (
+                        <div className="mt-2 space-y-1.5">
+                          {group.sessions.map((session) => {
+                            const fastForwardKeep = group.kind !== "fastForward" || session.sessionId === group.suggestedKeepSessionId;
+                            return (
+                              <div key={session.sessionId} className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-muted/30 px-2 py-1.5 text-xs">
+                                <span className="min-w-0 truncate font-mono text-muted-foreground">
+                                  {session.sessionId.slice(0, 8)} · {session.records ?? "?"} 条 · {formatFullDateTime(session.updatedAt)}
+                                </span>
+                                <Button
+                                  size="sm"
+                                  variant={fastForwardKeep ? "default" : "outline"}
+                                  disabled={!fastForwardKeep}
+                                  title={session.linked ? "将先解除关联，再软隐藏其他副本" : undefined}
+                                  onClick={() => {
+                                    setHideError(null);
+                                    setAuditOpen(false);
+                                    setHideTarget({ group, keep: session });
+                                  }}
+                                >
+                                  {session.linked ? "解除关联并保留" : fastForwardKeep && group.kind === "fastForward" ? "保留最长" : "保留此条"}
+                                </Button>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                  {auditReport.groups.length > 50 && <p className="text-xs text-muted-foreground">仅显示前 50 组，共 {auditReport.groups.length} 组。</p>}
+                </div>
+              )}
+              {hides.length > 0 && (
+                <div className="space-y-2 border-t pt-3">
+                  <div className="text-xs font-medium text-muted-foreground">已软隐藏，尚未恢复（{hides.length} 组）</div>
+                  {hides.slice(0, 10).map((record) => (
+                    <div key={record.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border p-2 text-xs">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium">{record.title}</div>
+                        <div className="mt-0.5 truncate text-muted-foreground" title={record.backup}>
+                          {record.hiddenIds.length} 条已隐藏 · 备份：{record.backup}
+                        </div>
+                      </div>
+                      <Button size="sm" variant="outline" disabled={restoreBusy === record.id} onClick={() => void restoreHide(record.id)}>
+                        {restoreBusy === record.id ? "恢复中…" : "恢复"}
+                      </Button>
+                    </div>
+                  ))}
+                  {hides.length > 10 && <p className="text-xs text-muted-foreground">仅显示前 10 条恢复记录，共 {hides.length} 条。</p>}
+                </div>
+              )}
+            </div>
+          )}
+          <DialogFooter>
+            <Button onClick={() => setAuditOpen(false)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!hideTarget}
+        onOpenChange={(open) => {
+          if (!open && !hideBusy) {
+            setHideTarget(null);
+            setHideError(null);
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>软隐藏其他副本？</DialogTitle>
+            <DialogDescription>
+              {hideTarget ? `保留 ${hideTarget.group.title} 的 ${hideTarget.keep.sessionId.slice(0, 8)}；其余别名仅从数据库软隐藏，JSONL 正文保留，可恢复。关联中的副本会先解除关联，关联表已备份。` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          {hideError && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">{hideError}</div>
+          )}
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => { setHideTarget(null); setAuditOpen(true); }} disabled={hideBusy}>取消</Button>
+            <Button onClick={() => void confirmHide()} disabled={hideBusy}>
+              {hideBusy ? <Loader2 className="size-4 animate-spin" /> : null}
+              {hideBusy ? "处理中…" : "确认软隐藏"}
             </Button>
           </DialogFooter>
         </DialogContent>

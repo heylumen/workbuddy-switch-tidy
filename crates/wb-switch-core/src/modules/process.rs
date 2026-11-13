@@ -76,8 +76,9 @@ pub(crate) fn run_cmd_timeout(program: &str, args: &[&str], timeout_secs: u64) -
     }
     let out = out_reader.join().unwrap_or_default();
     let err = err_reader.join().unwrap_or_default();
+    let status = status?;
     Some(Output {
-        status: status.unwrap(),
+        status,
         stdout: out,
         stderr: err,
     })

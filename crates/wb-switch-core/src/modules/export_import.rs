@@ -95,7 +95,7 @@ fn merge_import_record(accounts: &mut Vec<Value>, item: &Value) -> MergeOutcome 
             // 本地展示字段（备注 / 显示选择）：备份未携带时保留本地值；
             // 备份自带则以备份为准（导入即恢复用户当时的展示配置）。
             if let Some(obj) = replaced.as_object_mut() {
-                for key in ["note", "displayField"] {
+                for key in ["note", "displayField", "lastUsedAt"] {
                     if !obj.contains_key(key) {
                         if let Some(v) = existing.get(key) {
                             obj.insert(key.to_string(), v.clone());
@@ -152,10 +152,12 @@ pub fn merge_import_records(
 
 /// 导入：读账号库 → 合并 → 写回，返回计数。
 pub fn import_accounts(text: &str, indexes: &[usize]) -> Result<ImportResult, String> {
-    let mut accounts = account::load_accounts();
-    let result = merge_import_records(&mut accounts, text, indexes)?;
-    account::save_accounts(&accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
-    Ok(result)
+    account::with_accounts_lock(|| {
+        let mut accounts = account::load_accounts_for_update()?;
+        let result = merge_import_records(&mut accounts, text, indexes)?;
+        account::save_accounts_unlocked(&accounts).map_err(|e| format!("保存账号库失败：{e}"))?;
+        Ok(result)
+    })
 }
 
 /// 纯函数：从账号列表中挑出 id 命中的完整记录（含 token）。

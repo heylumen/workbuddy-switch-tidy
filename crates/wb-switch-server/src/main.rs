@@ -12,7 +12,8 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update, variant::WbVariant,
+    account, auth_file, checkin, config, process, rotate, session, session_link, travel, update,
+    variant::WbVariant,
 };
 
 fn default_port() -> u16 {
@@ -132,10 +133,79 @@ async fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
     match cmd {
         "status" => print_status(variant_arg(&args)),
+        "repair-links" => repair_links(),
+        "audit-duplicates" => audit_duplicates(&args),
         "version" | "--version" | "-V" => {
             println!("workbuddy-switch {}", env!("CARGO_PKG_VERSION"));
         }
         _ => serve(&args).await,
+    }
+}
+
+/// 只读审计同名会话：不修改数据库/正文/关联表。
+fn audit_duplicates(args: &[String]) {
+    let variant = variant_arg(args);
+    let only_uid = args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            if let Some(value) = arg.strip_prefix("--uid=") {
+                return Some(value.trim().to_string());
+            }
+            arg.eq("--uid")
+                .then(|| args.get(index + 1).map(|value| value.trim().to_string()))
+                .flatten()
+        })
+        .filter(|value| !value.is_empty());
+    let accounts = account::load_accounts();
+    let mut reports = Vec::new();
+    for acct in accounts {
+        if account::variant_of(&acct) != variant {
+            continue;
+        }
+        let uid = acct
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if uid.is_empty() || only_uid.as_deref().is_some_and(|wanted| wanted != uid) {
+            continue;
+        }
+        reports.push(session::audit_session_duplicates_for_user(variant, &uid));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "variant": variant.as_str(),
+            "accounts": reports,
+        }))
+        .unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+/// 修复三套关联主表：仅清理可丢弃的历史元数据，备份后原子写回。
+fn repair_links() {
+    let targets = [
+        (
+            "workbuddy",
+            session::SessionPaths::for_variant(WbVariant::Cn),
+        ),
+        ("vscode-ext", session::SessionPaths::for_vscode_ext()),
+        ("codebuddy-ide", session::SessionPaths::for_codebuddy_ide()),
+    ];
+    for (name, paths) in targets {
+        if !paths.session_links_file().is_file() {
+            println!("{name}: 无关联主表，跳过");
+            continue;
+        }
+        match session_link::repair_store(&paths) {
+            Ok(report) => println!("{name}: {report}"),
+            Err(error) => {
+                println!("{name}: 修复失败：{error}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -147,7 +217,8 @@ async fn serve(args: &[String]) {
         }
     }
 
-    let app = api::router();
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let app = api::router_with_token(token.clone());
     let addr = format!("127.0.0.1:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -157,13 +228,14 @@ async fn serve(args: &[String]) {
         }
     };
 
+    let webui_url = format!("http://{addr}/?token={token}");
     println!("workbuddy-switch v{}", update::APP_VERSION);
-    println!("webui: http://{addr}");
+    println!("webui: {webui_url}");
     println!("按 Ctrl+C 停止服务。");
 
     let no_open = args.iter().any(|a| a == "--no-open");
     if !no_open {
-        open_browser(&addr);
+        open_browser(&webui_url);
     }
 
     spawn_background_loops();
@@ -171,11 +243,10 @@ async fn serve(args: &[String]) {
     axum::serve(listener, app).await.unwrap();
 }
 
-fn open_browser(addr: &str) {
-    let url = format!("http://{addr}");
+fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(&url).spawn();
+        let _ = std::process::Command::new("open").arg(url).spawn();
     }
     #[cfg(target_os = "windows")]
     {
@@ -185,11 +256,11 @@ fn open_browser(addr: &str) {
             use std::os::windows::process::CommandExt;
             c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：开浏览器不闪 cmd 窗
         }
-        let _ = c.args(["/C", "start", &url]).spawn();
+        let _ = c.args(["/C", "start", url]).spawn();
     }
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
 

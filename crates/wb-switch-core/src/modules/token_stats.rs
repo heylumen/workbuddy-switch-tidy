@@ -11,11 +11,20 @@
 //! 不合并：两档位是不同账号体系，混算会让用量无法归因。
 
 use chrono::{Datelike, Local, Timelike};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::modules::session::SessionPaths;
+use crate::modules::session_link::{self, LinkStore, MemberState, StoreState};
 use crate::modules::variant::WbVariant;
 
 /// 明细中最多返回的请求条数（响应窗口）。
@@ -23,6 +32,439 @@ const REQUEST_WINDOW: usize = 500;
 /// 扫描期间明细缓存的内存硬上限；达到该值后立即裁剪到 `REQUEST_WINDOW`，
 /// 使峰值内存恒定，不随历史总量增长。
 const REQUEST_COLLECT_LIMIT: usize = 4_000;
+
+/// 单源统计的内存缓存：以文件元数据签名判失效，避免同一进程内反复全量解析。
+struct SourceCacheEntry {
+    signature: u64,
+    value: Value,
+    size: usize,
+    at: i64,
+}
+
+struct SourceCacheState {
+    entries: HashMap<String, SourceCacheEntry>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl SourceCacheState {
+    fn touch(&mut self, key: &str) {
+        if let Some(position) = self.order.iter().position(|item| item == key) {
+            self.order.remove(position);
+        }
+        self.order.push_back(key.to_string());
+    }
+
+    fn insert(&mut self, key: String, signature: u64, value: Value, size: usize, at: i64) {
+        if size > SOURCE_CACHE_MAX_VALUE_BYTES {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.size);
+        }
+        if let Some(position) = self.order.iter().position(|item| item == &key) {
+            self.order.remove(position);
+        }
+        while (self.bytes.saturating_add(size) > SOURCE_CACHE_MAX_BYTES
+            || self.entries.len() >= SOURCE_CACHE_MAX_ENTRIES)
+            && !self.order.is_empty()
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some(old) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(old.size);
+                }
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(key.clone());
+        self.entries.insert(
+            key,
+            SourceCacheEntry {
+                signature,
+                value,
+                size,
+                at,
+            },
+        );
+    }
+}
+
+static SOURCE_CACHE: OnceLock<Mutex<SourceCacheState>> = OnceLock::new();
+
+fn source_cache() -> &'static Mutex<SourceCacheState> {
+    SOURCE_CACHE.get_or_init(|| {
+        Mutex::new(SourceCacheState {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        })
+    })
+}
+/// 统计缓存的内存边界：条目数、单值与总字节预算。
+const SOURCE_CACHE_MAX_ENTRIES: usize = 8;
+const SOURCE_CACHE_MAX_VALUE_BYTES: usize = 4 * 1024 * 1024;
+const SOURCE_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// 带解析错误的结果只缓存 60 秒，避免一个坏行永久关闭整源缓存。
+const SOURCE_CACHE_ERROR_TTL_MS: i64 = 60_000;
+
+/// 可选诊断：`WB_TOKEN_PROFILE=1` 时输出各来源耗时与计数，不输出路径/正文。
+fn token_profile_enabled() -> bool {
+    matches!(
+        std::env::var("WB_TOKEN_PROFILE").ok().as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+#[derive(Clone)]
+struct CachedTokenRecord {
+    timestamp: Option<i64>,
+    usage: Usage,
+    model: String,
+    project: String,
+    thinking: u64,
+    fingerprint: Option<(i64, u64, u64, u64, u64, String)>,
+}
+
+struct CachedTokenFile {
+    signature: (u64, u128),
+    records: Vec<CachedTokenRecord>,
+    title: Option<String>,
+    session_project: Option<String>,
+    parse_errors: u64,
+    /// 含 usage/providerData 元数据但 JSON 损坏的行；这类错误可能隐藏用量，不能据此跳过整文件。
+    unsafe_parse_errors: u64,
+    max_timestamp: Option<i64>,
+}
+
+const TOKEN_FILE_CACHE_MAX_ENTRIES: usize = 32;
+const TOKEN_FILE_CACHE_MAX_RECORDS: usize = 100_000;
+const TOKEN_FILE_CACHE_DEFAULT_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+
+/// 低内存机器可用 `WB_TOKEN_CACHE_MB` 调整；默认 128MB，限制在 16..512MB。
+fn token_file_cache_total_bytes() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("WB_TOKEN_CACHE_MB")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .map(|mb| mb.clamp(16, 512) * 1024 * 1024)
+            .unwrap_or(TOKEN_FILE_CACHE_DEFAULT_TOTAL_BYTES)
+    })
+}
+
+fn token_file_cache_file_bytes() -> usize {
+    (token_file_cache_total_bytes() / 4).clamp(4 * 1024 * 1024, 32 * 1024 * 1024)
+}
+
+struct TokenFileCacheState {
+    entries: HashMap<PathBuf, Arc<CachedTokenFile>>,
+    order: VecDeque<PathBuf>,
+    bytes: usize,
+}
+
+impl TokenFileCacheState {
+    fn touch(&mut self, path: &Path) {
+        if let Some(position) = self.order.iter().position(|item| item == path) {
+            self.order.remove(position);
+        }
+        self.order.push_back(path.to_path_buf());
+    }
+
+    fn insert(&mut self, path: PathBuf, value: Arc<CachedTokenFile>, size: usize) {
+        if size > token_file_cache_file_bytes() {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&path) {
+            self.bytes = self.bytes.saturating_sub(cached_file_bytes(&old));
+        }
+        if let Some(position) = self.order.iter().position(|item| item == &path) {
+            self.order.remove(position);
+        }
+        while (self.bytes.saturating_add(size) > token_file_cache_total_bytes()
+            || self.entries.len() >= TOKEN_FILE_CACHE_MAX_ENTRIES)
+            && !self.order.is_empty()
+        {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some(old) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(cached_file_bytes(&old));
+                }
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push_back(path.clone());
+        self.entries.insert(path, value);
+    }
+}
+
+fn cached_file_bytes(file: &CachedTokenFile) -> usize {
+    let records = file.records.len();
+    let strings: usize = file
+        .records
+        .iter()
+        .map(|record| record.model.len() + record.project.len())
+        .sum();
+    let header = file.title.as_ref().map_or(0, String::len)
+        + file.session_project.as_ref().map_or(0, String::len);
+    64usize
+        .saturating_add(records.saturating_mul(std::mem::size_of::<CachedTokenRecord>()))
+        .saturating_add(records.saturating_mul(32))
+        .saturating_add(strings)
+        .saturating_add(header)
+}
+
+static TOKEN_FILE_CACHE: OnceLock<Mutex<TokenFileCacheState>> = OnceLock::new();
+
+#[derive(Clone, Serialize, Deserialize)]
+struct FileIndexEntry {
+    size: u64,
+    mtime_ns: String,
+    max_timestamp: Option<i64>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct TokenFileIndex {
+    entries: HashMap<String, FileIndexEntry>,
+}
+
+static TOKEN_FILE_INDEX: OnceLock<Mutex<TokenFileIndex>> = OnceLock::new();
+
+#[cfg(not(test))]
+fn token_file_index_path() -> PathBuf {
+    crate::modules::config::store_dir().join("token-file-index.json")
+}
+
+fn token_file_index() -> &'static Mutex<TokenFileIndex> {
+    TOKEN_FILE_INDEX.get_or_init(|| {
+        // 测试不读取/写入真实用户目录，避免污染开发机与并行测试。
+        #[cfg(test)]
+        {
+            Mutex::new(TokenFileIndex::default())
+        }
+        #[cfg(not(test))]
+        {
+            let index = std::fs::read_to_string(token_file_index_path())
+                .ok()
+                .and_then(|text| serde_json::from_str::<TokenFileIndex>(&text).ok())
+                .unwrap_or_default();
+            Mutex::new(index)
+        }
+    })
+}
+
+fn file_index_should_skip(path: &Path, cutoff: i64) -> bool {
+    let Some(signature) = file_signature(path) else {
+        return false;
+    };
+    let key = path.to_string_lossy().to_string();
+    let Ok(guard) = token_file_index().lock() else {
+        return false;
+    };
+    let Some(entry) = guard.entries.get(&key) else {
+        return false;
+    };
+    if entry.size != signature.0 || entry.mtime_ns != signature.1.to_string() {
+        return false;
+    }
+    entry.max_timestamp.is_some_and(|max| max < cutoff)
+}
+
+fn file_index_update(path: &Path, signature: (u64, u128), max_timestamp: Option<i64>) {
+    let Ok(mut guard) = token_file_index().lock() else {
+        return;
+    };
+    guard.entries.insert(
+        path.to_string_lossy().to_string(),
+        FileIndexEntry {
+            size: signature.0,
+            mtime_ns: signature.1.to_string(),
+            max_timestamp,
+        },
+    );
+}
+
+fn flush_token_file_index() {
+    // 测试只验证内存索引，绝不写真实用户缓存文件。
+    #[cfg(test)]
+    return;
+    #[cfg(not(test))]
+    {
+        let Ok(guard) = token_file_index().lock() else {
+            return;
+        };
+        let Ok(text) = serde_json::to_string(&*guard) else {
+            return;
+        };
+        let path = token_file_index_path();
+        if let Some(parent) = path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        if std::fs::write(&temp, text).is_ok() {
+            // 保留上一份索引为 .bak；rename 失败时旧文件仍在，避免崩溃后索引全丢。
+            let backup = path.with_extension("json.bak");
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::rename(&path, &backup);
+            if std::fs::rename(&temp, &path).is_err() {
+                let _ = std::fs::rename(&backup, &path);
+            }
+        }
+    }
+}
+
+fn file_signature(path: &Path) -> Option<(u64, u128)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Some((meta.len(), mtime))
+}
+
+fn line_has_token_metadata(line: &[u8]) -> bool {
+    const NEEDLES: [&[u8]; 4] = [
+        b"\"usage\"",
+        b"\"providerData\"",
+        b"\"aiTitle\"",
+        b"\"summary\"",
+    ];
+    NEEDLES
+        .iter()
+        .any(|needle| line.windows(needle.len()).any(|window| window == *needle))
+}
+
+fn parse_token_file(path: &Path, fallback_project: &str) -> Option<CachedTokenFile> {
+    let signature = file_signature(path)?;
+    let file = std::fs::File::open(path).ok()?;
+    let mut records = Vec::new();
+    let mut parse_errors = 0u64;
+    let mut unsafe_parse_errors = 0u64;
+    let mut ai_title: Option<String> = None;
+    let mut summary: Option<String> = None;
+    let mut session_project: Option<String> = None;
+    let mut max_timestamp: Option<i64> = None;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => {
+                parse_errors += 1;
+                unsafe_parse_errors += 1;
+                break;
+            }
+        }
+        // 消息正文/工具输出通常不含 usage 或标题字段；先做字节级过滤，
+        // 避免为它们构造完整 JSON DOM。过滤只跳过不可能产出记录的行走。
+        if !line_has_token_metadata(&line) {
+            // JSON 对象行可以安全跳过；非对象行仍按原语义记为解析错误。
+            let first = line.iter().find(|byte| !byte.is_ascii_whitespace());
+            if first != Some(&b'{') {
+                parse_errors += 1;
+            }
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            parse_errors += 1;
+            // 该行包含 usage/标题字段但 JSON 损坏，可能隐藏用量记录。
+            unsafe_parse_errors += 1;
+            continue;
+        };
+        if let Some(title) = non_empty_text(value.get("aiTitle")) {
+            ai_title = Some(title);
+        }
+        if let Some(value) = non_empty_text(value.get("summary")) {
+            summary = Some(value);
+        }
+        let Some(usage) = usage(&value) else {
+            continue;
+        };
+        let ts = timestamp(&value);
+        if let Some(ts) = ts {
+            max_timestamp = Some(max_timestamp.map_or(ts, |current| current.max(ts)));
+        }
+        let model_name = model(&value);
+        let project = record_project(&value, fallback_project);
+        if session_project.is_none() {
+            session_project = Some(project.clone());
+        }
+        records.push(CachedTokenRecord {
+            timestamp: ts,
+            usage,
+            model: model_name.clone(),
+            project,
+            thinking: thinking(&value),
+            fingerprint: ts.map(|ts| {
+                (
+                    ts,
+                    usage.input,
+                    usage.output,
+                    usage.read,
+                    usage.write,
+                    model_name,
+                )
+            }),
+        });
+    }
+    Some(CachedTokenFile {
+        signature,
+        records,
+        title: ai_title.or(summary),
+        session_project,
+        parse_errors,
+        unsafe_parse_errors,
+        max_timestamp,
+    })
+}
+
+fn load_token_file(path: &Path, fallback_project: &str) -> Option<Arc<CachedTokenFile>> {
+    let signature = file_signature(path)?;
+    if let Some(cache) = TOKEN_FILE_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            let hit = guard
+                .entries
+                .get(path)
+                .filter(|cached| cached.signature == signature)
+                .cloned();
+            if let Some(cached) = hit {
+                guard.touch(path);
+                return Some(cached);
+            }
+        }
+    }
+    // 大文件也可能只有少量 usage 记录；不能仅按原始字节数拒绝缓存。
+    // 缓存体积由 records 数 + 估算内存控制，而不是原始文件大小。
+    let parsed = Arc::new(parse_token_file(path, fallback_project)?);
+    if parsed.records.len() <= TOKEN_FILE_CACHE_MAX_RECORDS {
+        let size = cached_file_bytes(&parsed);
+        if let Some(cache) = TOKEN_FILE_CACHE.get() {
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(path.to_path_buf(), parsed.clone(), size);
+            }
+        }
+    }
+    Some(parsed)
+}
+
+fn paths_signature(paths: &[(PathBuf, PathBuf)]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (root, path) in paths {
+        path.hash(&mut hasher);
+        root.hash(&mut hasher);
+        if let Ok(meta) = std::fs::metadata(path) {
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified() {
+                modified.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
@@ -337,10 +779,23 @@ fn project_name(root: &Path, file: &Path) -> String {
         .filter(|name| !name.is_empty() && !name.ends_with(".jsonl"));
     match name {
         // Product directories commonly encode the complete absolute path.
-        // Returning that would leak a user name and parent directories.
-        Some(name) if !name.starts_with("Users-") && !name.starts_with("home-") => name.to_string(),
+        // Windows uses `c-Users-...`; checking only `Users-` misses that form.
+        // A drive-prefixed name is never a safe project label: fall back rather
+        // than exposing user names, parent directories, or workspace timestamps.
+        Some(name) if !looks_like_encoded_absolute_path(name) => name.to_string(),
         _ => "未知项目".to_string(),
     }
+}
+
+fn looks_like_encoded_absolute_path(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let windows_drive = bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b'-';
+    windows_drive
+        || lower.starts_with("users-")
+        || lower.starts_with("home-")
+        || lower.contains("-users-")
+        || lower.contains("-home-")
 }
 
 fn record_project(value: &Value, fallback: &str) -> String {
@@ -408,6 +863,13 @@ fn total_value(value: &Value) -> u64 {
 }
 
 #[derive(Default)]
+struct AccountTotals {
+    total: Totals,
+    models: HashMap<String, Totals>,
+    daily: HashMap<String, Totals>,
+}
+
+#[derive(Default)]
 struct SourceCollector {
     total: Totals,
     models: HashMap<String, Totals>,
@@ -422,6 +884,7 @@ struct SourceCollector {
     session_key_counts: HashMap<String, usize>,
     requests: Vec<RequestRow>,
     collect_requests: bool,
+    accounts: HashMap<String, AccountTotals>,
 }
 
 impl SourceCollector {
@@ -444,7 +907,7 @@ impl SourceCollector {
         }
     }
 
-    fn add(&mut self, usage: Usage, value: &Value, project: &str) {
+    fn add(&mut self, usage: Usage, value: &Value, project: &str, account: Option<&str>) {
         self.total.add(usage);
         let model_name = model(value);
         self.models
@@ -458,7 +921,7 @@ impl SourceCollector {
         if let Some(day) = date(value) {
             self.daily.entry(day.clone()).or_default().add(usage);
             self.daily_by_model
-                .entry(model_name)
+                .entry(model_name.clone())
                 .or_default()
                 .entry(day)
                 .or_default()
@@ -466,6 +929,18 @@ impl SourceCollector {
         }
         if let Some(hour) = hour(value) {
             self.hours.entry(hour).or_default().add(usage);
+        }
+        if let Some(account) = account.filter(|key| !key.trim().is_empty()) {
+            let entry = self.accounts.entry(account.to_string()).or_default();
+            entry.total.add(usage);
+            entry
+                .models
+                .entry(model_name.clone())
+                .or_default()
+                .add(usage);
+            if let Some(day) = date(value) {
+                entry.daily.entry(day).or_default().add(usage);
+            }
         }
         if let Some(timestamp) = timestamp(value) {
             self.coverage_start_at = Some(
@@ -506,7 +981,17 @@ impl SourceCollector {
         });
     }
 
-    fn into_value(mut self, name: &str, files_scanned: usize) -> Value {
+    fn into_value(self, name: &str, files_scanned: usize) -> Value {
+        self.into_value_with_counts(name, files_scanned, files_scanned, 0)
+    }
+
+    fn into_value_with_counts(
+        mut self,
+        name: &str,
+        files_scanned: usize,
+        files_parsed: usize,
+        files_skipped: usize,
+    ) -> Value {
         let daily_by_model = self
             .daily_by_model
             .into_iter()
@@ -522,9 +1007,12 @@ impl SourceCollector {
             "dailyByModel": daily_by_model,
             "hours": groups(self.hours),
             "filesScanned": files_scanned,
+            "filesParsed": files_parsed,
+            "filesSkipped": files_skipped,
             "parseErrors": self.parse_errors,
             "coverageStartAt": self.coverage_start_at,
             "coverageEndAt": self.coverage_end_at,
+            "accounts": account_groups(self.accounts),
         });
         // Only detail sources take the new key; every other source keeps its
         // previous response shape byte for byte.
@@ -538,10 +1026,75 @@ impl SourceCollector {
     }
 }
 
+fn account_groups(accounts: HashMap<String, AccountTotals>) -> Value {
+    let mut items: Vec<Value> = accounts
+        .into_iter()
+        .map(|(key, value)| {
+            json!({
+                "key": key,
+                "summary": value.total.value(),
+                "models": groups(value.models),
+                "daily": groups(value.daily),
+            })
+        })
+        .collect();
+    items.sort_by(|left, right| {
+        let left_total = left
+            .get("summary")
+            .and_then(|value| value.get("total"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let right_total = right
+            .get("summary")
+            .and_then(|value| value.get("total"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        right_total.cmp(&left_total)
+    });
+    Value::Array(items)
+}
+
+/// 从账号库的 DB 读取 session_id → uid 映射；只用于归因，不读取正文。
+fn session_account_map(variant: WbVariant) -> HashMap<String, String> {
+    let db = variant.data_root().join("workbuddy.db");
+    let Ok(conn) = Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return HashMap::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT id, user_id FROM sessions") else {
+        return HashMap::new();
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    });
+    let Ok(rows) = rows else {
+        return HashMap::new();
+    };
+    rows.flatten()
+        .filter_map(|(id, uid)| {
+            uid.filter(|value| !value.trim().is_empty())
+                .map(|uid| (id, uid))
+        })
+        .collect()
+}
+
+fn account_from_path(path: &Path) -> Option<String> {
+    path.components().find_map(|component| {
+        let name = component.as_os_str().to_str()?;
+        name.strip_prefix("user-")
+            .and_then(|value| value.strip_suffix("-personal"))
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 /// 单根统计：转发到多根实现，供 CodeBuddy CLI 这类固定单根的数据源使用。
 /// `detail` additionally keeps a bounded window of per-call request rows; both
 /// outputs share the same decode, cutoff, dedupe, and `subagents`-exclusion
 /// pipeline so a detail row can never disagree with the aggregate totals.
+#[cfg(test)]
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value {
     source_from_roots(std::slice::from_ref(&root), name, cutoff, detail)
 }
@@ -550,7 +1103,30 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value
 ///
 /// 国际版数据根与国内版不同构（实测无 `projects/`、只有 `sessions/`），因此按
 /// 「存在的根」探测；一个都不存在时返回空集且不报错（前端显示空状态）。
+#[cfg(test)]
 fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail: bool) -> Value {
+    source_from_roots_with_accounts(roots, name, cutoff, detail, &HashMap::new(), false)
+}
+
+fn source_with_refresh(
+    roots: &[PathBuf],
+    name: &str,
+    cutoff: Option<i64>,
+    detail: bool,
+    refresh: bool,
+) -> Value {
+    source_from_roots_with_accounts(roots, name, cutoff, detail, &HashMap::new(), refresh)
+}
+
+fn source_from_roots_with_accounts(
+    roots: &[PathBuf],
+    name: &str,
+    cutoff: Option<i64>,
+    detail: bool,
+    account_by_session: &HashMap<String, String>,
+    refresh: bool,
+) -> Value {
+    let profile_started = std::time::Instant::now();
     let mut paths: Vec<(PathBuf, PathBuf)> = Vec::new();
     for root in roots {
         let mut found = Vec::new();
@@ -575,8 +1151,52 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(u64::MAX)
     });
+    // 账号归属也会随切号/复制变化：必须进入缓存键，否则文件签名不变时会复用旧归属。
+    let mut account_hasher = DefaultHasher::new();
+    let mut account_entries: Vec<_> = account_by_session.iter().collect();
+    account_entries.sort_by_key(|(session, _)| *session);
+    for (session, uid) in account_entries {
+        session.hash(&mut account_hasher);
+        uid.hash(&mut account_hasher);
+    }
+    let cache_key = format!(
+        "{name}|{cutoff:?}|{detail}|{roots:?}|{:x}",
+        account_hasher.finish()
+    );
+    let signature = paths_signature(&paths);
+    if !refresh {
+        if let Ok(mut guard) = source_cache().lock() {
+            let now = crate::modules::config::now_ms();
+            let cached = guard
+                .entries
+                .get(&cache_key)
+                .filter(|entry| entry.signature == signature)
+                .filter(|entry| {
+                    let parse_errors = entry
+                        .value
+                        .get("parseErrors")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    parse_errors == 0 || now.saturating_sub(entry.at) < SOURCE_CACHE_ERROR_TTL_MS
+                })
+                .map(|entry| entry.value.clone());
+            if let Some(value) = cached {
+                guard.touch(&cache_key);
+                return value;
+            }
+        }
+    }
     let mut seen: HashSet<(i64, u64, u64, u64, u64, String)> = HashSet::new();
+    let mut files_parsed = 0usize;
+    let mut files_skipped = 0usize;
 
+    struct ScanJob {
+        path: PathBuf,
+        session_id: String,
+        fallback_project: String,
+    }
+
+    let mut jobs: Vec<ScanJob> = Vec::new();
     for (root, path) in &paths {
         let session_id = path
             .file_stem()
@@ -585,90 +1205,70 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
             .unwrap_or("未知会话")
             .to_string();
         let fallback_project = project_name(root, path);
-        let Ok(file) = std::fs::File::open(path) else {
+        if let Some(cutoff) = cutoff {
+            if file_index_should_skip(path, cutoff) {
+                files_skipped = files_skipped.saturating_add(1);
+                continue;
+            }
+        }
+        jobs.push(ScanJob {
+            path: path.clone(),
+            session_id,
+            fallback_project,
+        });
+    }
+
+    // 解析只读文件可并行；聚合、去重和索引更新仍按原顺序串行执行，保证结果稳定。
+    // 有界通道限制乱序结果的驻留内存，避免第一次扫描把所有文件同时留在内存。
+    let mut process_cached = |job: &ScanJob, cached: Option<Arc<CachedTokenFile>>| {
+        let Some(cached) = cached else {
             collector.note_parse_error();
-            continue;
+            return;
         };
-
+        files_parsed = files_parsed.saturating_add(1);
+        // 只有“无 usage 元数据的坏行”才允许建索引；含 usage 元数据但 JSON 损坏
+        // 的文件可能漏记录，必须每次重扫。
+        if cutoff.is_some() && cached.unsafe_parse_errors == 0 {
+            file_index_update(&job.path, cached.signature, cached.max_timestamp);
+        }
+        collector.parse_errors = collector.parse_errors.saturating_add(cached.parse_errors);
         let mut session_totals = Totals::default();
-        // Detail rows are buffered per file so the file-scoped title can be
-        // backfilled once the whole file has been read.
         let mut file_requests: Vec<RequestRow> = Vec::new();
-        let mut session_project: Option<String> = None;
-        let mut ai_title: Option<String> = None;
-        let mut summary: Option<String> = None;
-
-        for line in BufReader::new(file).lines() {
-            let Ok(line) = line else {
-                collector.note_parse_error();
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                collector.note_parse_error();
-                continue;
-            };
-            // Title metadata belongs to the whole JSONL session file. Read it
-            // before applying the usage cutoff so an older title can still
-            // label usage that falls inside the selected range. aiTitle has
-            // precedence over summary regardless of event order.
-            if let Some(title) = non_empty_text(value.get("aiTitle")) {
-                ai_title = Some(title);
-            }
-            if let Some(value) = non_empty_text(value.get("summary")) {
-                summary = Some(value);
-            }
-            // Records with a missing timestamp are excluded from a bounded
-            // range rather than guessed from file mtime or browser time.
-            if cutoff.is_some_and(|minimum| timestamp(&value).is_none_or(|ts| ts < minimum)) {
+        for record in &cached.records {
+            // 时间范围在合并时应用：同一文件可被多个时间窗口复用。
+            if cutoff.is_some_and(|minimum| record.timestamp.is_none_or(|ts| ts < minimum)) {
                 continue;
             }
-            let Some(usage) = usage(&value) else {
-                continue;
-            };
-            // Fingerprint = (timestamp, full usage, model). Records without a
-            // timestamp cannot be fingerprinted and are counted as before; they
-            // are also unsortable and therefore never appear in the detail
-            // window. Reuse the parsed model name for the fingerprint and the
-            // detail row instead of decoding it twice.
-            let ts = timestamp(&value);
-            let model_name = model(&value);
-            let duplicate = ts.is_some_and(|ts| {
-                !seen.insert((
-                    ts,
-                    usage.input,
-                    usage.output,
-                    usage.read,
-                    usage.write,
-                    model_name.clone(),
-                ))
-            });
-            if duplicate {
-                continue;
+            if let Some(fingerprint) = &record.fingerprint {
+                if !seen.insert(fingerprint.clone()) {
+                    continue;
+                }
             }
-            let project = record_project(&value, &fallback_project);
-            if session_project.is_none() {
-                session_project = Some(project.clone());
-            }
-            session_totals.add(usage);
-            collector.add(usage, &value, &project);
+            session_totals.add(record.usage);
+            collector.add(
+                record.usage,
+                &json!({
+                    "timestamp": record.timestamp,
+                    "providerData": { "model": record.model },
+                }),
+                &record.project,
+                account_by_session.get(&job.session_id).map(String::as_str),
+            );
             if collector.collect_requests {
-                if let Some(ts) = ts {
+                if let Some(ts) = record.timestamp {
                     file_requests.push(RequestRow {
                         timestamp: ts,
-                        model: model_name,
-                        project,
-                        session_id: session_id.clone(),
+                        model: record.model.clone(),
+                        project: record.project.clone(),
+                        session_id: job.session_id.clone(),
                         title: None,
-                        usage,
-                        thinking: thinking(&value),
+                        usage: record.usage,
+                        thinking: record.thinking,
                     });
                 }
             }
         }
-
-        // `aiTitle` can appear anywhere in the file (including after the usage
-        // records), so the file title is only final once the file is read.
-        let title = ai_title.or(summary);
+        let title = cached.title.clone();
         if !file_requests.is_empty() {
             for row in &mut file_requests {
                 row.title = title.clone();
@@ -678,14 +1278,89 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
             }
         }
         collector.push_session(
-            session_id,
+            job.session_id.clone(),
             title,
-            session_project.unwrap_or(fallback_project),
+            cached
+                .session_project
+                .clone()
+                .unwrap_or_else(|| job.fallback_project.clone()),
             session_totals,
         );
+    };
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .clamp(1, 4)
+        .min(jobs.len().max(1));
+    if jobs.len() <= 1 || worker_count <= 1 {
+        for job in &jobs {
+            process_cached(job, load_token_file(&job.path, &job.fallback_project));
+        }
+    } else {
+        let next_job = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::sync_channel::<(usize, Option<Arc<CachedTokenFile>>)>(
+            worker_count.saturating_mul(2),
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let sender = sender.clone();
+                let jobs = &jobs;
+                let next_job = &next_job;
+                scope.spawn(move || loop {
+                    let index = next_job.fetch_add(1, Ordering::Relaxed);
+                    if index >= jobs.len() {
+                        break;
+                    }
+                    let job = &jobs[index];
+                    let cached = load_token_file(&job.path, &job.fallback_project);
+                    if sender.send((index, cached)).is_err() {
+                        break;
+                    }
+                });
+            }
+            drop(sender);
+            let mut ready: HashMap<usize, Option<Arc<CachedTokenFile>>> = HashMap::new();
+            let mut next_index = 0usize;
+            for (index, cached) in receiver {
+                ready.insert(index, cached);
+                while let Some(cached) = ready.remove(&next_index) {
+                    process_cached(&jobs[next_index], cached);
+                    next_index += 1;
+                }
+            }
+        });
     }
 
-    collector.into_value(name, paths.len())
+    if cutoff.is_some() {
+        flush_token_file_index();
+    }
+    let parse_errors = collector.parse_errors;
+    let value = collector.into_value_with_counts(name, paths.len(), files_parsed, files_skipped);
+    if token_profile_enabled() {
+        eprintln!(
+            "[token-profile] source={name} files={} parsed={files_parsed} skipped={files_skipped} errors={parse_errors} elapsed_ms={}",
+            paths.len(),
+            profile_started.elapsed().as_millis()
+        );
+    }
+    // 零错误结果按普通 TTL 长期命中；带解析错误的结果也缓存，但查找时只保留 60 秒，
+    // 避免瞬时 IO 失败被固化，同时避免一个坏行让整源每次进入都全扫。
+    let size = serde_json::to_vec(&value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    if size > 0 && size <= SOURCE_CACHE_MAX_VALUE_BYTES {
+        if let Ok(mut guard) = source_cache().lock() {
+            guard.insert(
+                cache_key,
+                signature,
+                value.clone(),
+                size,
+                crate::modules::config::now_ms(),
+            );
+        }
+    }
+    value
 }
 
 /// 某档位的候选 jsonl 根（顺序固定；纯函数，便于单测）。
@@ -923,9 +1598,7 @@ fn ide_session_id(path: &Path) -> String {
 /// 追加——所以各份长短不一、内容并不完全相同，会话 id 也可能被重随机（插件侧
 /// `CopyIdPolicy::AlwaysNew`）。会话身份因此不能按目录名判，只能按「同一个起点请求」判。
 /// 指标里的条数/总量用于挑出最完整的那份，作为该会话的标题、模型与项目归属。
-fn ide_file_weight(path: &Path) -> Option<(String, usize, u64)> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let value = serde_json::from_str::<Value>(&text).ok()?;
+fn ide_file_weight(value: &Value) -> Option<(String, usize, u64)> {
     let requests = value.get("requests")?.as_array()?;
     let mut key: Option<String> = None;
     let mut count = 0usize;
@@ -948,12 +1621,14 @@ fn ide_file_weight(path: &Path) -> Option<(String, usize, u64)> {
 /// `seen` 按请求指纹去重、跨副本共享：副本重放父历史时带的是原始时间戳，所以并集
 /// 既不会把历史日期重复抬高，也不会丢掉各副本复制后各自追加的请求。指纹缺失的记录
 /// 一律计入。
+#[allow(clippy::too_many_arguments)]
 fn collect_ide_requests(
     collector: &mut SourceCollector,
     requests: &[Value],
     cutoff: Option<i64>,
     model_name: &str,
     project: &str,
+    account: Option<&str>,
     seen: &mut HashSet<String>,
     session_totals: &mut Totals,
 ) {
@@ -979,6 +1654,7 @@ fn collect_ide_requests(
                 "providerData": { "model": model_name },
             }),
             project,
+            account,
         );
     }
 }
@@ -997,8 +1673,18 @@ fn ide_source(
     // 请求指纹取**并集**：父历史只算一次（副本会把历史日期回溯性抬高），副本复制后各自
     // 追加的请求也都保留（只取「最长一份」会漏掉别的副本独有的请求）。会话标题、模型与
     // 项目归属取最完整的那份。
-    let weights: Vec<Option<(String, usize, u64)>> =
-        paths.iter().map(|path| ide_file_weight(path)).collect();
+    // 峰值内存优先：权重计算逐文件读取后立即释放，不把全部 index.json 同时留在内存。
+    // 代价是后续并入请求时再读一次；IDE index 通常不大，换取更低的峰值更划算。
+    let weights: Vec<Option<(String, usize, u64)>> = paths
+        .iter()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .as_ref()
+                .and_then(ide_file_weight)
+        })
+        .collect();
     let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut lead: HashMap<&str, (usize, usize, u64)> = HashMap::new();
     for (index, weight) in weights.iter().enumerate() {
@@ -1064,6 +1750,7 @@ fn ide_source(
                 cutoff,
                 &model_name,
                 &project,
+                account_from_path(&paths[*member]).as_deref(),
                 &mut seen,
                 &mut session_totals,
             );
@@ -1078,10 +1765,82 @@ fn ide_source(
 /// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI, and
 /// CodeBuddy IDE aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
-pub fn get_statistics(days: Option<i64>) -> Value {
+/// 关联组内最早已关联的 active 成员视为规范副本；只用于把已关联副本归到同一账号。
+/// 未关联副本仍走文件级启发式，不能宣称请求级归因。
+fn canonical_accounts_from_store(store: &LinkStore, variant: WbVariant) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for group in &store.groups {
+        let canonical = group
+            .members
+            .iter()
+            .filter(|member| member.state == MemberState::Active)
+            .min_by_key(|member| (member.linked_at, member.member_id.clone()))
+            .or_else(|| {
+                group
+                    .members
+                    .iter()
+                    .min_by_key(|member| (member.linked_at, member.member_id.clone()))
+            });
+        let Some(canonical) = canonical else {
+            continue;
+        };
+        if canonical.uid.trim().is_empty() {
+            continue;
+        }
+        for member in &group.members {
+            let member_variant = session_link::member_variant(group, member);
+            if member_variant == variant
+                && !member.session_id.trim().is_empty()
+                && !member.uid.trim().is_empty()
+            {
+                map.insert(member.session_id.clone(), canonical.uid.clone());
+            }
+        }
+    }
+    map
+}
+
+fn canonical_accounts_by_session(variant: WbVariant) -> HashMap<String, String> {
+    let paths = SessionPaths::for_variant(variant);
+    match session_link::load_store(&paths) {
+        StoreState::Ready(store) => canonical_accounts_from_store(&store, variant),
+        StoreState::Missing | StoreState::Unavailable(_) => HashMap::new(),
+    }
+}
+
+/// 只返回 CodeBuddy CLI 的请求明细，避免打开明细时重算四个来源。
+pub fn get_requests(days: Option<i64>, refresh: bool) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let generated_at = crate::modules::config::now_ms();
     let range_days = match days {
+        Some(1) => Some(1),
+        Some(7) => Some(7),
+        Some(30) => Some(30),
+        Some(90) => Some(90),
+        _ => None,
+    };
+    let cutoff = range_days.map(|value| generated_at - value * 86_400_000);
+    let source = source_with_refresh(
+        std::slice::from_ref(&home.join(".codebuddy/projects")),
+        "codebuddy-cli",
+        cutoff,
+        true,
+        refresh,
+    );
+    json!({
+        "generatedAt": generated_at,
+        "rangeDays": range_days,
+        "requests": source.get("requests").cloned().unwrap_or_else(|| json!([])),
+        "filesScanned": source.get("filesScanned").cloned().unwrap_or(json!(0)),
+        "parseErrors": source.get("parseErrors").cloned().unwrap_or(json!(0)),
+    })
+}
+
+pub fn get_statistics(days: Option<i64>, include_requests: bool, refresh: bool) -> Value {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let generated_at = crate::modules::config::now_ms();
+    let range_days = match days {
+        Some(1) => Some(1),
         Some(7) => Some(7),
         Some(30) => Some(30),
         Some(90) => Some(90),
@@ -1089,15 +1848,39 @@ pub fn get_statistics(days: Option<i64>) -> Value {
     };
     let cutoff = range_days.map(|value| generated_at - value * 86_400_000);
     let ide_projects = ide_project_by_session();
+    let mut cn_accounts = session_account_map(WbVariant::Cn);
+    cn_accounts.extend(canonical_accounts_by_session(WbVariant::Cn));
+    let mut ai_accounts = session_account_map(WbVariant::Ai);
+    ai_accounts.extend(canonical_accounts_by_session(WbVariant::Ai));
     json!({
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
-            source_from_roots(&variant_source_roots(WbVariant::Cn), "workbuddy", cutoff, false),
+            source_from_roots_with_accounts(
+                &variant_source_roots(WbVariant::Cn),
+                "workbuddy",
+                cutoff,
+                false,
+                &cn_accounts,
+                refresh,
+            ),
             // 国际版独立 source：不与国内版混算（不同账号体系）。
-            source_from_roots(&variant_source_roots(WbVariant::Ai), "workbuddy-ai", cutoff, false),
+            source_from_roots_with_accounts(
+                &variant_source_roots(WbVariant::Ai),
+                "workbuddy-ai",
+                cutoff,
+                false,
+                &ai_accounts,
+                refresh,
+            ),
             // 请求明细目前只对 CodeBuddy CLI 开放（见 spec 的 requests 契约）。
-            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff, true),
+            source_with_refresh(
+                std::slice::from_ref(&home.join(".codebuddy/projects")),
+                "codebuddy-cli",
+                cutoff,
+                include_requests,
+                refresh,
+            ),
             ide_source(
                 codebuddy_extension_data_dir(),
                 "codebuddy-ide",
@@ -1239,6 +2022,46 @@ mod tests {
                 write: 0,
             })
         );
+    }
+
+    #[test]
+    fn source_per_file_cache_invalidates_when_file_changes() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-incremental-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = |ts, input| {
+            json!({
+                "timestamp": ts,
+                "cwd": "/fixture/example-project",
+                "providerData": {
+                    "model": "fixture-model",
+                    "usage": { "inputTokens": input, "outputTokens": 1 }
+                }
+            })
+        };
+        let file = project.join("session.jsonl");
+        fs::write(&file, format!("{}\n", record(now, 10))).expect("write first fixture");
+
+        let first = source(root.clone(), "fixture", None, false);
+        assert_eq!(first["summary"]["input"], 10);
+        assert_eq!(first["summary"]["records"], 1);
+
+        // 文件变化（size 改变）必须使缓存失效；未变化文件的复用由缓存实现保证。
+        fs::write(
+            &file,
+            format!("{}\n{}\n", record(now, 10), record(now + 1, 7)),
+        )
+        .expect("append fixture");
+        let second = source(root.clone(), "fixture", None, false);
+        assert_eq!(second["summary"]["input"], 17);
+        assert_eq!(second["summary"]["records"], 2);
+        assert_eq!(second["parseErrors"], 0);
+
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -2101,7 +2924,7 @@ mod tests {
         // ~/.codebuddy 与扩展目录）。在数据量大的机器上耗时可达成分钟级，且结果随本机
         // 数据漂移——因此这条用例默认跳过，仅在需要端到端核对时手动运行：
         //   cargo test -p wb-switch-core --lib -- --ignored get_statistics_returns_four_isolated_sources
-        let value = get_statistics(None);
+        let value = get_statistics(None, true, false);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()
@@ -2194,6 +3017,36 @@ mod tests {
         fs::remove_dir_all(base).expect("remove fixture");
     }
 
+    #[test]
+    fn account_aggregation_groups_usage_by_uid() {
+        let mut collector = SourceCollector::default();
+        let usage = Usage {
+            input: 10,
+            output: 3,
+            read: 4,
+            write: 1,
+        };
+        collector.add(
+            usage,
+            &json!({"timestamp": 1_700_000_000_000i64, "providerData": {"model": "m1"}}),
+            "p",
+            Some("uid-1"),
+        );
+        collector.add(
+            usage,
+            &json!({"timestamp": 1_700_000_100_000i64, "providerData": {"model": "m1"}}),
+            "p",
+            None,
+        );
+        let value = collector.into_value("test", 1);
+        let accounts = value["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["key"], "uid-1");
+        assert_eq!(accounts[0]["summary"]["records"], 1);
+        assert_eq!(accounts[0]["summary"]["total"], 14);
+        assert_eq!(value["summary"]["records"], 2);
+    }
+
     /// 候选根按档位不同：国内版单根，国际版双根（无 projects/ 时只扫 sessions/）。
     #[test]
     fn jsonl_root_candidates_differ_by_variant() {
@@ -2209,5 +3062,295 @@ mod tests {
                 PathBuf::from("/tmp/wb-root/sessions")
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_prefilter_skips_message_only_lines() {
+        assert!(line_has_token_metadata(br#"{"providerData":{"usage":{}}}"#));
+        assert!(line_has_token_metadata(br#"{"aiTitle":"title"}"#));
+        assert!(line_has_token_metadata(br#"{"summary":"summary"}"#));
+        assert!(!line_has_token_metadata(
+            br#"{"type":"message","text":"hello"}"#
+        ));
+    }
+}
+
+#[cfg(test)]
+mod timestamp_index_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn recent_mtime_old_records_are_skipped_after_first_index() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-timestamp-index-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        fs::write(
+            project.join("old.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": now - 40 * 86_400_000i64,
+                    "providerData": {
+                        "model": "fixture-model",
+                        "usage": { "inputTokens": 10, "outputTokens": 1 }
+                    }
+                })
+            ),
+        )
+        .expect("write fixture");
+
+        let cutoff = now - 30 * 86_400_000;
+        let first = source(root.clone(), "fixture-first", Some(cutoff), false);
+        assert_eq!(first["summary"]["records"], 0);
+        assert!(file_index_should_skip(&project.join("old.jsonl"), cutoff));
+        let second = source(root.clone(), "fixture-second", Some(cutoff), false);
+        assert_eq!(second["summary"]["records"], 0);
+        assert_eq!(second["filesScanned"], 1);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+}
+
+#[cfg(test)]
+mod canonical_account_tests {
+    use super::*;
+    use crate::modules::session_link::{LinkGroup, LinkMember};
+
+    fn member(id: &str, uid: &str, linked_at: i64) -> LinkMember {
+        LinkMember {
+            member_id: id.to_string(),
+            account_id: None,
+            uid: uid.to_string(),
+            session_id: format!("session-{id}"),
+            variant: Some(WbVariant::Cn),
+            state: MemberState::Active,
+            linked_at,
+            last_synced_at: None,
+        }
+    }
+
+    #[test]
+    fn linked_copies_use_earliest_active_member_as_canonical_account() {
+        let store = LinkStore {
+            version: 1,
+            revision: 1,
+            groups: vec![LinkGroup {
+                id: "group".to_string(),
+                variant: WbVariant::Cn,
+                created_at: 1,
+                members: vec![
+                    member("copy", "uid-copy", 2),
+                    member("origin", "uid-origin", 1),
+                ],
+                pair_bases: Vec::new(),
+            }],
+        };
+        let accounts = canonical_accounts_from_store(&store, WbVariant::Cn);
+        assert_eq!(
+            accounts.get("session-origin").map(String::as_str),
+            Some("uid-origin")
+        );
+        assert_eq!(
+            accounts.get("session-copy").map(String::as_str),
+            Some("uid-origin")
+        );
+    }
+}
+
+#[cfg(test)]
+mod source_refresh_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parallel_scan_preserves_all_files_and_records() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-parallel-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        fs::create_dir_all(&project).expect("create parallel fixture");
+        for index in 0..8u64 {
+            fs::write(
+                project.join(format!("session-{index}.jsonl")),
+                format!(
+                    "{}
+",
+                    json!({
+                        "timestamp": now,
+                        "providerData": {
+                            "model": "fixture-model",
+                            "usage": { "inputTokens": index + 1, "outputTokens": 1 }
+                        }
+                    })
+                ),
+            )
+            .expect("write parallel fixture");
+        }
+        let value = source(root.clone(), "parallel-fixture", None, false);
+        assert_eq!(value["summary"]["records"], 8);
+        assert_eq!(value["sessions"].as_array().map(Vec::len), Some(8));
+        fs::remove_dir_all(root).expect("remove parallel fixture");
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_seeded_source_cache() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-refresh-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("project");
+        fs::create_dir_all(&project).expect("create refresh fixture");
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": now,
+                    "providerData": {
+                        "model": "fixture-model",
+                        "usage": { "inputTokens": 7, "outputTokens": 1 }
+                    }
+                })
+            ),
+        )
+        .expect("write refresh fixture");
+        let roots = std::slice::from_ref(&root);
+        let first = source_from_roots(roots, "refresh-fixture", None, false);
+        assert_eq!(first["summary"]["records"], 1);
+
+        // 直接污染缓存，证明 refresh=false 会命中旧值，refresh=true 不会。
+        {
+            let mut guard = source_cache().lock().expect("source cache lock");
+            let entry = guard
+                .entries
+                .values_mut()
+                .find(|entry| entry.value["source"] == "refresh-fixture")
+                .expect("seeded source cache entry");
+            entry.value["summary"]["records"] = json!(999);
+        }
+        let cached = source_from_roots(roots, "refresh-fixture", None, false);
+        assert_eq!(cached["summary"]["records"], 999);
+        let fresh = source_from_roots_with_accounts(
+            roots,
+            "refresh-fixture",
+            None,
+            false,
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(fresh["summary"]["records"], 1);
+        fs::remove_dir_all(root).expect("remove refresh fixture");
+    }
+}
+
+#[cfg(test)]
+mod project_name_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn encoded_absolute_paths_never_leak_into_token_statistics() {
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-path-privacy-{}-{}",
+            std::process::id(),
+            crate::modules::config::now_ms()
+        ));
+        let encoded = root.join("c-Users-alice-WorkBuddy-2026-01-01");
+        fs::create_dir_all(&encoded).expect("create encoded path fixture");
+        fs::write(
+            encoded.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": crate::modules::config::now_ms(),
+                    "providerData": {
+                        "model": "fixture-model",
+                        "usage": { "inputTokens": 1, "outputTokens": 1 }
+                    }
+                })
+            ),
+        )
+        .expect("write fixture");
+        let value = source(root.clone(), "workbuddy", None, false);
+        let text = value.to_string();
+        assert!(
+            !text.contains("alice"),
+            "response leaked encoded user path: {text}"
+        );
+        assert_eq!(value["projects"][0]["key"], "未知项目");
+        assert_eq!(value["projects"][0]["records"], 1);
+        fs::remove_dir_all(root).expect("remove path privacy fixture");
+    }
+
+    #[test]
+    fn normal_project_directory_is_preserved() {
+        let root = Path::new("/fixture/root");
+        let file = root.join("wb-switch").join("session.jsonl");
+        assert_eq!(project_name(root, &file), "wb-switch");
+    }
+}
+
+#[cfg(test)]
+mod parse_error_index_tests {
+    use super::*;
+    use std::fs;
+
+    fn fixture_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-parse-index-{tag}-{}-{}",
+            std::process::id(),
+            crate::modules::config::now_ms()
+        ));
+        fs::create_dir_all(&root).expect("create fixture root");
+        root
+    }
+
+    #[test]
+    fn metadata_broken_line_blocks_index_but_plain_bad_line_does_not() {
+        let now = crate::modules::config::now_ms();
+        let old = now - 40 * 86_400_000;
+        let root = fixture_root("metadata");
+        let unsafe_file = root.join("unsafe.jsonl");
+        fs::write(
+            &unsafe_file,
+            format!(
+                "{}\n{{\"usage\":{{}}\n",
+                json!({
+                    "timestamp": old,
+                    "providerData": { "model": "m", "usage": { "inputTokens": 1 } }
+                })
+            ),
+        )
+        .expect("write unsafe fixture");
+        source(root.clone(), "unsafe", Some(now - 30 * 86_400_000), false);
+        assert!(!file_index_should_skip(&unsafe_file, now - 30 * 86_400_000));
+
+        let root = fixture_root("plain");
+        let safe_file = root.join("safe.jsonl");
+        fs::write(
+            &safe_file,
+            format!(
+                "{}\nnot-json-no-usage\n",
+                json!({
+                    "timestamp": old,
+                    "providerData": { "model": "m", "usage": { "inputTokens": 1 } }
+                })
+            ),
+        )
+        .expect("write safe fixture");
+        source(root.clone(), "safe", Some(now - 30 * 86_400_000), false);
+        assert!(file_index_should_skip(&safe_file, now - 30 * 86_400_000));
     }
 }

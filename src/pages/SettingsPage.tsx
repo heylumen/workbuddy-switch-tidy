@@ -52,10 +52,8 @@ import type {
   UpdateInfo,
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
-import { useUpdateState } from "@/lib/use-update-state";
 import { cn } from "@/lib/utils";
 import { accountVariant, variantSupportsCheckin, variantSupportsTravel, variantUsesIntlCodebuddyIde } from "@/lib/variant";
-import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, CodeBuddyMark, JetbrainsMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { useAccountsStore } from "@/stores/accounts";
@@ -1288,15 +1286,11 @@ function useAuthFile(): string | undefined {
   return useAccountsStore((s) => s.status?.authFile);
 }
 
-/** 自动更新：检查公开 GitHub Releases 源 + 安装签名更新。 */
+/** 更新检查：检查公开 GitHub Releases 源，发现新版本后打开发布页手动下载。 */
 function UpdateCard() {
   const version = useAccountsStore((s) => s.status?.version);
-  // 阶段与进度来自 Rust 更新服务（托盘同源）：下载完成时按钮换成「重启以完成升级」。
-  const snapshot = useUpdateState();
   const [info, setInfo] = useState<UpdateInfo | null>(null);
   const [checking, setChecking] = useState(false);
-  const [installOpen, setInstallOpen] = useState(false);
-  const [restarting, setRestarting] = useState(false);
   const [githubConfig, setGithubConfig] = useState<GithubConfig>({});
   const [proxyUrl, setProxyUrl] = useState("");
   const [proxySaving, setProxySaving] = useState(false);
@@ -1333,17 +1327,6 @@ function UpdateCard() {
     }
   }
 
-  /** 安装已下载的更新包并重启（下载完成后的主动作，与托盘菜单同一入口）。 */
-  async function restartNow() {
-    setRestarting(true);
-    try {
-      await api.updateRestart();
-    } catch (e) {
-      setRestarting(false);
-      toast.error("重启失败", { description: api.asError(e) });
-    }
-  }
-
   async function saveProxy() {
     const value = proxyUrl.trim();
     if (value) {
@@ -1374,7 +1357,7 @@ function UpdateCard() {
   return (
     <SettingsGroup
       id="settings-updates"
-      title="自动更新"
+      title="更新检查"
     >
       <CardContent className="space-y-0 p-0">
         <div className="border-b border-border/60 px-4 py-3 text-sm sm:px-5">
@@ -1398,7 +1381,7 @@ function UpdateCard() {
 
         <SettingsFieldRow
           label="更新代理地址"
-          description="仅用于 GitHub 更新检查和安装包下载；留空表示关闭显式代理。"
+          description="仅用于 GitHub 更新检查；留空表示关闭显式代理。"
           htmlFor="update-proxy"
           className="bg-muted/25"
           operational
@@ -1441,33 +1424,18 @@ function UpdateCard() {
               </div>
               {info.hasUpdate && (
                 <DemoAction>
-                  {snapshot.phase === "readyToRestart" ? (
-                    <Button size="sm" onClick={() => void restartNow()} disabled={restarting}>
-                      {restarting ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-                      {restarting ? "正在重启…" : "重启以完成升级"}
-                    </Button>
-                  ) : (
-                    <Button size="sm" onClick={() => setInstallOpen(true)}>
-                      <ArrowUpCircle />
-                      立即升级
-                    </Button>
-                  )}
+                  <Button
+                    size="sm"
+                    onClick={() => void openReleaseUrl(info.releaseUrl ?? GITHUB_RELEASE_URL)}
+                  >
+                    <ExternalLink />
+                    打开发布页
+                  </Button>
                 </DemoAction>
-              )}
-              {info.releaseUrl && (
-                <DemoAction><Button
-                  variant="link"
-                  size="sm"
-                  className="h-auto p-0"
-                  onClick={() => void openReleaseUrl(info.releaseUrl)}
-                >
-                  打开 GitHub Release
-                </Button></DemoAction>
               )}
             </AlertDescription>
           </Alert>
         )}
-        <UpdateInstallDialog open={installOpen} onOpenChange={setInstallOpen} />
       </CardContent>
     </SettingsGroup>
   );
@@ -2061,7 +2029,7 @@ export default function SettingsPage() {
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          {api.isDemoMode() ? "限额监听、权限检测与自动更新配置。" : "自动签到、限额监听、权限检测与自动更新配置。"}
+          {api.isDemoMode() ? "限额监听、权限检测与更新检查配置。" : "自动签到、限额监听、权限检测与更新检查配置。"}
         </p>
       </header>
 

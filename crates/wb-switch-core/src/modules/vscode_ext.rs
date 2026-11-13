@@ -1143,6 +1143,7 @@ fn switch_account_after_close_inner(
         .map_err(describe_inject_error)?;
 
     set_active_account_id(account_id)?;
+    account::touch_last_used(account_id);
 
     let mut restarted = false;
     let mut relaunch_error: Option<String> = None;
