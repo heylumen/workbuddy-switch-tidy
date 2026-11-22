@@ -62,9 +62,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
+      # release published 事件比资产上传早几十秒触发过（2026-11-22 首跑就踩到），
+      # 直接下载会 404，因此轮询等待资产出现（最多 5 分钟）。
       - name: 下载线上资产
         run: |
           mkdir -p release-assets
+          for attempt in $(seq 1 30); do
+            if gh release view "$TAG" --json assets --jq '.assets | length' | grep -qv '^0$'; then
+              echo "资产已就绪（第 $attempt 次探测）"
+              break
+            fi
+            echo "资产尚未上传，10s 后重试（$attempt/30）"
+            sleep 10
+          done
           gh release download "$TAG" --dir release-assets
           ls -l release-assets
       # 注意：这里必须用 --structural。若把下载下来的文件当作「期望值」去比对线上资产，
@@ -112,6 +122,15 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          for ($attempt = 1; $attempt -le 30; $attempt++) {
+            $count = gh release view $env:TAG --json assets --jq '.assets | length'
+            if ($count -and [int]$count -gt 0) {
+              Write-Host "资产已就绪（第 $attempt 次探测）"
+              break
+            }
+            Write-Host "资产尚未上传，10s 后重试（$attempt/30）"
+            Start-Sleep -Seconds 10
+          }
           gh release download $env:TAG --dir release-assets
           Get-ChildItem release-assets | Select-Object Name, Length
       - name: 启动并观察存活 20 秒

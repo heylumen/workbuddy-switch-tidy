@@ -194,10 +194,16 @@ jobs:
       - name: npm audit (high+)
         run: npm audit --audit-level=high
 
-      - name: cargo audit
-        uses: rustsec/audit-check@v2.0.0
+      # 原先用 rustsec/audit-check：它需要 checks:write 才能回写结果，缺权限时会以
+      # "Not Found - update a check-run" 失败，把「有没有漏洞」这件事掩盖掉。
+      # 改成直接跑 cargo audit：输出明确，也与本地排查一致。
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
 
   # 前端行为测试：纯逻辑单测（node 环境），不依赖 Rust 工具链。
   frontend-tests:

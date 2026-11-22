@@ -346,15 +346,11 @@ async fn local_only(req: Request, next: Next) -> Response {
 }
 
 fn request_is_loopback(req: &Request) -> bool {
-    let host = header_text(req.headers(), header::HOST);
-    if host.is_some_and(|value| !is_loopback_authority(value)) {
-        return false;
-    }
-    let origin = header_text(req.headers(), header::ORIGIN);
-    if origin.is_some_and(|value| !is_loopback_origin(value)) {
-        return false;
-    }
-    true
+    // 用布尔表达式而不是「if … return false」两段式：clippy 对后者会报
+    // “this `if` guard returns a bool literal”（CI 以 -D warnings 运行会直接红）。
+    let host_ok = header_text(req.headers(), header::HOST).is_none_or(is_loopback_authority);
+    let origin_ok = header_text(req.headers(), header::ORIGIN).is_none_or(is_loopback_origin);
+    host_ok && origin_ok
 }
 
 fn header_text(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
