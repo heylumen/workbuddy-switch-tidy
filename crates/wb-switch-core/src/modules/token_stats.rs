@@ -45,6 +45,8 @@ struct SourceCacheState {
     entries: HashMap<String, SourceCacheEntry>,
     order: VecDeque<String>,
     bytes: usize,
+    /// 上次落盘时间（毫秒）；用于节流，避免每次 insert 都写盘。
+    last_saved_at: i64,
 }
 
 impl SourceCacheState {
@@ -86,6 +88,21 @@ impl SourceCacheState {
                 at,
             },
         );
+        self.maybe_persist();
+    }
+
+    /// 落盘节流：同一进程内 10 秒内最多写一次，避免刷新时反复写大 JSON。
+    fn maybe_persist(&mut self) {
+        // 同理：单测不写用户的缓存文件。
+        if cfg!(test) {
+            return;
+        }
+        let now = crate::modules::config::now_ms();
+        if now.saturating_sub(self.last_saved_at) < SOURCE_CACHE_SAVE_INTERVAL_MS {
+            return;
+        }
+        self.last_saved_at = now;
+        persist_source_cache(self);
     }
 }
 
@@ -93,12 +110,138 @@ static SOURCE_CACHE: OnceLock<Mutex<SourceCacheState>> = OnceLock::new();
 
 fn source_cache() -> &'static Mutex<SourceCacheState> {
     SOURCE_CACHE.get_or_init(|| {
-        Mutex::new(SourceCacheState {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            bytes: 0,
-        })
+        // 测试必须与本机真实缓存隔离：否则用户机器上有缓存文件时，
+        // 单测会读到上一次运行留下的条目，结果不可重复（2026-11-22 踩到）。
+        let state = if cfg!(test) {
+            SourceCacheState {
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+                bytes: 0,
+                last_saved_at: 0,
+            }
+        } else {
+            load_source_cache()
+        };
+        Mutex::new(state)
     })
+}
+
+/// 缓存文件版本；结构变化时递增，旧文件会被直接忽略。
+const SOURCE_CACHE_VERSION: u64 = 1;
+/// 落盘节流间隔。
+const SOURCE_CACHE_SAVE_INTERVAL_MS: i64 = 10_000;
+/// 落盘条目最长保留时间：超过后即使签名命中也不复用（防止元数据未变但内容被改写）。
+const SOURCE_CACHE_MAX_AGE_MS: i64 = 7 * 86_400_000;
+
+/// source 缓存文件路径。
+///
+/// `WB_SWITCH_TOKEN_CACHE` 可整体覆盖（指向具体文件）：集成测试是独立 crate，
+/// `cfg!(test)` 为 false，会读写**用户真实缓存**；给它一个显式出口就不必依赖
+/// 进程级 HOME 重定向。
+fn source_cache_path() -> std::path::PathBuf {
+    if let Some(override_path) = std::env::var_os("WB_SWITCH_TOKEN_CACHE") {
+        if !override_path.is_empty() {
+            return std::path::PathBuf::from(override_path);
+        }
+    }
+    crate::modules::config::store_dir().join("token-source-cache.json")
+}
+
+/// 读取磁盘缓存；文件缺失/损坏/版本不符时返回空缓存（静默降级）。
+fn load_source_cache() -> SourceCacheState {
+    load_source_cache_from(&source_cache_path())
+}
+
+fn load_source_cache_from(path: &std::path::Path) -> SourceCacheState {
+    let mut state = SourceCacheState {
+        entries: HashMap::new(),
+        order: VecDeque::new(),
+        bytes: 0,
+        last_saved_at: 0,
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return state;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return state;
+    };
+    if value.get("version").and_then(Value::as_u64) != Some(SOURCE_CACHE_VERSION) {
+        return state;
+    }
+    let now = crate::modules::config::now_ms();
+    let Some(items) = value.get("entries").and_then(Value::as_array) else {
+        return state;
+    };
+    // 按落盘顺序回填，命中容量上限时与运行时行为一致（淘汰最旧）。
+    for item in items {
+        let Some(key) = item.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(signature) = item.get("signature").and_then(Value::as_u64) else {
+            continue;
+        };
+        let at = item.get("at").and_then(Value::as_i64).unwrap_or(0);
+        if now.saturating_sub(at) > SOURCE_CACHE_MAX_AGE_MS {
+            continue;
+        }
+        let Some(value) = item.get("value") else {
+            continue;
+        };
+        let size = value.to_string().len();
+        state.insert(key.to_string(), signature, value.clone(), size, at);
+    }
+    // 读盘不算“用户可见的写盘”，把节流计时归零，后续首次插入立即可落盘。
+    state.last_saved_at = 0;
+    if token_profile_enabled() {
+        eprintln!(
+            "[token-profile] 载入磁盘缓存 {} 条 / {} KB",
+            state.entries.len(),
+            state.bytes / 1024
+        );
+    }
+    state
+}
+
+/// 原子写盘：先写临时文件再重命名，避免半截 JSON 让下次启动读到损坏缓存。
+fn persist_source_cache(state: &SourceCacheState) {
+    persist_source_cache_to(state, &source_cache_path())
+}
+
+fn persist_source_cache_to(state: &SourceCacheState, path: &std::path::Path) {
+    if state.entries.is_empty() {
+        return;
+    }
+    let entries: Vec<Value> = state
+        .order
+        .iter()
+        .filter_map(|key| {
+            let entry = state.entries.get(key)?;
+            Some(json!({
+                "key": key,
+                "signature": entry.signature,
+                "at": entry.at,
+                "value": entry.value,
+            }))
+        })
+        .collect();
+    let payload = json!({
+        "version": SOURCE_CACHE_VERSION,
+        "savedAt": crate::modules::config::now_ms(),
+        "entries": entries,
+    });
+    let Ok(text) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if std::fs::write(&tmp, text).is_err() {
+        return;
+    }
+    let _ = std::fs::rename(&tmp, path);
 }
 /// 统计缓存的内存边界：条目数、单值与总字节预算。
 const SOURCE_CACHE_MAX_ENTRIES: usize = 8;
@@ -134,6 +277,8 @@ struct CachedTokenFile {
     /// 含 usage/providerData 元数据但 JSON 损坏的行；这类错误可能隐藏用量，不能据此跳过整文件。
     unsafe_parse_errors: u64,
     max_timestamp: Option<i64>,
+    /// 已消费到「最后一个完整行末」的字节偏移；用于 append-only 增量续读。
+    offset: u64,
 }
 
 const TOKEN_FILE_CACHE_MAX_ENTRIES: usize = 32;
@@ -336,23 +481,49 @@ fn line_has_token_metadata(line: &[u8]) -> bool {
         .any(|needle| line.windows(needle.len()).any(|window| window == *needle))
 }
 
-fn parse_token_file(path: &Path, fallback_project: &str) -> Option<CachedTokenFile> {
+fn parse_token_file(
+    path: &Path,
+    fallback_project: &str,
+    prev: Option<&CachedTokenFile>,
+) -> Option<CachedTokenFile> {
     let signature = file_signature(path)?;
-    let file = std::fs::File::open(path).ok()?;
-    let mut records = Vec::new();
-    let mut parse_errors = 0u64;
-    let mut unsafe_parse_errors = 0u64;
-    let mut ai_title: Option<String> = None;
+    // 增量判据：上次已消费到完整行末（offset > 0），且文件没变短（append-only）。
+    // 说明：客户端只追加写入；若外部工具原地重写同长度内容，会因前缀相同而漏读差异，
+    // 但不会重复计数（offset 之后才读）。
+    let resume_at = prev
+        .filter(|prev| prev.offset > 0 && signature.0 >= prev.offset)
+        .map(|prev| prev.offset)
+        .unwrap_or(0);
+    let mut file = std::fs::File::open(path).ok()?;
+    if resume_at > 0 {
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(resume_at)).ok()?;
+    }
+    // 非续读（首次解析 / 文件变短 / 被改写）时丢弃旧聚合，否则已删除的行会残留。
+    let prev = if resume_at > 0 { prev } else { None };
+    let mut records = prev.map(|prev| prev.records.clone()).unwrap_or_default();
+    let mut parse_errors = prev.map_or(0, |prev| prev.parse_errors);
+    let mut unsafe_parse_errors = prev.map_or(0, |prev| prev.unsafe_parse_errors);
+    let mut ai_title: Option<String> = prev.and_then(|prev| prev.title.clone());
     let mut summary: Option<String> = None;
-    let mut session_project: Option<String> = None;
-    let mut max_timestamp: Option<i64> = None;
+    let mut session_project: Option<String> = prev.and_then(|prev| prev.session_project.clone());
+    let mut max_timestamp: Option<i64> = prev.and_then(|prev| prev.max_timestamp);
+    let mut offset = resume_at;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
-            Ok(_) => {}
+            Ok(read) => {
+                // 只有以换行结尾才算完整消费；末尾半行本次不处理，等补齐换行后再读，
+                // 否则它会先计入本次、下次又被读一遍（重复计数）。
+                if line.last() == Some(&b'\n') {
+                    offset += read as u64;
+                } else {
+                    break;
+                }
+            }
             Err(_) => {
                 parse_errors += 1;
                 unsafe_parse_errors += 1;
@@ -419,6 +590,7 @@ fn parse_token_file(path: &Path, fallback_project: &str) -> Option<CachedTokenFi
         parse_errors,
         unsafe_parse_errors,
         max_timestamp,
+        offset,
     })
 }
 
@@ -439,7 +611,18 @@ fn load_token_file(path: &Path, fallback_project: &str) -> Option<Arc<CachedToke
     }
     // 大文件也可能只有少量 usage 记录；不能仅按原始字节数拒绝缓存。
     // 缓存体积由 records 数 + 估算内存控制，而不是原始文件大小。
-    let parsed = Arc::new(parse_token_file(path, fallback_project)?);
+    // 增量续读：命中同路径的旧条目（签名已变）时，只读 offset 之后的字节。
+    let previous = TOKEN_FILE_CACHE.get().and_then(|cache| {
+        cache
+            .lock()
+            .ok()
+            .and_then(|guard| guard.entries.get(path).cloned())
+    });
+    let parsed = Arc::new(parse_token_file(
+        path,
+        fallback_project,
+        previous.as_deref(),
+    )?);
     if parsed.records.len() <= TOKEN_FILE_CACHE_MAX_RECORDS {
         let size = cached_file_bytes(&parsed);
         if let Some(cache) = TOKEN_FILE_CACHE.get() {
@@ -3285,9 +3468,12 @@ mod project_name_tests {
         .expect("write fixture");
         let value = source(root.clone(), "workbuddy", None, false);
         let text = value.to_string();
+        // 断言消息不插值整段响应：避免把可能含敏感内容的文本写进日志/panic
+        // （CodeQL rust/cleartext-logging；此处只需知道长度即可定位）。
         assert!(
             !text.contains("alice"),
-            "response leaked encoded user path: {text}"
+            "response leaked encoded user path (len={})",
+            text.len()
         );
         assert_eq!(value["projects"][0]["key"], "未知项目");
         assert_eq!(value["projects"][0]["records"], 1);
@@ -3352,5 +3538,127 @@ mod parse_error_index_tests {
         .expect("write safe fixture");
         source(root.clone(), "safe", Some(now - 30 * 86_400_000), false);
         assert!(file_index_should_skip(&safe_file, now - 30 * 86_400_000));
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::parse_token_file;
+
+    fn usage_line(input: u64, output: u64) -> String {
+        format!(
+            r#"{{"model":"m","timestamp":1760000000000,"usage":{{"inputTokens":{input},"outputTokens":{output}}}}}"#
+        ) + "
+"
+    }
+
+    fn write(path: &std::path::Path, content: &str) {
+        std::fs::write(path, content).expect("write fixture");
+    }
+
+    #[test]
+    fn append_only_continues_from_offset() {
+        let dir = std::env::temp_dir().join("wb-token-incremental");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.jsonl");
+        write(&path, &(usage_line(10, 1) + &usage_line(20, 2)));
+
+        let first = parse_token_file(&path, "p", None).expect("first parse");
+        assert_eq!(first.records.len(), 2);
+        assert_eq!(first.offset, std::fs::metadata(&path).unwrap().len());
+
+        // 追加一行后，只读 offset 之后的字节
+        let mut content = std::fs::read_to_string(&path).unwrap();
+        content.push_str(&usage_line(30, 3));
+        write(&path, &content);
+
+        let second = parse_token_file(&path, "p", Some(&first)).expect("second parse");
+        assert_eq!(second.records.len(), 3, "增量应保留旧记录并追加新记录");
+        assert_eq!(second.offset, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncation_forces_full_reparse() {
+        let dir = std::env::temp_dir().join("wb-token-truncate");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b.jsonl");
+        write(&path, &(usage_line(1, 1) + &usage_line(2, 2)));
+        let first = parse_token_file(&path, "p", None).expect("first");
+        assert_eq!(first.records.len(), 2);
+
+        // 文件变短：不能沿用旧记录（否则会出现已删除的行）
+        write(&path, &usage_line(9, 9));
+        let second = parse_token_file(&path, "p", Some(&first)).expect("second");
+        assert_eq!(second.records.len(), 1, "变短必须整份重读");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn partial_tail_line_is_deferred_not_double_counted() {
+        let dir = std::env::temp_dir().join("wb-token-partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.jsonl");
+        let full = usage_line(5, 5);
+        let (head, tail) = full.split_at(full.len() - 1);
+        write(&path, head); // 没有结尾换行
+
+        let first = parse_token_file(&path, "p", None).expect("first");
+        assert_eq!(first.records.len(), 0, "末尾半行本次不处理");
+
+        // 补齐换行后应只出现一次
+        write(&path, &format!("{head}\n"));
+        let second = parse_token_file(&path, "p", Some(&first)).expect("second");
+        assert_eq!(second.records.len(), 1, "补齐换行后只计一次");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = tail;
+    }
+}
+
+#[cfg(test)]
+mod source_cache_persist_tests {
+    use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wb-source-cache-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir.join("cache.json")
+    }
+
+    #[test]
+    fn round_trip_keeps_key_signature_and_value() {
+        let path = temp_path("roundtrip");
+        let mut state = load_source_cache_from(&path);
+        let now = crate::modules::config::now_ms();
+        // 先设好节流时间，避免 insert 顺带写真实缓存文件。
+        state.last_saved_at = now;
+        state.insert(
+            "src|k".to_string(),
+            42,
+            json!({ "ok": true, "n": 7 }),
+            16,
+            now,
+        );
+        persist_source_cache_to(&state, &path);
+
+        let loaded = load_source_cache_from(&path);
+        let entry = loaded.entries.get("src|k").expect("entry restored");
+        assert_eq!(entry.signature, 42);
+        assert_eq!(entry.value["n"], 7);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn wrong_version_is_ignored() {
+        let path = temp_path("version");
+        std::fs::write(
+            &path,
+            r#"{"version":999,"entries":[{"key":"k","signature":1,"at":1,"value":{}}]}"#,
+        )
+        .expect("write");
+        let loaded = load_source_cache_from(&path);
+        assert!(loaded.entries.is_empty(), "版本不符应整份忽略");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

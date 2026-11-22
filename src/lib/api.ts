@@ -150,6 +150,22 @@ const ROUTES: Record<string, Route> = {
   copy_sessions_cross: { method: "POST", path: "/api/sessions/copy-cross" },
   audit_session_duplicates: { method: "POST", path: "/api/sessions/audit-duplicates" },
   hide_duplicate_group: { method: "POST", path: "/api/sessions/hide-duplicate-group" },
+  hide_exact_subgroup: { method: "POST", path: "/api/sessions/hide-exact-subgroup" },
+  import_preview_file: { method: "POST", path: "/api/accounts/import-preview-file" },
+  import_file: { method: "POST", path: "/api/accounts/import-file" },
+  divergence_preview: { method: "POST", path: "/api/session-groups/divergence-preview" },
+  canonical_audit: { method: "POST", path: "/api/sessions/canonical-audit" },
+  canonical_resolve: { method: "POST", path: "/api/sessions/canonical" },
+  search_sessions: { method: "POST", path: "/api/sessions/search" },
+  export_session_markdown: { method: "POST", path: "/api/sessions/export-markdown" },
+  account_merge_scan: { method: "POST", path: "/api/accounts/merge-scan" },
+  account_merge_apply: { method: "POST", path: "/api/accounts/merge-apply" },
+  storage_scan: { method: "POST", path: "/api/storage/scan" },
+  storage_orphan_scan: { method: "POST", path: "/api/storage/orphan-scan" },
+  storage_orphan_trash: { method: "POST", path: "/api/storage/orphan-trash" },
+  storage_move_to_trash: { method: "POST", path: "/api/storage/move-to-trash" },
+  storage_restore_trash: { method: "POST", path: "/api/storage/restore-trash" },
+  storage_purge_trash: { method: "POST", path: "/api/storage/purge-trash" },
   list_duplicate_hides: { method: "POST", path: "/api/sessions/duplicate-hides" },
   restore_duplicate_hide: { method: "POST", path: "/api/sessions/restore-duplicate-hide" },
   session_links_preview: { method: "POST", path: "/api/session-links/preview" },
@@ -536,12 +552,13 @@ export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; acc
   return call("export_accounts", { accountIds });
 }
 
-/** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）。 */
+/** 桌面端：把完整记录写入用户选择的路径（系统保存对话框产物）；给了口令即加密导出。 */
 export function exportAccountsToPath(
   accountIds: string[],
   path: string,
+  password?: string,
 ): Promise<{ ok: boolean; path: string }> {
-  return call("export_accounts_to_path", { accountIds, path });
+  return call("export_accounts_to_path", { accountIds, path, password });
 }
 
 export function previewImportAccounts(
@@ -557,7 +574,6 @@ export function importAccounts(fileText: string, indexes: number[]): Promise<Imp
 export function switchAccount(args: {
   accountId: string;
   restart?: boolean;
-  shareSessions?: boolean;
   copySessionIds?: string[];
   syncSelections?: SessionSyncSelection[];
 }): Promise<SwitchResult> {
@@ -1228,4 +1244,307 @@ export function getErrorLogPath(): Promise<string> {
 export function revealErrorLog(): Promise<void> {
   if (demoModeEnabled || isWebui()) return Promise.resolve();
   return call<unknown>("reveal_error_log").then(() => undefined);
+}
+
+/** 只软隐藏「完全相同子组」中除保留项外的成员（同组内的分叉成员不动）。 */
+export function hideExactSubgroup(
+  accountId: string,
+  cwd: string,
+  title: string,
+  sessionIds: string[],
+  keepSessionId: string,
+  unlinkLinked = true,
+): Promise<{
+  ok: boolean;
+  hidden?: number;
+  unlinked?: number;
+  skippedLinked?: number;
+  keepSessionId?: string;
+  kind?: string;
+  backup?: string;
+  restoreRecordSaved?: boolean;
+  restoreRecordError?: string | null;
+  reason?: string;
+}> {
+  return call("hide_exact_subgroup", {
+    accountId,
+    cwd,
+    title,
+    sessionIds,
+    keepSessionId,
+    unlinkLinked,
+  });
+}
+
+export interface StorageCategory {
+  id: string;
+  label: string;
+  hint: string;
+  bytes: number;
+  files: number;
+  trashable: boolean;
+  needsClientClosed: boolean;
+  exists: boolean;
+}
+
+export interface TrashEntry {
+  id: string;
+  categoryId: string;
+  label: string;
+  variant: string;
+  originalPath: string;
+  bytes: number;
+  files: number;
+  createdAt: number;
+}
+
+export interface StorageScan {
+  ok: boolean;
+  variant: string;
+  storeRoot: string;
+  dataRoot: string;
+  categories: StorageCategory[];
+  trashableBytes: number;
+  trash: { bytes: number; files: number; entries: TrashEntry[] };
+  reason?: string;
+}
+
+export function storageScan(variant: "cn" | "ai"): Promise<StorageScan> {
+  return call("storage_scan", { variant });
+}
+
+export function storageMoveToTrash(variant: "cn" | "ai", categoryId: string) {
+  return call("storage_move_to_trash", { variant, categoryId }) as Promise<{
+    ok: boolean;
+    entry?: TrashEntry;
+    reason?: string;
+  }>;
+}
+
+export function storageRestoreTrash(entryId: string) {
+  return call("storage_restore_trash", { entryId }) as Promise<{
+    ok: boolean;
+    restoredTo?: string;
+    reason?: string;
+  }>;
+}
+
+export function storagePurgeTrash(olderThanDays: number) {
+  return call("storage_purge_trash", { olderThanDays }) as Promise<{
+    ok: boolean;
+    purged?: number;
+    bytes?: number;
+  }>;
+}
+
+export interface AccountMergeItem {
+  id: string;
+  label: string;
+  hint: string;
+  sourceExists: boolean;
+  sourceBytes: number;
+  targetExists: boolean;
+  targetBytes: number;
+}
+
+export interface AccountMergeScan {
+  ok: boolean;
+  sourceUid: string;
+  targetUid: string;
+  items: AccountMergeItem[];
+  notMigratable: string[];
+  reason?: string;
+}
+
+export function accountMergeScan(accountId: string, targetAccountId: string): Promise<AccountMergeScan> {
+  return call("account_merge_scan", { accountId, targetAccountId });
+}
+
+export function accountMergeApply(
+  accountId: string,
+  targetAccountId: string,
+  itemIds: string[],
+  overwrite: boolean,
+) {
+  return call("account_merge_apply", { accountId, targetAccountId, itemIds, overwrite }) as Promise<{
+    ok: boolean;
+    copied?: { id: string; label: string; bytes: number }[];
+    skipped?: { id: string; label?: string; reason: string }[];
+    backedUp?: number;
+    backup?: string | null;
+    reason?: string;
+  }>;
+}
+
+export interface OrphanBodyScan {
+  ok: boolean;
+  count: number;
+  bytes: number;
+  deletedSessions?: number;
+  sample?: { name: string; bytes: number }[];
+  needsClientClosed?: boolean;
+  reason?: string;
+}
+
+/** 只读扫描「已删除会话的正文残留」。 */
+export function storageOrphanScan(variant: "cn" | "ai"): Promise<OrphanBodyScan> {
+  return call("storage_orphan_scan", { variant });
+}
+
+/** 把残留正文移入回收站（多文件条目，可整条恢复；需先退出客户端）。 */
+export function storageOrphanTrash(variant: "cn" | "ai") {
+  return call("storage_orphan_trash", { variant }) as Promise<{
+    ok: boolean;
+    moved?: number;
+    bytes?: number;
+    reason?: string;
+  }>;
+}
+
+/** 导出指定会话为 Markdown（只读）。 */
+export function exportSessionMarkdown(
+  accountId: string,
+  sessionId: string,
+  title?: string,
+): Promise<{
+  ok: boolean;
+  markdown?: string;
+  messages?: number;
+  records?: number;
+  bytes?: number;
+  fileName?: string;
+  readError?: string | null;
+  reason?: string;
+}> {
+  return call("export_session_markdown", { accountId, sessionId, title });
+}
+
+export interface SessionSearchHit {
+  sessionId: string;
+  uid: string;
+  title: string;
+  cwd: string;
+  updatedAt: number;
+  accountId: string | null;
+  accountName: string | null;
+  match: "title" | "body";
+}
+
+export interface SessionSearchResult {
+  ok: boolean;
+  items: SessionSearchHit[];
+  total: number;
+  bodyScanned?: number;
+  truncated?: boolean;
+  reason?: string;
+}
+
+/** 全局会话搜索：标题默认，可选正文扫描。 */
+export function searchSessions(
+  variant: "cn" | "ai",
+  query: string,
+  limit = 30,
+  includeBody = false,
+): Promise<SessionSearchResult> {
+  return call("search_sessions", { variant, query, limit, includeBody });
+}
+
+/** 按路径预览导入文件（桌面端优先；解析在 Rust 侧完成）。加密备份需传口令。 */
+export function previewImportFile(path: string, password?: string) {
+  return call("import_preview_file", { path, password }) as Promise<{
+    accounts: { index: number; uid: string; nickname: string; email: string; hasToken: boolean; encrypted: boolean }[];
+    total: number;
+  }>;
+}
+
+/** 按路径导入账号；加密备份需传口令。 */
+export function importAccountsFile(
+  path: string,
+  indexes: number[],
+  password?: string,
+): Promise<ImportResult> {
+  return call("import_file", { path, indexes, password });
+}
+
+export interface CanonicalCluster {
+  title: string;
+  cwd: string;
+  accountCount: number;
+  copyCount: number;
+  bytes: number;
+  covered: boolean;
+  members: { sessionId: string; uid: string; updatedAt: number; bytes: number; covered: boolean }[];
+}
+
+export interface CanonicalAudit {
+  ok: boolean;
+  totalSessions?: number;
+  oversized?: number;
+  budgetExhausted?: boolean;
+  cached?: boolean;
+  cachedAt?: number;
+  clusters: CanonicalCluster[];
+  stats?: {
+    logicalClusters: number;
+    coveredClusters: number;
+    uncoveredClusters: number;
+    returned: number;
+  };
+  reason?: string;
+}
+
+/** 逻辑会话普查：跨账号同一段对话的族群（只读）。 */
+export function auditCanonical(
+  variant: "cn" | "ai",
+  limit = 30,
+  force = false,
+): Promise<CanonicalAudit> {
+  return call("canonical_audit", { variant, limit, force });
+}
+
+/** 解析某个会话所属的逻辑会话（canonical/alias）。 */
+export function resolveSessionCanonical(
+  variant: "cn" | "ai",
+  uid: string,
+  sessionId: string,
+): Promise<{
+  ok: boolean;
+  covered: boolean;
+  canonicalId: string | null;
+  memberCount?: number;
+  accountCount?: number;
+  members?: { uid: string; sessionId: string; state: string; variant: string }[];
+  reason?: string;
+}> {
+  return call("canonical_resolve", { variant, uid, sessionId });
+}
+
+export interface DivergenceMemberPreview {
+  uid: string;
+  sessionId: string;
+  variant: string;
+  messages: number;
+  beyondCommon: number;
+  items: { role: string; text: string }[];
+}
+
+export interface DivergencePreview {
+  ok: boolean;
+  group_id?: string;
+  comparable?: number;
+  commonPrefix?: number;
+  /** 是否有副本因超大而采用"只比开头若干条"的采样模式。 */
+  sampled?: boolean;
+  members: DivergenceMemberPreview[];
+  unavailable?: { sessionId: string; uid: string; reason: string; variant: string }[];
+  reason?: string;
+}
+
+/** 消息级分叉预览：各副本「超出共同前缀」的消息。 */
+export function divergencePreview(
+  groupId: string,
+  variant: "cn" | "ai",
+  maxMessages = 10,
+): Promise<DivergencePreview> {
+  return call("divergence_preview", { groupId, variant, maxMessages });
 }

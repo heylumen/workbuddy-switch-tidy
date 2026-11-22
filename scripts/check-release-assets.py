@@ -23,10 +23,86 @@ import sys
 import urllib.request
 from pathlib import Path
 
+# 两种调用模式：
+#   A) 发布前（本地有产物）：check-release-assets.py <tag> <本地exe> <本地latest.json>
+#      逐个核对线上 name / label / size 与本地一致；
+#   B) 发版后验收（只有线上文件）：check-release-assets.py --structural --tag <tag> --dir <目录>
+#      按 tag 推导应有形状，不依赖本地产物。
 REPO = "heylumen/workbuddy-switch-tidy"
 
 
+def structural_check(tag: str, directory: Path) -> tuple[list[str], dict]:
+    """结构校验：不依赖本地构建产物，只看「一个版本应当发什么」。
+
+    为什么需要：发版后验收时我们只能拿到**线上**资产，若把下载下来的文件当作
+    期望值去比对，name/label/size 三项都会恒真（等于没检查）。此模式改为按 tag
+    推导应有的资产结构。
+    """
+    import re as _re
+
+    version = tag[1:] if tag.startswith("v") else tag
+    problems: list[str] = []
+    facts: dict = {"tag": tag, "version": version, "mode": "structural"}
+    files = sorted(p for p in directory.iterdir() if p.is_file())
+    exes = [p for p in files if p.suffix.lower() == ".exe"]
+    facts["files"] = [p.name for p in files]
+
+    pattern = _re.compile(r"^workbuddy-switch-tidy_(\d+\.\d+\.\d+)\.exe$")
+    if len(exes) != 1:
+        problems.append(f"应当恰好 1 个 .exe，实际 {len(exes)} 个：{[p.name for p in exes]}")
+    for path in exes:
+        match = pattern.match(path.name)
+        if not match:
+            problems.append(f"EXE 命名不符合 workbuddy-switch-tidy_<版本>.exe：{path.name}")
+        elif match.group(1) != version:
+            problems.append(f"EXE 版本 {match.group(1)} 与 tag {version} 不一致")
+        size = path.stat().st_size
+        facts["exe_bytes"] = size
+        if size < 20 * 1024 * 1024:
+            problems.append(f"EXE 体积 {size} 字节偏小，疑似构建残次")
+
+    manifest = directory / "latest.json"
+    if not manifest.is_file():
+        problems.append("缺少 latest.json")
+    else:
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            problems.append(f"latest.json 不是合法 JSON：{error}")
+            data = {}
+        facts["manifest_version"] = data.get("version")
+        if str(data.get("version", "")) != version:
+            problems.append(f"latest.json version={data.get('version')!r} 与 tag {version} 不一致")
+
+    forbidden = [p.name for p in files if p.suffix.lower() in {".sig", ".msi", ".dmg", ".deb", ".appimage"}]
+    if forbidden:
+        problems.append(f"出现不应发布的资产：{forbidden}")
+    return problems, facts
+
+
 def main() -> int:
+    # --structural --tag vX.Y.Z --dir <目录>：发版后验收用（只看结构，不比对本地文件）
+    if "--structural" in sys.argv:
+        import argparse as _argparse
+
+        parser = _argparse.ArgumentParser(description="发布资产结构校验")
+        parser.add_argument("--structural", action="store_true")
+        parser.add_argument("--tag", required=True)
+        parser.add_argument("--dir", default=".")
+        parser.add_argument("--json", action="store_true")
+        args = parser.parse_args()
+        problems, facts = structural_check(args.tag, Path(args.dir))
+        if args.json:
+            print(json.dumps({"ok": not problems, "problems": problems, "facts": facts},
+                             ensure_ascii=False, indent=2))
+        elif problems:
+            print("❌ 发布资产结构不合规：")
+            for item in problems:
+                print(" -", item)
+        else:
+            print(f"✅ 发布资产结构合规：{facts.get('exe_bytes', 0):,} B + latest.json v{facts['version']}")
+        return 1 if problems else 0
+
     if len(sys.argv) < 3:
         print(__doc__)
         return 2

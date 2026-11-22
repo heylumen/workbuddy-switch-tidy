@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import { AccountCard } from "@/components/account-card";
+import { AccountsHealthBar } from "@/components/accounts-health-bar";
 import { AccountInfoDialog } from "@/components/account-info-dialog";
 import { CopyMemoryDialog } from "@/components/copy-memory-dialog";
 import { JetbrainsSwitchDialog } from "@/components/jetbrains-switch-dialog";
@@ -224,7 +225,16 @@ export default function AccountsPage() {
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
-  /** 复制本地工作记忆弹窗 */
+  /** 把异常条里的账号定位到卡片：滚动到视野内并短暂高亮。 */
+  function focusAccount(accountId: string) {
+    const element = document.querySelector(`[data-account-card="${accountId}"]`);
+    if (!(element instanceof HTMLElement)) return;
+    element.scrollIntoView({ behavior: "smooth", block: "center" });
+    element.classList.add("ring-2", "ring-amber-500/60");
+    window.setTimeout(() => element.classList.remove("ring-2", "ring-amber-500/60"), 1600);
+  }
+
+  /** 账号资料迁移弹窗（记忆 / 人格 / 偏好 / 专家） */
   const [copyMemoryOpen, setCopyMemoryOpen] = useState(false);
   /** 切换 CodeBuddy CLI 确认目标（null=关闭） */
   const [cliSwitchTarget, setCliSwitchTarget] = useState<AccountMeta | null>(null);
@@ -1027,12 +1037,12 @@ export default function AccountsPage() {
                     className="size-9 rounded-lg"
                     disabled={api.isDemoMode() || accounts.filter((account) => Boolean(account.uid)).length < 2}
                     onClick={() => setCopyMemoryOpen(true)}
-                    aria-label="复制本地工作记忆"
+                    aria-label="迁移账号资料（记忆/人格/偏好）"
                   >
                     <Copy />
                   </Button>
                 </TooltipTrigger>
-                <TooltipContent side="top">复制本地工作记忆</TooltipContent>
+                <TooltipContent side="top">迁移账号资料（记忆 / 人格 / 偏好）</TooltipContent>
               </Tooltip>
               <Select value={sortMode} onValueChange={changeSortMode}>
                 <SelectTrigger
@@ -1087,6 +1097,9 @@ export default function AccountsPage() {
             </div>
           </TooltipProvider>
         </div>
+        {!loading && visibleAccounts.length > 0 ? (
+          <AccountsHealthBar accounts={visibleAccounts} onFocus={focusAccount} />
+        ) : null}
         {loading && visibleAccounts.length === 0 ? (
           <div className="flex items-center gap-2 py-16 text-sm text-muted-foreground">
             <Loader2 className="animate-spin" />

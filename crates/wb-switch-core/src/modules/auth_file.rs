@@ -50,17 +50,50 @@ pub fn read_auth_file_at(path: &Path) -> Option<Value> {
 }
 
 /// 切换前备份当前认证文件，返回备份路径。对照 server.py `backup_auth_file`。
-pub fn backup_auth_file(variant: WbVariant) -> Option<PathBuf> {
-    let path = auth_file_path(variant);
+///
+/// **失败即阻断**：认证文件存在但备份不出来时返回 `Err`，由切号流程终止本次切换。
+/// 备份是「切错了还能切回去」的唯一保障（上游 issue #215：切号后账号登不上、
+/// 无备份可回滚）。认证文件本来不存在（首次登录）不算失败，返回 `Ok(None)`。
+pub fn backup_auth_file(variant: WbVariant) -> Result<Option<PathBuf>, String> {
+    backup_auth_file_at(&auth_file_path(variant), &backup_dir(), variant)
+}
+
+/// [`backup_auth_file`] 的可注入路径版本：单测用它验证「备份失败必须阻断切号」，
+/// 不必改动进程级的 home 目录。
+fn backup_auth_file_at(
+    path: &Path,
+    dir: &Path,
+    variant: WbVariant,
+) -> Result<Option<PathBuf>, String> {
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    let dir = backup_dir();
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir).map_err(|error| backup_failure_hint(dir, error))?;
     let ts = utc_iso();
     let dest = dir.join(variant.backup_file_name(&ts));
-    std::fs::copy(&path, &dest).ok()?;
-    Some(dest)
+    std::fs::copy(path, &dest).map_err(|error| {
+        format!(
+            "备份认证文件失败（{} → {}）：{error}。{}",
+            path.display(),
+            dest.display(),
+            BACKUP_ABORT_HINT
+        )
+    })?;
+    Ok(Some(dest))
+}
+
+/// 备份失败一律阻断切号的统一说明：告诉用户「发生了什么 + 怎么解决」，
+/// 否则 fail-closed 会把用户卡在「切号没反应」的状态里。
+const BACKUP_ABORT_HINT: &str = "为避免切坏后无法回滚，已取消本次切换；\
+请检查磁盘剩余空间、备份目录（~/.wb-switch/backups）是否可写、\
+以及是否被杀软拦截后再试。";
+
+fn backup_failure_hint(dir: &Path, error: std::io::Error) -> String {
+    format!(
+        "创建备份目录失败（{}）：{error}。{}",
+        dir.display(),
+        BACKUP_ABORT_HINT
+    )
 }
 
 /// 从账号库记录构造官方 account 字段。对照 server.py `build_account_obj`。
@@ -426,6 +459,38 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn backup_failure_returns_error_with_actionable_hint() {
+        // 备份目录的父级是个普通文件 → create_dir_all 必然失败，模拟磁盘/权限异常。
+        let root = std::env::temp_dir().join(format!("wb-backup-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let auth = root.join("auth.json");
+        std::fs::write(&auth, "{\"auth\":{}}").unwrap();
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let backup_dir = blocker.join("backups");
+
+        let error = backup_auth_file_at(&auth, &backup_dir, WbVariant::Cn).unwrap_err();
+        assert!(error.contains("已取消本次切换"), "{error}");
+        assert!(
+            error.contains("磁盘剩余空间"),
+            "文案要给出排查方向：{error}"
+        );
+        // 原认证文件不能被改动
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), "{\"auth\":{}}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn missing_auth_file_is_not_an_error() {
+        let root = std::env::temp_dir().join(format!("wb-backup-none-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let backup_dir = root.join("backups");
+        let outcome = backup_auth_file_at(&root.join("absent.json"), &backup_dir, WbVariant::Cn);
+        assert!(matches!(outcome, Ok(None)));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

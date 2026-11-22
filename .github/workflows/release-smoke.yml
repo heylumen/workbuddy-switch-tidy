@@ -1,0 +1,152 @@
+name: release-smoke
+
+# 发版后自动验收（借鉴社区分支做法，2026-11-22 引入）
+#
+# 为什么需要：2026-11-22 发生过「本地构建成功、界面白屏」的事故——单测/clippy/tsc/vite build
+# 全绿，但产物在真实浏览器里根本没挂载。发出去才知道就太晚了。
+#
+# 覆盖三类可自动判定的风险：
+#   1. 白屏类：用**该 tag 的源码**重建前端，真实浏览器断言 window.__WB_MOUNTED__ === true；
+#   2. 资产类：单文件 EXE 命名/label/体积与线上一致（复用 scripts/check-release-assets.py）；
+#   3. 启动类：下载线上 EXE 实际启动并观察存活（GUI 窗口无法脚本化，此项为参考级）。
+#
+# 不做的事：不自动修 Release、不改代码、不发通知。失败只报告，处置留给人。
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要验收的 tag（如 v1.0.17）"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-smoke-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: true
+
+jobs:
+  frontend-mount:
+    name: 前端挂载（白屏类）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 版本一致性
+        run: python3 scripts/check-version-consistency.py
+      - name: 构建前端
+        run: |
+          npm ci
+          npm run build
+      - name: 真实浏览器断言已挂载
+        run: python3 scripts/smoke-webui.py --dist dist --require-browser
+      - name: 记录结论
+        if: always()
+        run: |
+          echo "- 前端挂载（白屏类）：${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+  assets:
+    name: 发布资产（命名/体积/一致）
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - name: 下载线上资产
+        run: |
+          mkdir -p release-assets
+          gh release download "$TAG" --dir release-assets
+          ls -l release-assets
+      # 注意：这里必须用 --structural。若把下载下来的文件当作「期望值」去比对线上资产，
+      # name/label/size 三项都会恒真（等于没检查）——这是本 workflow 首版的设计错误，已改。
+      - name: 资产结构校验（按 tag 推导应有形状）
+        run: |
+          python3 scripts/check-release-assets.py --structural --tag "$TAG" --dir release-assets
+      - name: latest.json 版本与 tag 一致
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          tag = os.environ["TAG"].lstrip("v")
+          data = json.load(open("release-assets/latest.json", encoding="utf-8"))
+          if str(data.get("version")) != tag:
+              sys.exit(f"latest.json version={data.get('version')!r} 与 tag {tag} 不一致")
+          if not str(data.get("notes", "")).strip():
+              sys.exit("latest.json 缺少 notes（更新弹窗需要显示说明）")
+          print(f"✅ latest.json 版本 {tag} 与 notes 就绪")
+          PY
+      - name: /releases/latest 指向该 tag
+        run: |
+          LATEST=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name)
+          echo "线上 latest=$LATEST 期望=$TAG"
+          test "$LATEST" = "$TAG" || { echo "最新发布不是该 tag"; exit 1; }
+      - name: 记录结论
+        if: always()
+        run: |
+          echo "- 发布资产（命名/体积/一致）：${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+  launch:
+    name: 线上 EXE 启动存活（参考级）
+    runs-on: windows-latest
+    # GUI 依赖桌面会话，GitHub Windows runner 上不保证能渲染；
+    # 这一项只作参考，失败不阻塞发版。用 **step 级** continue-on-error +
+    # outputs 暴露真实结果：job 级 continue-on-error 会让 needs.*.result 恒为
+    # success，汇总表就永远看不出"参考级失败"。
+    outputs:
+      advisory: ${{ steps.launch.outcome }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 下载线上 EXE
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          gh release download $env:TAG --dir release-assets
+          Get-ChildItem release-assets | Select-Object Name, Length
+      - name: 启动并观察存活 20 秒
+        id: launch
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem release-assets -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "未找到 EXE" }
+          $proc = Start-Process -FilePath $exe.FullName -PassThru
+          Start-Sleep -Seconds 20
+          $proc.Refresh()
+          if ($proc.HasExited) { throw "EXE 启动后退出，退出码 $($proc.ExitCode)" }
+          Write-Host "✅ 进程存活 20 秒（PID $($proc.Id)）"
+          try { $proc.Kill() } catch {}
+      - name: 记录结论
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_STEP_SUMMARY "- 线上 EXE 启动存活（参考级）：${{ steps.launch.outcome }}"
+
+  summary:
+    name: 结论
+    runs-on: ubuntu-latest
+    needs: [frontend-mount, assets, launch]
+    if: always()
+    steps:
+      - name: 汇总
+        run: |
+          echo "## release-smoke 结论" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 结果 |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| 前端挂载（白屏类） | ${{ needs.frontend-mount.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 发布资产 | ${{ needs.assets.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| EXE 启动存活（参考级） | ${{ needs.launch.outputs.advisory }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "后端/桌面窗口的界面渲染仍以人工打开确认为准（WebView2 无法可靠脚本化截图）。" >> $GITHUB_STEP_SUMMARY

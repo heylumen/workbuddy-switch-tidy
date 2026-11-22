@@ -17,6 +17,31 @@ npm run build:app        # 构建 debug .app（含前端资源补丁）
 npm run build:app:release  # 构建 release .app + 签名更新包
 ```
 
+### 前端运行时冒烟（必做）
+
+`vite build` 成功只说明「能构建」，不代表「能运行」。2026-11-22 就因为一次分包改动
+（`manualChunks`）导致产物构建成功、但入口模块求值失败，桌面端直接白屏，
+而当时单测 / clippy / tsc / build / 质量脚本全绿。
+
+交付前必须跑：
+
+```bash
+npm run build            # tsc + vite build
+npm run smoke            # 真实浏览器断言 window.__WB_MOUNTED__ === true
+npm run smoke:exe        # 可选：直接校验可执行文件内嵌的前端产物
+```
+
+冒烟脚本（`scripts/smoke-webui.py`）用系统浏览器 + CDP，不引入新依赖；失败时会打印
+资源 404 / 脚本异常详情。CI 的 `quality-gates` 已包含该步骤。
+
+**桌面窗口无法脚本化验证**：Tauri 窗口走内嵌协议、不监听 HTTP，且 Tauri 屏蔽了 WebView2
+的远程调试端口；`PrintWindow` 抓 WebView2 只能拿到空白图（实测 16×16）。所以桌面端
+**每次交付前必须人工打开一次**（本机与 CI 都做不到自动判定）。好在这类失败会由下面的
+「错误详情」直接说明原因，不再是黑盒白屏。
+
+启动失败时，兜底页会显示「错误详情（可截图反馈）」，内容来自 `window.__WB_BOOT_ERRORS__`
+（资源加载失败 / 脚本错误 / 未处理拒绝），可直接用于定位。
+
 ## 发布新版本
 
 签名密钥（自动更新用）存放于 `~/.wb-switch/wb-switch-updater.key`，构建脚本通过

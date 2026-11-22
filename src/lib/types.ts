@@ -32,6 +32,10 @@ export interface AccountMeta {
   lastUsedAt?: number | null;
   needsRelogin: boolean;
   needsReloginReason: string | null;
+  /** 上次刷新失败的说明（临时失败，区别于需要重新登录）。 */
+  last_refresh_error?: string | null;
+  /** 上次刷新失败的时间戳（毫秒）。 */
+  last_refresh_error_at?: number | null;
   /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
   variant?: WbVariant;
   /**
@@ -172,6 +176,19 @@ export interface SessionDuplicateAuditSession {
   linked?: boolean;
 }
 
+export interface SessionDuplicateAuditSubgroup {
+  /** 子组成员数（≥2）。 */
+  count: number;
+  /** 每份的记录条数（子组内逐条一致，故相同）。 */
+  records: number;
+  /** 子组成员会话 id。 */
+  sessions: string[];
+  /** 建议保留（最新）的会话 id。 */
+  keepSessionId?: string | null;
+  /** 可安全隐藏的份数 = count - 1。 */
+  safeToHide: number;
+}
+
 export interface SessionDuplicateAuditGroup {
   uid: string;
   cwd: string;
@@ -181,6 +198,10 @@ export interface SessionDuplicateAuditGroup {
   commonPrefix?: number;
   suggested: string;
   suggestedKeepSessionId?: string | null;
+  /** 逐条完全一致的子组（≥2 个成员）：整组为 divergent 时这些子组仍可安全收敛。 */
+  exactSubgroups?: SessionDuplicateAuditSubgroup[];
+  /** 各子组可安全隐藏份数之和。 */
+  hideableExact?: number;
   sessions: SessionDuplicateAuditSession[];
 }
 

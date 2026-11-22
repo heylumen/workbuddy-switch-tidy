@@ -7,3 +7,36 @@
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+
+# 行尾统一（2026-11-22）：此前每次提交都刷一屏 “LF will be replaced by CRLF”，
+# 说明本地 core.autocrlf=true 与仓库 LF 冲突；跨平台检出后脚本/CI 行为也可能不一致。
+# 这里只钉本项目的源码与配置（不动未知文件），Windows 批处理保持 CRLF。
+*.rs       text eol=lf
+*.toml     text eol=lf
+*.ts       text eol=lf
+*.tsx      text eol=lf
+*.js       text eol=lf
+*.mjs      text eol=lf
+*.cjs      text eol=lf
+*.json     text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.html     text eol=lf
+*.css      text eol=lf
+*.py       text eol=lf
+*.sh       text eol=lf
+*.sql      text eol=lf
+*.ps1      text eol=crlf
+*.props    text eol=lf
+*.editorconfig text eol=lf
+*.cmd      text eol=crlf
+*.bat      text eol=crlf
+*.exe      binary
+*.png      binary
+*.ico      binary
+*.jpg      binary
+*.woff     binary
+*.woff2    binary
+.gitattributes text eol=lf
+.gitignore     text eol=lf

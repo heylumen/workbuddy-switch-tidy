@@ -1,6 +1,8 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import { ArrowRight, Check, ChevronDown, ChevronLeft, Copy, Ellipsis, FileText, Folder, Info, Link2, Loader2, Plus, RefreshCw, TriangleAlert, Unlink, X } from "lucide-react";
+import { ArrowRight, Check, ChevronDown, ChevronLeft, Copy, Ellipsis, FileDown, FileText, Folder, Info, Link2, Loader2, Plus, RefreshCw, TriangleAlert, Unlink, X } from "lucide-react";
+import { toast } from "sonner";
 import { DemoAction } from "@/components/demo-action";
+import { DivergencePreviewDialog } from "@/components/divergence-preview-dialog";
 import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, VscodeExtAiMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
@@ -11,6 +13,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigge
 import { Popover, PopoverArrow, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import * as api from "@/lib/api";
 import { displayName } from "@/lib/account-display";
 import { accountVariant, variantIsIntl, variantLabel } from "@/lib/variant";
 import type { SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupUnifyPlan } from "@/lib/types";
@@ -54,6 +57,41 @@ export function GroupDetailPanel(props: GroupDetailPanelProps) {
   const [unlinkTargetId, setUnlinkTargetId] = useState<string | null>(null);
   const [unlinkBusy, setUnlinkBusy] = useState(false);
   const unlinkTarget = detail?.members.find((member) => member.memberId === unlinkTargetId) ?? null;
+
+  /** 导出该副本为 Markdown（只读；浏览器与桌面端都用 Blob 下载）。 */
+  async function exportMarkdown(member: SessionGroupMemberDetail) {
+    if (!member.accountId) {
+      toast.error("无法导出", { description: "该副本未关联到具体账号" });
+      return;
+    }
+    try {
+      const result = await api.exportSessionMarkdown(member.accountId, member.sessionId, member.title);
+      if (!result.ok || !result.markdown) {
+        toast.error("导出失败", { description: result.reason || "未知错误" });
+        return;
+      }
+      const blob = new Blob([result.markdown], { type: "text/markdown;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = result.fileName || `${member.sessionId}.md`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      if (result.readError) {
+        toast.warning(`已导出 ${result.messages ?? 0} 条消息，但内容不完整`, {
+          description: result.readError,
+        });
+      } else {
+        toast.success(`已导出 ${result.messages ?? 0} 条消息`, {
+          description: `${Math.round((result.bytes ?? 0) / 1024)} KB · Markdown`,
+        });
+      }
+    } catch (e) {
+      toast.error("导出失败", { description: api.asError(e) });
+    }
+  }
   const graphRef = useRef<HTMLDivElement>(null);
   const [connections, setConnections] = useState<GraphLine[]>([]);
   useLayoutEffect(() => {
@@ -223,7 +261,7 @@ export function GroupDetailPanel(props: GroupDetailPanelProps) {
           {divergence && <div className="relationship-group-labels mb-2 flex items-center justify-between gap-3 text-[11px] leading-4">
             <span className="rounded-md bg-amber-500/10 px-2 py-1 font-medium text-amber-800 dark:text-amber-200">共同旧版 · {divergence.commonMemberIds.length} 个账号</span>
             <ArrowRight className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <span className="rounded-md bg-destructive/10 px-2 py-1 font-medium text-destructive">独立更新 · {divergence.branches.length} 条分支</span>
+            <span className="flex items-center gap-1.5"><span className="rounded-md bg-destructive/10 px-2 py-1 font-medium text-destructive">独立更新 · {divergence.branches.length} 条分支</span><DivergencePreviewDialog groupId={detail.groupId} variant={detail.groupVariant} members={detail.members} /></span>
           </div>}
           <div ref={graphRef} className="relationship-graph" data-lineage={!!divergence}>
           <svg className="relationship-connections" aria-hidden="true">{connections.map((line, index) => <g key={index} data-line-tone={line.tone}><path d={line.path} />{line.points.map((point, pointIndex) => <circle key={pointIndex} cx={point.x} cy={point.y} r="3.5" />)}</g>)}</svg>
@@ -254,6 +292,7 @@ export function GroupDetailPanel(props: GroupDetailPanelProps) {
                             <Button variant="ghost" size="icon" className="size-6 text-muted-foreground hover:text-foreground" aria-label={`${member.accountName} 的操作`} title="更多操作"><Ellipsis className="size-3.5" /></Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end" className="w-36">
+                            <DropdownMenuItem onSelect={() => void exportMarkdown(member)}><FileDown />导出 Markdown</DropdownMenuItem>
                             <DropdownMenuItem onSelect={() => setUnlinkTargetId(member.memberId)}><Unlink />取消关联</DropdownMenuItem>
                           </DropdownMenuContent>
                         </DropdownMenu>

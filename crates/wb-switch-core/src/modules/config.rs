@@ -242,7 +242,14 @@ pub fn clear_workbuddy_exe_cache(variant: WbVariant) {
         return;
     }
     let content = serde_json::to_string_pretty(&root).unwrap_or_default();
-    let _ = atomic_write(&file, &content);
+    // 写失败不能静默：缓存丢了会退化为「每次重新探测」，用户无从得知。
+    if let Err(error) = atomic_write(&file, &content) {
+        crate::modules::error_log::record(
+            "backend",
+            "保存应用路径缓存失败",
+            &format!("{}: {error}", file.display()),
+        );
+    }
 }
 
 pub fn codebuddy_cn_app_cache_file() -> PathBuf {
@@ -605,7 +612,9 @@ pub fn add_checkin_log(entry: &Value) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut logs = load_checkin_logs();
     logs.push(entry.clone());
-    let _ = save_checkin_logs_unlocked(&logs);
+    if let Err(error) = save_checkin_logs_unlocked(&logs) {
+        crate::modules::error_log::record("backend", "保存签到日志失败", &error.to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +840,9 @@ pub fn save_rotate_logs(logs: &[Value]) -> std::io::Result<()> {
 pub fn add_rotate_log(entry: &Value) {
     let mut logs = load_rotate_logs();
     logs.push(entry.clone());
-    let _ = save_rotate_logs(&logs);
+    if let Err(error) = save_rotate_logs(&logs) {
+        crate::modules::error_log::record("backend", "保存轮换日志失败", &error.to_string());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1862,12 +1873,12 @@ mod tests {
     #[test]
     fn parse_workbuddy_exe_cache_json_reads_exe() {
         let path = parse_workbuddy_exe_cache_json(
-            r#"{ "exe": "D:\\Users\\Zhou\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe" }"#,
+            r#"{ "exe": "D:\\Users\\tester\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe" }"#,
         )
         .expect("valid cache");
         assert_eq!(
             path.to_string_lossy(),
-            r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe"
+            r"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe"
         );
     }
 

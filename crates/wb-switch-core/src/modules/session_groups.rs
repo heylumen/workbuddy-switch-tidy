@@ -1613,18 +1613,26 @@ fn list_needs_lightweight(
     list_needs_lightweight_from_sizes(sizes)
 }
 
+/// 列表轻量模式的单成员阈值：与「能否参与判定」的上限**解耦**。
+///
+/// 判定上限 summary_scan_max_bytes 决定「这份正文能不能算摘要」，
+/// 而这里决定「列表页会不会因为逐个成员算摘要而卡住」——后者是纯 UI 保护，
+/// 不应随判定上限一起放宽（实测 800+ MB 副本时列表会明显变慢）。
+pub(crate) const LIST_LIGHTWEIGHT_SINGLE_BYTES: u64 = 32 * 1024 * 1024;
+/// 列表轻量模式的成员总体积上限。
+pub(crate) const LIST_LIGHTWEIGHT_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
 fn list_needs_lightweight_from_sizes<I>(sizes: I) -> bool
 where
     I: IntoIterator<Item = u64>,
 {
-    const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
     let mut total = 0u64;
     for size in sizes {
-        if size > session_link::SUMMARY_SCAN_MAX_BYTES {
+        if size > LIST_LIGHTWEIGHT_SINGLE_BYTES {
             return true;
         }
         total = total.saturating_add(size);
-        if total > MAX_TOTAL_BYTES {
+        if total > LIST_LIGHTWEIGHT_TOTAL_BYTES {
             return true;
         }
     }

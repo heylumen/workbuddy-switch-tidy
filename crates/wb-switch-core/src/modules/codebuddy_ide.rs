@@ -1223,13 +1223,13 @@ mod tests {
         assert!(!is_codebuddy_ide_image_name("WorkBuddy.exe"));
         assert!(!is_codebuddy_ide_image_name("workbuddy-switch.exe"));
         assert!(is_codebuddy_ide_windows_exe(
-            r"C:\Users\Zhou\AppData\Local\Programs\CodeBuddy\CodeBuddy.exe"
+            r"C:\Users\tester\AppData\Local\Programs\CodeBuddy\CodeBuddy.exe"
         ));
         assert!(!is_codebuddy_ide_windows_exe(
-            r"C:\Users\Zhou\AppData\Local\Programs\CodeBuddy CN\CodeBuddy.exe"
+            r"C:\Users\tester\AppData\Local\Programs\CodeBuddy CN\CodeBuddy.exe"
         ));
         assert!(!is_codebuddy_ide_windows_exe(
-            r"C:\Users\Zhou\AppData\Local\Programs\CodeBuddy CN\CodeBuddy CN.exe"
+            r"C:\Users\tester\AppData\Local\Programs\CodeBuddy CN\CodeBuddy CN.exe"
         ));
     }
 
@@ -1238,11 +1238,11 @@ mod tests {
         let stdout = "\
 1001|workbuddy-switch|C:\\apps\\workbuddy-switch.exe
 1002|CodeBuddy CN|D:\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe
-1003|CodeBuddy|D:\\Users\\Zhou\\AppData\\Local\\Programs\\CodeBuddy\\CodeBuddy.exe
+1003|CodeBuddy|D:\\Users\\tester\\AppData\\Local\\Programs\\CodeBuddy\\CodeBuddy.exe
 1004|crashpad_handler|C:\\x\\crashpad_handler.exe
 1005|wb-switch|
-1006|CodeBuddy|C:\\Users\\Zhou\\AppData\\Local\\Programs\\CodeBuddy\\CodeBuddy.exe
-1007|CodeBuddy|C:\\Users\\Zhou\\AppData\\Local\\Programs\\CodeBuddy CN\\CodeBuddy.exe
+1006|CodeBuddy|C:\\Users\\tester\\AppData\\Local\\Programs\\CodeBuddy\\CodeBuddy.exe
+1007|CodeBuddy|C:\\Users\\tester\\AppData\\Local\\Programs\\CodeBuddy CN\\CodeBuddy.exe
 ";
         let kept: Vec<u32> = process::parse_windows_process_rows(stdout)
             .into_iter()
@@ -1255,10 +1255,10 @@ mod tests {
     #[test]
     fn windows_ide_fallback_candidates_include_local_and_program_files() {
         let cands = windows_ide_fallback_exe_candidates(
-            Some(r"C:\Users\Zhou\AppData\Local"),
+            Some(r"C:\Users\tester\AppData\Local"),
             Some(r"C:\Program Files"),
             Some(r"C:\Program Files (x86)"),
-            Some("Zhou"),
+            Some("tester"),
             &['C'],
         );
         let s: Vec<String> = cands

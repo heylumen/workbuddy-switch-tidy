@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "note": "指标只能下降；新增债务请先把基线调高的评估写进提交信息。",
+  "metrics": {
+    "silent_discard_let_underscore": 178,
+    "prod_unwrap": 0,
+    "largest_prod_file_lines": 4385,
+    "todo_markers": 0
+  },
+  "largestFile": "crates/wb-switch-core/src/modules/session.rs"
+}

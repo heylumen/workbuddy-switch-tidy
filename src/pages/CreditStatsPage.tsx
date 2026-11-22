@@ -109,6 +109,37 @@ function dateDaysAgo(days: number): string {
   return dateKey(date);
 }
 
+/** 本地观察口径的窗口起点（本地时区当天 0 点）。 */
+function startOfLocalDay(daysAgo: number): number {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() - daysAgo);
+  return date.getTime();
+}
+
+/** 本地观察口径的本月起点（本地时区 1 号 0 点）。 */
+function startOfLocalMonth(): number {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(1);
+  return date.getTime();
+}
+
+/**
+ * 官方用量不可用时，本地观察只会覆盖「有快照的那几天」。
+ * 若本地覆盖起点晚于窗口起点，说明这个窗口根本没被观测到，
+ * 此时必须显示 “—” 而不是用今日值冒充（issue #225：三个数字一模一样）。
+ */
+function coveredOrDash(
+  value: number | null | undefined,
+  coverageStartAt: number | null | undefined,
+  windowStart: number,
+): string {
+  if (value == null) return "—";
+  if (coverageStartAt != null && coverageStartAt > windowStart) return "—";
+  return formatCredits(value);
+}
+
 function formatCredits(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "—";
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
@@ -1906,23 +1937,29 @@ export default function CreditStatsPage() {
                   <StatMetric
                     icon={TrendingDown}
                     label="今日消耗"
-                    value={formatCredits(official ? official.summary.usageToday : filteredStats.summary.usageToday)}
+                    value={official ? formatCredits(official.summary.usageToday) : coveredOrDash(filteredStats.summary.usageToday, filteredStats.coverageStartAt, startOfLocalDay(0))}
                     divided
                   />
                   <StatMetric
                     icon={CalendarDays}
                     label="近 7 天消耗"
-                    value={formatCredits(official ? official.summary.usage7Days : filteredStats.summary.usage7Days)}
+                    value={official ? formatCredits(official.summary.usage7Days) : coveredOrDash(filteredStats.summary.usage7Days, filteredStats.coverageStartAt, startOfLocalDay(6))}
                     divided
                   />
                   <StatMetric
                     icon={CalendarRange}
                     label="本月消耗"
-                    value={formatCredits(official ? official.summary.usageThisMonth : filteredStats.summary.usageThisMonth)}
+                    value={official ? formatCredits(official.summary.usageThisMonth) : coveredOrDash(filteredStats.summary.usageThisMonth, filteredStats.coverageStartAt, startOfLocalMonth())}
                     divided
                   />
                 </CardContent>
               </Card>
+
+              {!official && filteredStats.coverageStartAt != null && (
+                <p className="text-xs leading-5 text-muted-foreground">
+                  当前为本地观察口径，自 {formatDate(filteredStats.coverageStartAt)} 起有记录；
+                </p>
+              )}
 
               {!official && !filteredStats.coverageStartAt && filteredStats.events.some((event) => event.kind === "checkin") && (
                 <Alert>

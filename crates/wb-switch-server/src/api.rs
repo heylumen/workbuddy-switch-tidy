@@ -19,11 +19,12 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, account_memory, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
-    codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
-    export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    account, account_memory, account_merge, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide,
+    codebuddy_ide, codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage,
+    credits, export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, session_groups, session_link, storage, switch,
+    token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -164,6 +165,40 @@ fn routes() -> Router {
             "/api/sessions/hide-duplicate-group",
             post(api_hide_duplicate_group),
         )
+        .route(
+            "/api/sessions/hide-exact-subgroup",
+            post(api_hide_exact_subgroup),
+        )
+        .route(
+            "/api/accounts/import-preview-file",
+            post(api_import_preview_file),
+        )
+        .route("/api/accounts/import-file", post(api_import_accounts_file))
+        .route(
+            "/api/session-groups/divergence-preview",
+            post(api_divergence_preview),
+        )
+        .route("/api/sessions/canonical-audit", post(api_canonical_audit))
+        .route("/api/sessions/canonical", post(api_resolve_canonical))
+        .route("/api/sessions/search", post(api_search_sessions))
+        .route(
+            "/api/sessions/export-markdown",
+            post(api_export_session_markdown),
+        )
+        .route("/api/accounts/merge-scan", post(api_account_merge_scan))
+        .route("/api/accounts/merge-apply", post(api_account_merge_apply))
+        .route("/api/storage/scan", post(api_storage_scan))
+        .route("/api/storage/orphan-scan", post(api_storage_orphan_scan))
+        .route("/api/storage/orphan-trash", post(api_storage_orphan_trash))
+        .route(
+            "/api/storage/move-to-trash",
+            post(api_storage_move_to_trash),
+        )
+        .route(
+            "/api/storage/restore-trash",
+            post(api_storage_restore_trash),
+        )
+        .route("/api/storage/purge-trash", post(api_storage_purge_trash))
         .route(
             "/api/sessions/duplicate-hides",
             post(api_list_duplicate_hides),
@@ -963,10 +998,6 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         .get("restart")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let share_sessions = body
-        .get("shareSessions")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     let copy_ids: Vec<String> = body
         .get("copySessionIds")
         .and_then(|v| v.as_array())
@@ -1000,7 +1031,6 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             Some(&progress),
             &account_id,
             restart,
-            share_sessions,
             &copy_ids,
             &sync_selections,
         )
@@ -1192,6 +1222,400 @@ async fn api_restore_duplicate_hide(Json(body): Json<Value>) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
+}
+
+/// POST /api/accounts/import-preview-file —— 按路径预览导入文件。
+async fn api_import_preview_file(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if path.trim().is_empty() {
+        return json_err("缺少文件路径".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let outcome = tokio::task::spawn_blocking(move || {
+        export_import::preview_accounts_file_auto(&path, password.as_deref())
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("后台任务失败：{error}")));
+    match outcome {
+        Ok(value) => json_ok(value),
+        Err(reason) => json_err(reason, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/accounts/import-file —— 按路径导入账号。
+async fn api_import_accounts_file(Json(body): Json<Value>) -> Response {
+    let path = body
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let indexes: Vec<usize> = body
+        .get("indexes")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    if path.trim().is_empty() {
+        return json_err("缺少文件路径".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let outcome = tokio::task::spawn_blocking(move || {
+        export_import::import_accounts_file_auto(&path, password.as_deref(), &indexes)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("后台任务失败：{error}")));
+    match outcome {
+        Ok(result) => json_ok(serde_json::to_value(result).unwrap_or(Value::Null)),
+        Err(reason) => json_err(reason, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/session-groups/divergence-preview —— 消息级分叉预览（只读）。
+async fn api_divergence_preview(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    let group_id = body
+        .get("groupId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if group_id.is_empty() {
+        return json_err("缺少 groupId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let max_messages = body
+        .get("maxMessages")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10) as usize;
+    let value = tokio::task::spawn_blocking(move || {
+        let paths = session::SessionPaths::for_variant(variant);
+        session::divergence_preview(&paths, variant, &group_id, max_messages)
+    })
+    .await
+    .unwrap_or_else(|error| json!({ "ok": false, "reason": format!("后台任务失败：{error}") }));
+    json_ok(value)
+}
+
+/// POST /api/sessions/canonical-audit —— 逻辑会话普查（只读）。
+async fn api_canonical_audit(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+    let force = body.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let value =
+        tokio::task::spawn_blocking(move || session::audit_canonical(variant, limit, force))
+            .await
+            .unwrap_or_else(
+                |error| json!({ "ok": false, "reason": format!("后台任务失败：{error}") }),
+            );
+    json_ok(value)
+}
+
+/// POST /api/sessions/canonical —— 解析会话的逻辑身份。
+async fn api_resolve_canonical(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    let uid = body
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_id = body
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if uid.is_empty() || session_id.is_empty() {
+        return json_err("缺少 uid 或 sessionId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let paths = session::SessionPaths::for_variant(variant);
+    json_ok(session_link::resolve_canonical(
+        &paths,
+        variant,
+        &uid,
+        &session_id,
+    ))
+}
+
+/// POST /api/sessions/search —— 全局会话搜索。
+async fn api_search_sessions(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    let query = body
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+    let include_body = body
+        .get("includeBody")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let value = tokio::task::spawn_blocking(move || {
+        session::search_sessions(variant, &query, limit, include_body)
+    })
+    .await
+    .unwrap_or_else(|error| json!({ "ok": false, "reason": format!("后台任务失败：{error}") }));
+    json_ok(value)
+}
+
+/// POST /api/sessions/export-markdown —— 导出会话为 Markdown（只读）。
+async fn api_export_session_markdown(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_id = body
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = account::variant_of(&target);
+    let Some(uid) = account::get_str(&target, "uid").map(|v| v.trim().to_string()) else {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let outcome = tokio::task::spawn_blocking(move || {
+        session::export_session_markdown(variant, &uid, &session_id, &title)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("后台任务失败：{error}")));
+    match outcome {
+        Ok(value) => json_ok(value),
+        Err(reason) => json_err(reason, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/accounts/merge-scan —— 扫描可迁移的账号资料。
+async fn api_account_merge_scan(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let target_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let Some(source) = account::find_account(&account_id) else {
+        return json_err("来源账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(target) = account::find_account(&target_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = account::variant_of(&source);
+    if account::variant_of(&target) != variant {
+        return json_err("暂不支持跨档位迁移".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let source_uid = account::get_str(&source, "uid").unwrap_or_default();
+    let target_uid = account::get_str(&target, "uid").unwrap_or_default();
+    json_ok(account_merge::scan_account_artifacts(
+        variant,
+        &source_uid,
+        &target_uid,
+    ))
+}
+
+/// POST /api/accounts/merge-apply —— 执行账号资料迁移。
+async fn api_account_merge_apply(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let target_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let overwrite = body
+        .get("overwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let item_ids: Vec<String> = body
+        .get("itemIds")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(source) = account::find_account(&account_id) else {
+        return json_err("来源账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let Some(target) = account::find_account(&target_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = account::variant_of(&source);
+    if account::variant_of(&target) != variant {
+        return json_err("暂不支持跨档位迁移".to_string(), StatusCode::BAD_REQUEST);
+    }
+    if process::is_workbuddy_running(variant) {
+        return json_err(
+            "请先退出 WorkBuddy 再迁移账号资料".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    let source_uid = account::get_str(&source, "uid").unwrap_or_default();
+    let target_uid = account::get_str(&target, "uid").unwrap_or_default();
+    json_ok(account_merge::merge_account_artifacts(
+        variant,
+        &source_uid,
+        &target_uid,
+        &item_ids,
+        overwrite,
+    ))
+}
+
+/// POST /api/storage/scan —— 存储占用扫描。
+async fn api_storage_scan(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    json_ok(storage::scan_storage(variant))
+}
+
+/// POST /api/storage/orphan-scan —— 已删除会话的正文残留（只读）。
+async fn api_storage_orphan_scan(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    json_ok(storage::scan_orphan_bodies(variant))
+}
+
+/// POST /api/storage/orphan-trash —— 把残留正文移入回收站。
+async fn api_storage_orphan_trash(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    json_ok(storage::trash_orphan_bodies(variant))
+}
+
+/// POST /api/storage/move-to-trash —— 类别整体移入回收站。
+async fn api_storage_move_to_trash(Json(body): Json<Value>) -> Response {
+    let variant = match body.get("variant").and_then(|v| v.as_str()).unwrap_or("cn") {
+        "ai" => WbVariant::Ai,
+        _ => WbVariant::Cn,
+    };
+    let category_id = body
+        .get("categoryId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    json_ok(storage::move_to_trash(variant, category_id))
+}
+
+/// POST /api/storage/restore-trash —— 从回收站恢复。
+async fn api_storage_restore_trash(Json(body): Json<Value>) -> Response {
+    let entry_id = body.get("entryId").and_then(|v| v.as_str()).unwrap_or("");
+    json_ok(storage::restore_from_trash(entry_id))
+}
+
+/// POST /api/storage/purge-trash —— 清空回收站（0 = 全部）。
+async fn api_storage_purge_trash(Json(body): Json<Value>) -> Response {
+    let days = body
+        .get("olderThanDays")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30) as u32;
+    json_ok(storage::purge_trash(days))
+}
+
+/// POST /api/sessions/hide-exact-subgroup —— 只软隐藏「完全相同子组」的别名，正文保留。
+async fn api_hide_exact_subgroup(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cwd = body
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let title = body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let keep = body
+        .get("keepSessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let unlink_linked = body
+        .get("unlinkLinked")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let session_ids: Vec<String> = body
+        .get("sessionIds")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if session_ids.len() < 2 {
+        return json_err("子组至少需要 2 个成员".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&account_id) else {
+        return json_err("账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = account::variant_of(&target);
+    let Some(uid) = account::get_str(&target, "uid").map(|v| v.trim().to_string()) else {
+        return json_err("账号缺少 uid".to_string(), StatusCode::BAD_REQUEST);
+    };
+    if process::is_workbuddy_running(variant) {
+        return json_err(
+            "请先退出 WorkBuddy 再软隐藏重复会话".to_string(),
+            StatusCode::BAD_REQUEST,
+        );
+    }
+    json_ok(session::hide_exact_subgroup_for_user(
+        variant,
+        &uid,
+        &cwd,
+        &title,
+        &session_ids,
+        &keep,
+        unlink_linked,
+    ))
 }
 
 /// POST /api/sessions/hide-duplicate-group —— 软隐藏重复组别名，正文保留。
@@ -1991,7 +2415,7 @@ async fn static_handler_with_auth(
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .body(Body::from("请使用启动日志中的带 token 链接打开 WebUI"))
-            .unwrap();
+            .unwrap_or_else(|_| internal_error_response());
     }
     // 首次链接携带 token 时只用于换取 HttpOnly cookie；立刻 302 到去掉 token 的
     // 干净地址，避免它留在地址栏、浏览器历史、截图或旧浏览器的 Referer 中。
@@ -2014,7 +2438,7 @@ async fn static_handler_with_auth(
             .header(header::SET_COOKIE, cookie)
             .header(header::CACHE_CONTROL, "no-store")
             .body(Body::empty())
-            .unwrap();
+            .unwrap_or_else(|_| internal_error_response());
     }
     // 前端路由回退到 index.html。Content-Type 必须按**实际命中的文件**给：按请求路径算
     // 会把 `/sessions` 这类前端路由标成 application/octet-stream，浏览器直接当下载。
@@ -2026,7 +2450,7 @@ async fn static_handler_with_auth(
                 return Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .body(Body::from("not found"))
-                    .unwrap()
+                    .unwrap_or_else(|_| internal_error_response())
             }
         },
     };
@@ -2036,7 +2460,9 @@ async fn static_handler_with_auth(
     if served == "index.html" {
         builder = builder.header(header::CACHE_CONTROL, "no-store");
     }
-    builder.body(Body::from(data.data.into_owned())).unwrap()
+    builder
+        .body(Body::from(data.data.into_owned()))
+        .unwrap_or_else(|_| internal_error_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,6 +2470,13 @@ async fn static_handler_with_auth(
 // ---------------------------------------------------------------------------
 
 /// GET /api/notifications —— 最近的应用内提示（新的在前，最多 100 条）。
+/// 响应构建失败时的降级（正常不会发生；避免 handler 直接 panic）。
+fn internal_error_response() -> Response {
+    let mut response = Response::new(Body::from("internal error"));
+    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+    response
+}
+
 async fn api_notifications() -> Response {
     match notifications::list() {
         Ok(items) => json_ok(json!({ "items": items })),

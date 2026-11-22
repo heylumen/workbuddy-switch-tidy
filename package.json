@@ -1,7 +1,7 @@
 {
   "name": "wb-switch-rust",
   "private": true,
-  "version": "1.0.16",
+  "version": "1.0.17",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -16,7 +16,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:app": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=wb-switch-dev npm run tauri build -- --debug --bundles app; sh scripts/fix-app.sh",
-    "build:app:release": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=wb-switch-dev npm run tauri build -- --bundles app; sh scripts/fix-app.sh"
+    "build:app:release": "TAURI_SIGNING_PRIVATE_KEY=\"$(cat \"$HOME/.wb-switch/wb-switch-updater.key\")\" TAURI_SIGNING_PRIVATE_KEY_PASSWORD=wb-switch-dev npm run tauri build -- --bundles app; sh scripts/fix-app.sh",
+    "smoke": "python3 scripts/smoke-webui.py",
+    "smoke:exe": "python3 scripts/smoke-webui.py --exe target/release/wb-switch-rust.exe"
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.3.0",

@@ -41,8 +41,7 @@ use crate::modules::config::now_ms;
 use crate::modules::error_log;
 use crate::modules::process;
 use crate::modules::session_backup::{
-    self, BackupLifecycle, CleanupOutcome, CLEANUP_STATE_SAFE_TERMINATED,
-    OPERATION_LIFECYCLE_VERSION,
+    self, CLEANUP_STATE_SAFE_TERMINATED, OPERATION_LIFECYCLE_VERSION,
 };
 use crate::modules::session_link::{
     self, full_digest_of, BaselineState, ContentSnapshot, ContentState, LinkGroup, LinkMember,
@@ -56,7 +55,35 @@ use crate::modules::variant::WbVariant;
 mod paths;
 pub use paths::*;
 
+mod canonical;
+mod copy_progress;
+mod divergence;
+mod equivalent;
+mod export;
+mod identity;
+mod rows;
+mod search;
 mod store;
+
+pub use canonical::audit_canonical;
+pub use divergence::divergence_preview;
+pub use export::export_session_markdown;
+// 4.2 拆分第 2 步：身份/查重的纯逻辑迁到 identity.rs，这里再导出给本模块与 tests 使用。
+pub(crate) use copy_progress::{
+    advance_operation, fail_operation, finish_backup_cleanup, finish_copy_from_body,
+    reconcile_reported_cleanup, report_cleanup,
+};
+pub(crate) use equivalent::equivalent_target_session_id;
+#[cfg(test)]
+pub(crate) use export::markdown_from_jsonl;
+pub(crate) use identity::{
+    index_project_jsonls_in, is_claw_workspace, normalize_cwd, normalize_jsonl,
+    session_display_title,
+};
+pub(crate) use rows::DbCopyOutcome;
+pub(crate) use rows::{
+    backup_workbuddy_db, insert_session_copy, session_row_owner, verify_session_row,
+};
 pub(crate) use store::{column_exists, edge_sync_db_path, nonempty_text, open_db, table_exists};
 pub use store::{
     current_user_uid, current_user_uid_at, session_copy_supported_at, workbuddy_db_path,
@@ -103,70 +130,6 @@ fn account_uid(account: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// WorkBuddy 侧栏展示名：优先 custom_title（用户改名 / 定时任务名），否则 title。
-fn session_display_title(title: Option<String>, custom_title: Option<String>) -> String {
-    nonempty_text(custom_title)
-        .or_else(|| nonempty_text(title))
-        .unwrap_or_else(|| "(无标题)".to_string())
-}
-
-/// Claw 是账号绑定的 IM 渠道工作区，复制会话行不够，目标账号也用不了。
-fn is_claw_workspace(cwd: &str) -> bool {
-    cwd.trim()
-        .trim_end_matches(['/', '\\'])
-        .rsplit(['/', '\\'])
-        .next()
-        .is_some_and(|name| name.eq_ignore_ascii_case("claw"))
-}
-
-/// 归一化工作目录：去掉首尾空白与尾部路径分隔符，用于跨副本的 cwd 比对。
-fn normalize_cwd(cwd: &str) -> String {
-    cwd.trim().trim_end_matches(['/', '\\']).to_string()
-}
-
-/// 会话正文去标识：把「本会话自身 id」替换为中性占位符，
-/// 使复制产生的不同 id 副本在比对时视为同一份内容。
-/// 复制时会把源 cid 替换为新 cid，故正文里出现的是会话自身 id。
-const NEUTRAL_ID: &str = "\u{0}WB_SWITCH_NEUTRAL_ID\u{0}";
-
-fn normalize_jsonl(text: &str, cid: &str) -> String {
-    text.replace(cid, NEUTRAL_ID)
-}
-
-/// 一次性索引指定 `projects/` 下所有 `{cid}.jsonl`，返回 cid -> 路径。
-///
-/// 查找范围与 `find_project_jsonl` 一致（直接文件 + 各 workspace 子目录）。
-/// 多档位/测试注入都必须走这里，避免固定读当前用户主目录而漏掉另一档位的数据。
-fn index_project_jsonls_in(projects: &Path) -> std::collections::HashMap<String, PathBuf> {
-    let mut map = std::collections::HashMap::new();
-    if !projects.is_dir() {
-        return map;
-    }
-    let mut visit = |p: PathBuf| {
-        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-            map.entry(stem.to_string()).or_insert(p);
-        }
-    };
-    if let Ok(entries) = std::fs::read_dir(projects) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() {
-                visit(p);
-            } else if p.is_dir() {
-                if let Ok(sub) = std::fs::read_dir(&p) {
-                    for f in sub.flatten() {
-                        let fp = f.path();
-                        if fp.is_file() {
-                            visit(fp);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    map
-}
-
 /// 删除云端映射中指定会话的归属记录（会话被去重软删后清理孤儿映射）。
 fn delete_edge_sync_mappings(db_path: &Path, cids: &[String]) {
     if !db_path.is_file() {
@@ -186,191 +149,6 @@ fn delete_edge_sync_mappings(db_path: &Path, cids: &[String]) {
     }
 }
 
-/// 目标账号是否已存在与源会话「等价」的会话。
-///
-/// 等价判定：cwd 一致，且正文（抹平各自 id 后）一致。仅当双方都有正文时
-/// 做内容比对；若双方都无正文（空会话），退化为「同 cwd + 同展示标题」判定，
-/// 仅在目标也无正文时才跳过，避免误跳正常会话。
-///
-/// **失败即阻止**：目标数据库、正文索引或任一候选正文无法读取时返回 `Err`，
-/// 由复制入口终止本次复制；绝不以“无法证明重复”为理由新建副本。
-#[allow(clippy::too_many_arguments)] // 参数语义独立；抽结构体会牵动全部调用点
-fn target_has_equivalent_session(
-    db: &Path,
-    _source_cid: &str,
-    _source_uid: &str,
-    target_uid: &str,
-    source_cwd: &str,
-    source_title: &str,
-    source_jsonl_norm: &str,
-    source_has_jsonl: bool,
-) -> Result<Option<String>, String> {
-    let conn = open_db(db, true).ok_or_else(|| "无法打开目标会话数据库，已阻止复制".to_string())?;
-    if !table_exists(&conn, "sessions") {
-        return Err("目标会话数据库缺少 sessions 表，已阻止复制".to_string());
-    }
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, cwd, title, custom_title FROM sessions \
-             WHERE user_id = ?1 AND deleted_at IS NULL",
-        )
-        .map_err(|_| "无法读取目标会话列表，已阻止复制".to_string())?;
-    let rows = stmt
-        .query_map([target_uid], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })
-        .map_err(|_| "无法读取目标会话列表，已阻止复制".to_string())?;
-
-    let data_root = db.parent().unwrap_or_else(|| Path::new("."));
-    let index = index_project_jsonls_in(&data_root.join("projects"));
-    for r in rows {
-        let (cid, cwd, title, custom_title) =
-            r.map_err(|_| "目标会话记录读取失败，已阻止复制".to_string())?;
-        let cid = cid.unwrap_or_default();
-        let cwd = cwd.unwrap_or_default();
-        if is_claw_workspace(&cwd) {
-            continue;
-        }
-        if normalize_cwd(&cwd) != normalize_cwd(source_cwd) {
-            continue;
-        }
-        let target_has_jsonl = index.contains_key(&cid);
-        if source_has_jsonl && target_has_jsonl {
-            if let Some(p) = index.get(&cid) {
-                let text = std::fs::read_to_string(p)
-                    .map_err(|_| "目标会话正文不可读，已阻止复制".to_string())?;
-                if normalize_jsonl(&text, &cid) == source_jsonl_norm {
-                    return Ok(Some(cid.clone()));
-                }
-            }
-        } else if !source_has_jsonl
-            && !target_has_jsonl
-            && session_display_title(title, custom_title) == source_title
-        {
-            return Ok(Some(cid.clone()));
-        }
-    }
-    Ok(None)
-}
-
-/// 目标账号是否已存在与源会话「逐字等价」的会话；有则返回其 id。
-///
-/// 本 fork 的内容级去重：上游的「已关联则跳过」依赖关联组表，若某会话没有关联记录
-/// （旧版本复制留下的副本、关联表缺失等），上游会再次新建副本导致重复行累积。
-/// 这里按「同 cwd + 同标题 + 正文抹平各自 id 后一致」再判一次，命中即跳过新增。
-///
-/// 跨档复制时必须从**源档**数据库读取源 cwd/title，不能用目标档数据库。
-/// 正文使用调用方已经校验过的源快照文本，避免二次读取产生 TOCTOU。
-fn equivalent_target_session_id(
-    context: &CopyContext,
-    cid: &str,
-    snapshot: &session_link::ContentSnapshot,
-) -> Result<Option<String>, String> {
-    if context.paths.data_root.as_os_str().is_empty()
-        || context.source_paths.data_root.as_os_str().is_empty()
-    {
-        return Err("无法确定会话数据目录，已阻止复制".to_string());
-    }
-    let db = context.paths.data_root.join("workbuddy.db");
-    let source_db = context.source_paths.data_root.join("workbuddy.db");
-    let conn =
-        open_db(&source_db, true).ok_or_else(|| "无法打开源会话数据库，已阻止复制".to_string())?;
-    if !table_exists(&conn, "sessions") {
-        return Err("源会话数据库缺少 sessions 表，已阻止复制".to_string());
-    }
-    let has_custom = column_exists(&conn, "sessions", "custom_title");
-    let sql = if has_custom {
-        "SELECT cwd, title, custom_title FROM sessions WHERE id = ?1 AND user_id = ?2"
-    } else {
-        "SELECT cwd, title, NULL FROM sessions WHERE id = ?1 AND user_id = ?2"
-    };
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|_| "无法读取源会话元数据，已阻止复制".to_string())?;
-    let (cwd, title, custom_title) = stmt
-        .query_row([cid, context.source_uid], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })
-        .map_err(|_| "源会话元数据不存在，已阻止复制".to_string())?;
-    let source_cwd = cwd.unwrap_or_default();
-    let source_title = session_display_title(title, custom_title);
-    let source_norm = normalize_jsonl(&snapshot.text, cid);
-    target_has_equivalent_session(
-        &db,
-        cid,
-        context.source_uid,
-        context.target_uid,
-        &source_cwd,
-        &source_title,
-        &source_norm,
-        true,
-    )
-}
-
-/// 目标账号中是否存在与 (归一化 cwd, 展示标题) 相同的未删除会话。
-///
-/// 用于切换复制时的「按标题 upsert」：只要同工作区下同名，即视为同一会话，
-/// 据此把内容同步为源端最新，而非新增重复行。返回其 `(cid, updated_at)`；
-/// 不存在或读取失败返回 `None`。
-#[allow(dead_code)] // 复制路径的事后查重已被上游幂等复制取代（保留以备回归）
-fn find_target_session_by_cwd_title(
-    db: &Path,
-    target_uid: &str,
-    norm_cwd: &str,
-    display_title: &str,
-) -> Option<(String, i64)> {
-    let conn = open_db(db, true)?;
-    if !table_exists(&conn, "sessions") {
-        return None;
-    }
-    let has_custom = column_exists(&conn, "sessions", "custom_title");
-    let sql = if has_custom {
-        "SELECT id, updated_at, cwd, title, custom_title FROM sessions \
-         WHERE user_id = ?1 AND deleted_at IS NULL"
-    } else {
-        "SELECT id, updated_at, cwd, title, NULL FROM sessions \
-         WHERE user_id = ?1 AND deleted_at IS NULL"
-    };
-    let Ok(mut stmt) = conn.prepare(sql) else {
-        return None;
-    };
-    let Ok(rows) = stmt.query_map([target_uid], |r| {
-        Ok((
-            r.get::<_, Option<String>>(0)?,
-            r.get::<_, Option<i64>>(1)?,
-            r.get::<_, Option<String>>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, Option<String>>(4)?,
-        ))
-    }) else {
-        return None;
-    };
-    for r in rows.flatten() {
-        let (cid, ua, cwd, title, custom_title) = r;
-        let cid = cid.unwrap_or_default();
-        let cwd = cwd.unwrap_or_default();
-        if is_claw_workspace(&cwd) {
-            continue;
-        }
-        if normalize_cwd(&cwd) != norm_cwd {
-            continue;
-        }
-        if session_display_title(title, custom_title) == display_title {
-            return Some((cid, ua.unwrap_or(0)));
-        }
-    }
-    None
-}
-
 mod list;
 #[cfg(test)]
 pub(crate) use list::audit_session_duplicates_for_user_at;
@@ -387,9 +165,10 @@ pub(crate) use list::restore_duplicate_hide_for_user_at;
 pub(crate) use list::session_row_for_user;
 pub use list::{
     audit_session_duplicates_for_user, collapse_sessions_for_user, dedup_sessions_for_user,
-    hide_duplicate_group_for_user, list_duplicate_hides_for_user, list_sessions_for_account,
-    list_sessions_for_user, restore_duplicate_hide_for_user,
+    hide_duplicate_group_for_user, hide_exact_subgroup_for_user, list_duplicate_hides_for_user,
+    list_sessions_for_account, list_sessions_for_user, restore_duplicate_hide_for_user,
 };
+pub use search::search_sessions;
 
 /// 在 `{档位数据根}/projects/{workspace}/{cid}.jsonl` 定位会话正文。
 struct ProjectJsonlIndex {
@@ -455,204 +234,6 @@ fn project_jsonl_for(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
 
 pub(crate) fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
     project_jsonl_for(paths, cid)
-}
-
-/// 备份 workbuddy.db（一致性快照），返回主库备份路径。
-///
-/// 复制允许在非当前登录账号运行时发生，顺序复制主库/WAL/SHM 无法保证同一时点；
-/// 这里与同步路径共用 SQLite Backup API，失败即中止写入。
-fn backup_workbuddy_db(paths: &SessionPaths, backup_root: &Path) -> Result<PathBuf, String> {
-    let db = paths.workbuddy_db();
-    if !db.is_file() {
-        return Err("会话数据不存在，未复制".to_string());
-    }
-    std::fs::create_dir_all(backup_root).map_err(|error| format!("备份目录创建失败：{error}"))?;
-    let dest = backup_root.join("workbuddy.db");
-    snapshot_workbuddy_db(&db, &dest)?;
-    Ok(dest)
-}
-
-/// 数据库插入结果：`No*` 与 `SourceRowMissing` 都不允许被当成成功。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DbCopyOutcome {
-    Inserted,
-    SourceRowMissing,
-    NoSessionsTable,
-    NoDb,
-}
-
-/// 会话行归属（未删除时）。
-fn session_row_owner(paths: &SessionPaths, cid: &str) -> Option<String> {
-    let db = paths.workbuddy_db();
-    let conn = open_db(&db, true)?;
-    conn.query_row(
-        "SELECT user_id FROM sessions WHERE id = ?1 AND deleted_at IS NULL",
-        [cid],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .ok()
-    .flatten()
-}
-
-/// 在 workbuddy.db 中把源会话行复制为新 id（动态列，覆盖 id/user_id/updated_at，
-/// created_at 透传源值）。
-///
-/// 跨档时源行与目标行分属两个库：源行从 `source_paths` 读取（跨档用只读连接），
-/// 目标行按**目标表列序取交集**写入——目标存在而源没有的列不写，由库默认值补齐，
-/// 不写 NULL 破坏约束（design §2.3；旧版客户端列少时靠这条兼容）。
-/// 与旧实现不同：db/表/源行缺失都显式返回，不再静默 Ok。
-fn insert_session_copy(
-    source_paths: &SessionPaths,
-    target_paths: &SessionPaths,
-    new_cid: &str,
-    cid: &str,
-    source_uid: &str,
-    target_uid: &str,
-) -> Result<DbCopyOutcome, String> {
-    let dst_db = target_paths.workbuddy_db();
-    if !dst_db.is_file() {
-        return Ok(DbCopyOutcome::NoDb);
-    }
-    let src_db = source_paths.workbuddy_db();
-    let same_db = src_db == dst_db;
-    let source_row = if src_db.is_file() {
-        // 同档沿用读写连接（与改造前一致）；跨档对源档只读，不触碰源档 WAL 恢复。
-        let Some(conn) = open_db(&src_db, !same_db) else {
-            return Err("会话数据无法打开".to_string());
-        };
-        if !table_exists(&conn, "sessions") {
-            return Ok(DbCopyOutcome::NoSessionsTable);
-        }
-        read_source_session_row(&conn, cid, source_uid)?
-    } else {
-        None
-    };
-    let Some(source_row) = source_row else {
-        return Ok(DbCopyOutcome::SourceRowMissing);
-    };
-
-    let Some(conn) = open_db(&dst_db, false) else {
-        return Err("会话数据无法打开".to_string());
-    };
-    if !table_exists(&conn, "sessions") {
-        return Ok(DbCopyOutcome::NoSessionsTable);
-    }
-    // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
-    session_backup::ensure_full_synchronous(&conn)?;
-    let target_cols = session_table_columns(&conn)?;
-
-    let mut cols: Vec<String> = Vec::with_capacity(target_cols.len());
-    let mut vals: Vec<rusqlite::types::Value> = Vec::with_capacity(target_cols.len());
-    for col in &target_cols {
-        let Some((_, value)) = source_row.iter().find(|(name, _)| name == col) else {
-            continue;
-        };
-        let value = value.clone();
-        if col == "cwd" {
-            if let rusqlite::types::Value::Text(ref path) = value {
-                if is_claw_workspace(path) {
-                    return Err("Claw 工作区绑定当前账号渠道，不支持复制".to_string());
-                }
-            }
-        }
-        let value = match col.as_str() {
-            "id" => rusqlite::types::Value::Text(new_cid.to_string()),
-            "user_id" => rusqlite::types::Value::Text(target_uid.to_string()),
-            // created_at 是会话历史起点，复制不伪造：源值原样透传，只有源值为 NULL
-            // （旧库没记）时才回退到当前时间，避免把 NULL 下传破坏客户端的时间排序。
-            "created_at" => match value {
-                rusqlite::types::Value::Null => rusqlite::types::Value::Integer(now_ms()),
-                source => source,
-            },
-            // updated_at 恒写当前时间：它驱动「最近更新」排序，副本沿用源值会直接沉底，
-            // 而且副本此刻确实刚被创建。
-            "updated_at" => rusqlite::types::Value::Integer(now_ms()),
-            "deleted_at" => rusqlite::types::Value::Null,
-            // 项目归属属于源账号云端数据，不能跨账号继承；否则目标客户端按项目分组
-            // 渲染时查不到该项目，会把整组会话静默丢弃（issue #200）。
-            "project_id" => rusqlite::types::Value::Null,
-            // 副本不是运行中的实例：terminated/working 等状态会让客户端归入非默认分类，
-            // 归一为 completed，保留已有的终态/空闲态。
-            "status" => match value {
-                rusqlite::types::Value::Text(state)
-                    if !matches!(state.as_str(), "archived" | "completed" | "active" | "idle") =>
-                {
-                    rusqlite::types::Value::Text("completed".to_string())
-                }
-                other => other,
-            },
-            // 客户端排序键为 COALESCE(last_activity_at, created_at)，源值为 NULL 时会沉底。
-            "last_activity_at" => match value {
-                rusqlite::types::Value::Null => rusqlite::types::Value::Integer(now_ms()),
-                other => other,
-            },
-            // 客户端按 mode 渲染，缺字段会退化。
-            "source_mode" => match value {
-                rusqlite::types::Value::Null => rusqlite::types::Value::Text("craft".to_string()),
-                other => other,
-            },
-            _ => value,
-        };
-        cols.push(col.clone());
-        vals.push(value);
-    }
-
-    let placeholders = cols.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-    let colnames = cols.join(", ");
-    // 用 INSERT 而不是 INSERT OR REPLACE：新 UUID 撞库时宁可失败，也不能悄悄覆盖既有会话。
-    let sql = format!("INSERT INTO sessions ({colnames}) VALUES ({placeholders})");
-    let params: Vec<&rusqlite::types::Value> = vals.iter().collect();
-    conn.execute(&sql, rusqlite::params_from_iter(params))
-        .map_err(|e| format!("会话记录保存失败：{e}"))?;
-    Ok(DbCopyOutcome::Inserted)
-}
-
-/// 读取一行会话（列名 + 值，按源表列序），供跨库复制按目标列取交集。
-fn read_source_session_row(
-    conn: &Connection,
-    cid: &str,
-    uid: &str,
-) -> Result<Option<Vec<(String, rusqlite::types::Value)>>, String> {
-    let mut stmt = conn
-        .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
-        .map_err(|e| e.to_string())?;
-    let cols: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
-    let mut rows = stmt
-        .query(rusqlite::params![cid, uid])
-        .map_err(|e| e.to_string())?;
-    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
-        return Ok(None);
-    };
-    let values = cols
-        .into_iter()
-        .enumerate()
-        .map(|(i, col)| {
-            let value = row
-                .get::<_, rusqlite::types::Value>(i)
-                .unwrap_or(rusqlite::types::Value::Null);
-            (col, value)
-        })
-        .collect();
-    Ok(Some(values))
-}
-
-/// 目标 sessions 表的列名（按表自身列序）。
-fn session_table_columns(conn: &Connection) -> Result<Vec<String>, String> {
-    let stmt = conn
-        .prepare("SELECT * FROM sessions LIMIT 0")
-        .map_err(|e| e.to_string())?;
-    Ok(stmt.column_names().map(|s| s.to_string()).collect())
-}
-
-/// 写后校验：目标行必须存在、归属目标账号且未删除。
-fn verify_session_row(paths: &SessionPaths, new_cid: &str, target_uid: &str) -> Result<(), String> {
-    match session_row_owner(paths, new_cid) {
-        Some(owner) if owner == target_uid => Ok(()),
-        Some(owner) => Err(format!(
-            "会话记录归属校验失败：期望 {target_uid}，实际 {owner}"
-        )),
-        None => Err("会话记录保存后不可见，未按成功处理".to_string()),
-    }
 }
 
 /// 云端映射登记结果：失败必须上报，不能静默降级成成功。
@@ -1031,7 +612,7 @@ fn run_copy(
 ///
 /// 源 / 目标解耦：`paths` 恒为目标档（写侧），`source_paths` 恒为源档（读侧）；
 /// 同档复制时两者相同，跨档复制时指向不同数据根。
-struct CopyContext<'a> {
+pub(crate) struct CopyContext<'a> {
     paths: &'a SessionPaths,
     variant: WbVariant,
     source_paths: &'a SessionPaths,
@@ -1521,158 +1102,6 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         cleanup_state: cleanup_state.to_string(),
         cleanup_error,
     })
-}
-
-/// 业务完成后的收尾：可靠转 cleanupPending 再回收；失败只报告，不改业务结果。
-fn finish_backup_cleanup(
-    paths: &SessionPaths,
-    variant: WbVariant,
-    lifecycle: &mut BackupLifecycle,
-) -> CleanupOutcome {
-    if let Err(error) = session_backup::mark_cleanup_pending(paths, lifecycle, None) {
-        // 业务已完成、维护记录仍是 protected：下次维护按 Completed 补转后清理。
-        return CleanupOutcome::Pending {
-            reason: format!("清理状态推进失败（{error}）"),
-        };
-    }
-    session_backup::cleanup_after_success(paths, variant, lifecycle)
-}
-
-/// 维护入口补清成功后，把仍写着 pending 路径的成功项改成 cleaned / null。
-///
-/// `symlink_metadata` 把符号链接也视为「还在」，避免把拒绝删除的链接目标标成已清理。
-fn reconcile_reported_cleanup(items: &mut [Value]) {
-    for item in items {
-        if item.get("cleanupState").and_then(Value::as_str) != Some("pending") {
-            continue;
-        }
-        let still_there = item
-            .get("backup")
-            .and_then(Value::as_str)
-            .is_some_and(|path| std::fs::symlink_metadata(path).is_ok());
-        if still_there {
-            continue;
-        }
-        item["backup"] = json!(null);
-        if item.get("backupManifest").is_some() {
-            item["backupManifest"] = json!(null);
-        }
-        item["cleanupState"] = json!("cleaned");
-        if let Some(object) = item.as_object_mut() {
-            object.remove("cleanupError");
-        }
-    }
-}
-
-/// 清理结果到报告字段的投影：已清理不展示路径；待清理保留位置与原因。
-fn report_cleanup(
-    cleanup: &CleanupOutcome,
-    dir: &Path,
-) -> (Option<String>, &'static str, Option<String>) {
-    match cleanup {
-        CleanupOutcome::Cleaned => (None, "cleaned", None),
-        CleanupOutcome::Pending { reason } => (
-            Some(dir.to_string_lossy().to_string()),
-            "pending",
-            Some(reason.clone()),
-        ),
-        CleanupOutcome::Protected { reason } => (
-            Some(dir.to_string_lossy().to_string()),
-            "pending",
-            Some(reason.clone()),
-        ),
-    }
-}
-
-/// 从「源快照已确认」开始推进复制：写正文 → 写数据库行 → 登记映射 → 提交关联与基线。
-///
-/// `body_source` 为 `Some(source_path)` 时先写正文；为 `None` 表示正文此前已写成
-/// （恢复场景），直接继续数据库行与关联。源行读取与目标行写入的档位经
-/// `source_paths` 分离（跨档复制时与 `paths` 不同，同档时相同）。
-fn finish_copy_from_body(
-    paths: &SessionPaths,
-    variant: WbVariant,
-    source_paths: &SessionPaths,
-    operation: &mut Operation,
-    snapshot: &ContentSnapshot,
-    body_source: Option<&Path>,
-) -> Result<(), String> {
-    if let Some(source_path) = body_source {
-        write_copy_body(
-            snapshot,
-            source_path,
-            source_paths,
-            paths,
-            &operation.source.session_id,
-            &operation.target.session_id,
-        )?;
-        advance_operation(paths, operation, OpPhase::BodyWritten)?;
-    }
-
-    match insert_session_copy(
-        source_paths,
-        paths,
-        &operation.target.session_id,
-        &operation.source.session_id,
-        &operation.source.uid,
-        &operation.target.uid,
-    )? {
-        DbCopyOutcome::Inserted => {}
-        DbCopyOutcome::SourceRowMissing => {
-            return Err("数据库中找不到源会话记录，未复制".to_string())
-        }
-        DbCopyOutcome::NoSessionsTable => return Err("会话数据缺少数据表，未复制".to_string()),
-        DbCopyOutcome::NoDb => return Err("会话数据不存在，未复制".to_string()),
-    }
-    verify_session_row(paths, &operation.target.session_id, &operation.target.uid)?;
-    advance_operation(paths, operation, OpPhase::DbWritten)?;
-
-    // 云端登记交接给客户端：不预写 edge_sync_mapping——预写会让 edge-sync 扩展
-    // 判定"已迁移"而跳过上传，导致云端没有会话、后续 RENAME/ACTIVITY 404。
-    // 副本由客户端下次启动时自行迁移并写入映射行；阶段标记保留，语义为"已交接"。
-    advance_operation(paths, operation, OpPhase::MappingWritten)?;
-
-    let group_id = commit_links(paths, variant, operation, &snapshot.normalized)?;
-    operation.group_id = group_id;
-    advance_operation(paths, operation, OpPhase::LinksCommitted)?;
-    advance_operation(paths, operation, OpPhase::Completed)?;
-    Ok(())
-}
-
-/// 推进操作阶段。阶段只能前进：已经走到更靠后的阶段时不回写（恢复路径不得把
-/// `LinksCommitted`/`Completed` 写回 `DbWritten`）。
-///
-/// 先保存候选副本、成功后才替换内存状态：保存失败时内存阶段不变，随后的
-/// `fail_operation` 不会把未落盘的阶段写回磁盘（design §3）。
-fn advance_operation(
-    paths: &SessionPaths,
-    operation: &mut Operation,
-    phase: OpPhase,
-) -> Result<(), String> {
-    if operation.phase >= phase {
-        return Ok(());
-    }
-    let mut candidate = operation.clone();
-    candidate.phase = phase;
-    candidate.updated_at = now_ms();
-    session_link::save_operation(paths, &candidate)?;
-    *operation = candidate;
-    Ok(())
-}
-
-fn fail_operation(paths: &SessionPaths, operation: &mut Operation, error: &str) {
-    operation.last_error = Some(error.to_string());
-    operation.updated_at = now_ms();
-    if let Err(save_error) = session_link::save_operation(paths, operation) {
-        error_log::record(
-            "session-operation",
-            "保存失败状态失败",
-            &format!(
-                "operation={} phase={:?}: {save_error}",
-                operation.operation_id, operation.phase
-            ),
-        );
-    }
 }
 
 /// 原子提交关联与配对基线（含失效成员替换与基线继承）。
@@ -2188,7 +1617,7 @@ fn reconcile_stale_link_members_scoped(
         return report;
     }
     // 只改关联元数据（成员换绑/失效），不碰任何会话正文与数据库行。
-    let _ = session_link::with_link_store_write(paths, |store| {
+    let link_write = session_link::with_link_store_write(paths, |store| {
         for fix in &fixes {
             let Some(group) = store
                 .groups
@@ -2215,6 +1644,14 @@ fn reconcile_stale_link_members_scoped(
         }
         Ok(())
     });
+    // 关联表写失败不能静默：用户会以为「已修正」，重启后又变回去。
+    if let Err(error) = link_write {
+        crate::modules::error_log::record(
+            "backend",
+            "修正关联成员失败（关联表未更新，重启后可能回退）",
+            &error,
+        );
+    }
     report
 }
 

@@ -4,6 +4,7 @@ import { FileUp, Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -49,16 +50,20 @@ export function ImportAccountsDialog({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [fileName, setFileName] = useState("");
   const [fileText, setFileText] = useState("");
+  // 桌面端按路径交给 Rust 解析，避免大 JSON 在 WebView 主线程解析导致卡死。
+  const [filePath, setFilePath] = useState("");
   const [preview, setPreview] = useState<ImportPreviewAccount[]>([]);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [parsing, setParsing] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  const [error, setError] = useState("");/** 加密备份口令：解密在 Rust 侧完成，口令不落盘。 */
+  const [password, setPassword] = useState("");
 
   useEffect(() => {
     if (open) {
       setFileName("");
       setFileText("");
+      setFilePath("");
       setPreview([]);
       setSelected(new Set());
       setParsing(false);
@@ -67,8 +72,35 @@ export function ImportAccountsDialog({
     }
   }, [open]);
 
-  function chooseFile() {
-    fileInputRef.current?.click();
+  async function chooseFile() {
+    if (!api.isDesktop()) {
+      fileInputRef.current?.click();
+      return;
+    }
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const picked = await open({ multiple: false, filters: [{ name: "JSON", extensions: ["json"] }] });
+      if (typeof picked !== "string" || !picked) return;
+      setFilePath(picked);
+      setFileText("");
+      setFileName(picked.split(/[\\/]/).pop() || picked);
+      setParsing(true);
+      setError("");
+      try {
+        const previewResult = await api.previewImportFile(picked, password.trim() || undefined);
+        setPreview(previewResult.accounts);
+        setSelected(new Set(previewResult.accounts.map((a) => a.index)));
+      } catch (err) {
+        setPreview([]);
+        setSelected(new Set());
+        setFilePath("");
+        setError(api.asError(err));
+      } finally {
+        setParsing(false);
+      }
+    } catch (e) {
+      setError(api.asError(e));
+    }
   }
 
   function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -79,6 +111,9 @@ export function ImportAccountsDialog({
     const reader = new FileReader();
     reader.onload = () => {
       const text = String(reader.result ?? "");
+      if (text.length > 8 * 1024 * 1024) {
+        setError("文件较大（超过 8 MB），浏览器内解析可能短暂卡顿；桌面版会交由后端解析。");
+      }
       setFileName(file.name);
       setFileText(text);
       setParsing(true);
@@ -115,13 +150,15 @@ export function ImportAccountsDialog({
   }
 
   async function doImport() {
-    if (busy || parsing || !fileText || selected.size === 0) return;
+    if (busy || parsing || (!fileText && !filePath) || selected.size === 0) return;
     setBusy(true);
     setError("");
     try {
       // 所选账号中的加密凭据数：随导入结果上报，供宿主附加能力限制提醒。
       const encrypted = preview.filter((a) => selected.has(a.index) && a.encrypted).length;
-      const res = await api.importAccounts(fileText, [...selected]);
+      const res = filePath
+        ? await api.importAccountsFile(filePath, [...selected], password.trim() || undefined)
+        : await api.importAccounts(fileText, [...selected]);
       onImported?.({ ...res, encrypted });
       onOpenChange(false);
     } catch (e) {
@@ -157,6 +194,21 @@ export function ImportAccountsDialog({
             选择文件
           </Button>
           {fileName && <span className="truncate text-xs text-muted-foreground">{fileName}</span>}
+        </div>
+
+        <div className="space-y-1.5">
+          <label htmlFor="import-password" className="text-sm font-medium">
+            口令（仅加密备份需要）
+          </label>
+          <Input
+            id="import-password"
+            type="password"
+            autoComplete="off"
+            placeholder="明文备份留空即可"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            disabled={busy || parsing}
+          />
         </div>
 
         {parsing && (

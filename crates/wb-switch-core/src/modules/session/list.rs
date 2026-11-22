@@ -521,8 +521,11 @@ pub(crate) fn audit_session_duplicates_for_user_at(
             .into_iter()
             .map(|(cid, updated_at)| {
                 let body =
+                    // 2026-11-22：审计只需逐条摘要，改用**流式摘要**——
+                    // 原实现走 read_content_snapshot（整文件读入内存），数百 MB 会话峰值近 2GB、
+                    // 极易失败成 unavailable，导致超大重复组在审计里成为盲区。
                     index.get(&cid).and_then(|path| {
-                        match session_link::read_content_snapshot(path, &cid) {
+                        match session_link::read_content_summary_for_audit(path, &cid) {
                             ContentState::Ready(snapshot) => Some(snapshot.normalized.line_digests),
                             ContentState::Missing | ContentState::Unavailable(_) => None,
                         }
@@ -586,6 +589,36 @@ pub(crate) fn audit_session_duplicates_for_user_at(
                 None
             },
             "sessions": sessions,
+            // 逐条完全相同的子组（≥2 个成员）：整组为 divergent 时，这些子组仍可安全收敛
+            "exactSubgroups": partition_exact_subgroups(&members)
+                .into_iter()
+                .map(|indices| {
+                    let records = indices
+                        .first()
+                        .and_then(|i| members[*i].2.as_ref().map(Vec::len))
+                        .unwrap_or(0);
+                    let group_ids: Vec<String> = indices
+                        .iter()
+                        .map(|i| members[*i].0.clone())
+                        .collect();
+                    let keep = indices
+                        .iter()
+                        .max_by_key(|i| members[**i].1)
+                        .map(|i| members[*i].0.clone());
+                    let safe_to_hide = group_ids.len().saturating_sub(1);
+                    json!({
+                        "count": group_ids.len(),
+                        "records": records,
+                        "sessions": group_ids,
+                        "keepSessionId": keep,
+                        "safeToHide": safe_to_hide,
+                    })
+                })
+                .collect::<Vec<Value>>(),
+            "hideableExact": partition_exact_subgroups(&members)
+                .iter()
+                .map(|ids| ids.len() - 1)
+                .sum::<usize>(),
         }));
     }
 
@@ -612,6 +645,29 @@ pub(crate) fn audit_session_duplicates_for_user_at(
     })
 }
 
+/// 把逐条摘要**完全相同**的成员聚成子组（≥2 个成员才算），返回成员下标。
+///
+/// 用途：一个同名重复组里可能同时存在「1 个主分叉 + N 个旧快照副本」——
+/// 整组判定为 divergent 时，N 个完全相同的副本仍可安全收敛为 1 份。
+/// 只有拿到 `body`（逐条摘要）的成员参与；缺失正文的成员不参与聚类。
+fn partition_exact_subgroups(
+    members: &[(String, i64, Option<Vec<String>>, String)],
+) -> Vec<Vec<usize>> {
+    let mut buckets: Vec<(Vec<String>, Vec<usize>)> = Vec::new();
+    for (index, (_, _, body, _)) in members.iter().enumerate() {
+        let Some(seq) = body else { continue };
+        match buckets.iter_mut().find(|(key, _)| key == seq) {
+            Some((_, ids)) => ids.push(index),
+            None => buckets.push((seq.clone(), vec![index])),
+        }
+    }
+    buckets
+        .into_iter()
+        .map(|(_, ids)| ids)
+        .filter(|ids| ids.len() >= 2)
+        .collect()
+}
+
 fn classify_duplicate_group(
     members: &[(String, i64, Option<Vec<String>>, String)],
 ) -> &'static str {
@@ -628,7 +684,10 @@ fn classify_duplicate_group(
     if seqs.windows(2).all(|w| w[0] == w[1]) {
         return "exact";
     }
-    let longest = seqs.iter().max_by_key(|seq| seq.len()).unwrap();
+    // 上面已保证 len() >= 2；这里仍用 let-else，避免任何路径上 panic。
+    let Some(longest) = seqs.iter().max_by_key(|seq| seq.len()) else {
+        return "independent";
+    };
     if seqs.iter().all(|seq| seq_is_prefix(seq, longest)) {
         return "fastForward";
     }
@@ -693,6 +752,55 @@ pub(crate) fn hide_duplicate_group_for_user_at(
     keep_session_id: &str,
     unlink_linked: bool,
 ) -> Value {
+    hide_duplicate_group_inner(
+        paths,
+        variant,
+        uid,
+        cwd,
+        title,
+        keep_session_id,
+        unlink_linked,
+        None,
+    )
+}
+
+/// 只软隐藏「完全相同子组」中除保留项外的成员；同组内的分叉成员保持不动。
+///
+/// `session_ids` 必须是审计结果 `exactSubgroups[*].sessions` 的一份（顺序无关）；
+/// 执行前会重新审计并核对子组仍然逐条一致，避免审计到执行之间的并发修改。
+pub fn hide_exact_subgroup_for_user(
+    variant: WbVariant,
+    uid: &str,
+    cwd: &str,
+    title: &str,
+    session_ids: &[String],
+    keep_session_id: &str,
+    unlink_linked: bool,
+) -> Value {
+    hide_duplicate_group_inner(
+        &SessionPaths::for_variant(variant),
+        variant,
+        uid,
+        cwd,
+        title,
+        keep_session_id,
+        unlink_linked,
+        Some(session_ids),
+    )
+}
+
+// 参数确实多：内部实现与公开入口一一对应，拆结构体反而更难追踪调用链。
+#[allow(clippy::too_many_arguments)]
+fn hide_duplicate_group_inner(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    uid: &str,
+    cwd: &str,
+    title: &str,
+    keep_session_id: &str,
+    unlink_linked: bool,
+    subgroup_ids: Option<&[String]>,
+) -> Value {
     let report = audit_session_duplicates_for_user_at(paths, variant, uid);
     if report["ok"] != true {
         return json!({ "ok": false, "reason": report["reason"].clone() });
@@ -706,16 +814,34 @@ pub(crate) fn hide_duplicate_group_for_user_at(
         return json!({ "ok": false, "reason": "审计中未找到该重复组" });
     };
     let kind = group["kind"].as_str().unwrap_or("unavailable");
-    if !matches!(kind, "exact" | "fastForward" | "divergent") {
+    if subgroup_ids.is_none() && !matches!(kind, "exact" | "fastForward" | "divergent") {
         return json!({ "ok": false, "reason": "该组无法安全自动处理，请人工检查" });
     }
     let Some(sessions) = group["sessions"].as_array() else {
         return json!({ "ok": false, "reason": "审计组缺少会话列表" });
     };
-    let ids: Vec<String> = sessions
+    let all_ids: Vec<String> = sessions
         .iter()
         .filter_map(|session| session["sessionId"].as_str().map(str::to_string))
         .collect();
+    let ids: Vec<String> = match subgroup_ids {
+        Some(subset) => {
+            let mut picked: Vec<String> = Vec::new();
+            for id in subset {
+                if !all_ids.contains(id) {
+                    return json!({ "ok": false, "reason": "子组成员不在该重复组中，请刷新审计后重试" });
+                }
+                if !picked.contains(id) {
+                    picked.push(id.clone());
+                }
+            }
+            if picked.len() < 2 {
+                return json!({ "ok": false, "reason": "子组至少需要 2 个成员" });
+            }
+            picked
+        }
+        None => all_ids.clone(),
+    };
     if !ids.iter().any(|id| id == keep_session_id) {
         return json!({ "ok": false, "reason": "保留项不在该重复组中" });
     }
@@ -731,7 +857,32 @@ pub(crate) fn hide_duplicate_group_for_user_at(
     }) else {
         return json!({ "ok": false, "reason": "重复组已变化，请刷新审计后重试" });
     };
-    if verify_group["kind"] != kind
+    if subgroup_ids.is_some() {
+        // 子组模式：重新审计后必须仍存在**逐条一致**的同成员子组。
+        let still_exact = verify_group["exactSubgroups"]
+            .as_array()
+            .map(|subgroups| {
+                subgroups.iter().any(|subgroup| {
+                    let mut members: Vec<String> = subgroup["sessions"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    members.sort();
+                    let mut expected: Vec<String> = ids.clone();
+                    expected.sort();
+                    members == expected
+                })
+            })
+            .unwrap_or(false);
+        if !still_exact {
+            return json!({ "ok": false, "reason": "子组已不再是逐条一致，请刷新审计后重试" });
+        }
+    } else if verify_group["kind"] != kind
         || verify_group["count"] != group["count"]
         || verify_group["suggestedKeepSessionId"] != group["suggestedKeepSessionId"]
     {
@@ -870,7 +1021,7 @@ pub(crate) fn hide_duplicate_group_for_user_at(
         "unlinked": unlinked,
         "skippedLinked": skipped_linked,
         "keepSessionId": keep_session_id,
-        "kind": kind,
+        "kind": if subgroup_ids.is_some() { "exactSubgroup" } else { kind },
         "backup": backup,
         "restoreRecordSaved": record_error.is_none(),
         "restoreRecordError": record_error,
@@ -1122,4 +1273,46 @@ pub(crate) fn restore_duplicate_hide_for_user_at(
         "backup": backup,
         "journalError": journal_error,
     })
+}
+
+#[cfg(test)]
+mod exact_subgroup_tests {
+    use super::partition_exact_subgroups;
+
+    fn member(
+        id: &str,
+        ts: i64,
+        body: Option<Vec<&str>>,
+    ) -> (String, i64, Option<Vec<String>>, String) {
+        (
+            id.to_string(),
+            ts,
+            body.map(|seq| seq.into_iter().map(str::to_string).collect()),
+            "ready".to_string(),
+        )
+    }
+
+    #[test]
+    fn groups_identical_sequences_and_skips_singletons() {
+        let members = vec![
+            member("a", 1, Some(vec!["x", "y"])),
+            member("b", 2, Some(vec!["x", "y"])),
+            member("c", 3, Some(vec!["x", "z"])),
+            member("d", 4, Some(vec!["x", "y"])),
+            member("e", 5, None),
+        ];
+        let mut groups = partition_exact_subgroups(&members);
+        groups.sort_by_key(|ids| std::cmp::Reverse(ids.len()));
+        assert_eq!(groups, vec![vec![0, 1, 3]]);
+    }
+
+    #[test]
+    fn returns_empty_when_no_duplicates() {
+        let members = vec![
+            member("a", 1, Some(vec!["x"])),
+            member("b", 2, Some(vec!["y"])),
+            member("c", 3, None),
+        ];
+        assert!(partition_exact_subgroups(&members).is_empty());
+    }
 }

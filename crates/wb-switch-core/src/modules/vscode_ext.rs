@@ -1384,7 +1384,7 @@ mod tests {
         assert!(is_code_image_name("Code.exe"));
         assert!(is_code_image_name("code"));
         assert!(is_code_image_name(
-            r"C:\Users\Zhou\AppData\Local\Programs\Microsoft VS Code\Code.exe"
+            r"C:\Users\tester\AppData\Local\Programs\Microsoft VS Code\Code.exe"
         ));
         assert!(!is_code_image_name("Code - Insiders.exe"));
         assert!(!is_code_image_name("CodeBuddy CN.exe"));
@@ -1397,11 +1397,11 @@ mod tests {
     fn windows_code_rows_drop_self_insiders_and_codebuddy() {
         let stdout = "\
 2001|workbuddy-switch|C:\\apps\\workbuddy-switch.exe
-2002|Code - Insiders|C:\\Users\\Zhou\\AppData\\Local\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe
-2003|Code|C:\\Users\\Zhou\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe
+2002|Code - Insiders|C:\\Users\\tester\\AppData\\Local\\Programs\\Microsoft VS Code Insiders\\Code - Insiders.exe
+2003|Code|C:\\Users\\tester\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe
 2004|crashpad_handler|C:\\x\\crashpad_handler.exe
 2005|CodeBuddy CN|D:\\Programs\\CodeBuddy CN\\CodeBuddy CN.exe
-2006|Code|C:\\Users\\Zhou\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe
+2006|Code|C:\\Users\\tester\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe
 ";
         let kept: Vec<u32> = process::parse_windows_process_rows(stdout)
             .into_iter()
@@ -1459,11 +1459,11 @@ mod tests {
         );
         assert_eq!(
             process::extract_app_bundle_from_args(
-                "/Users/zhou/Applications/Visual Studio Code.app/Contents/MacOS/Electron \
+                "/Users/tester/Applications/Visual Studio Code.app/Contents/MacOS/Electron \
                  --type=renderer"
             ),
             Some(PathBuf::from(
-                "/Users/zhou/Applications/Visual Studio Code.app"
+                "/Users/tester/Applications/Visual Studio Code.app"
             ))
         );
         // 非 VS Code 进程不得被当成目标

@@ -24,7 +24,8 @@ import { avatarTone } from "@/lib/avatar-tone";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import { formatFullDateTime } from "@/lib/format-time";
-import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateAuditGroup, SessionDuplicateAuditSession, SessionDuplicateHideRecord, SessionDuplicateKind, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, SessionDuplicateAudit, SessionDuplicateAuditGroup, SessionDuplicateAuditSession,
+  SessionDuplicateAuditSubgroup, SessionDuplicateHideRecord, SessionDuplicateKind, TravelStatus } from "@/lib/types";
 
 const AUDIT_KIND_LABEL: Record<SessionDuplicateKind, string> = {
   exact: "精确重复",
@@ -553,6 +554,38 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
     }
   }
 
+  /** 只软隐藏「逐条完全一致」子组内的其余副本；同组内的分叉成员保持不动。 */
+  async function hideSubgroup(
+    group: SessionDuplicateAuditGroup,
+    sub: SessionDuplicateAuditSubgroup,
+  ) {
+    if (!sub.keepSessionId || sub.sessions.length < 2) return;
+    setHideBusy(true);
+    setHideError(null);
+    try {
+      const result = await api.hideExactSubgroup(
+        account.id,
+        group.cwd,
+        group.title,
+        sub.sessions,
+        sub.keepSessionId,
+        true,
+      );
+      if (!result.ok) {
+        setHideError(result.reason || "软隐藏失败");
+        return;
+      }
+      toast.success(`已软隐藏 ${result.hidden ?? 0} 份完全相同的副本（正文保留）`, {
+        description: result.skippedLinked ? `${result.skippedLinked} 个关联副本已跳过` : undefined,
+      });
+      await loadAudit();
+    } catch (e) {
+      setHideError(api.asError(e));
+    } finally {
+      setHideBusy(false);
+    }
+  }
+
   async function restoreHide(hideId: string) {
     setRestoreBusy(hideId);
     try {
@@ -578,7 +611,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
 
   return (
     <TooltipProvider>
-      <article className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
+      <article data-account-card={account.id} className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-[0_1px_2px_rgba(15,23,42,.025),0_10px_28px_rgba(15,23,42,.035)] transition-shadow hover:shadow-[0_2px_4px_rgba(15,23,42,.04),0_14px_34px_rgba(15,23,42,.055)]">
       <header
         className={cn(
           "relative flex items-center border-b border-border",
@@ -671,6 +704,12 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                   <DropdownMenuSeparator />
                 <DropdownMenuItem disabled={featuresDisabled || demoModeEnabled} onSelect={() => void loadAudit()}>
                   <Search />重复审计
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={featuresDisabled} onSelect={() => setDedupOpen(true)}>
+                  <Eraser />清理重复会话
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={featuresDisabled} onSelect={() => setCollapseOpen(true)}>
+                  <Layers />折叠同名会话
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem className="text-destructive focus:bg-destructive/5 focus:text-destructive" onSelect={() => onDelete(account)}>
@@ -1197,6 +1236,28 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onShowInf
                       <div className="mt-2 text-xs text-muted-foreground">
                         建议：{group.suggested === "keep-newest" ? "保留最新" : group.suggested === "fast-forward-to-longest" ? "快进到最长副本" : "人工选择分支"}
                       </div>
+                      {(group.exactSubgroups ?? []).filter((sub) => sub.count >= 2).map((sub) => (
+                        <div
+                          key={`sub:${sub.sessions.join(",")}`}
+                          className="mt-2 rounded-md border border-emerald-300/60 bg-emerald-50/50 p-2 text-xs dark:bg-emerald-950/20"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="min-w-0">
+                              其中 <strong className="tabular-nums">{sub.count}</strong> 份逐条完全一致（各 {sub.records} 条），
+                              可只保留最新的一份
+                            </span>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={hideBusy || !sub.keepSessionId}
+                              title="只隐藏该子组内的其余副本；同组里的分叉成员不动"
+                              onClick={() => void hideSubgroup(group, sub)}
+                            >
+                              软隐藏其余 {sub.safeToHide} 份
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
                       {group.sessions.some((session) => session.linked) && (
                         <p className="mt-1 text-xs text-amber-700">关联中的副本会先解除关联，再软隐藏；关联表会备份。</p>
                       )}

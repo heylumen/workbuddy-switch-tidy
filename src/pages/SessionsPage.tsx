@@ -19,6 +19,8 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupList, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
+import { CanonicalAuditDialog } from "@/components/canonical-audit-dialog";
+import { SessionSearchDialog } from "@/components/session-search-dialog";
 import { accountVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -578,6 +580,8 @@ export default function SessionsPage() {
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">统一管理各账号下的会话副本，按需复制或同步。</p>
             </div>
             <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
+              <SessionSearchDialog variant={variantScope} />
+              <CanonicalAuditDialog variant={variantScope} />
               <Button variant="outline" size="sm" className="shrink-0" onClick={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} disabled={loading || detailLoading}><RefreshCw className={loading ? "animate-spin" : undefined} />刷新</Button>
               <AddLinkedSessionDialog client={client} disabled={loading} onDone={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} requestRestartConfirm={(actionLabel, run) => setRestartPrompt({ actionLabel, run })} />
             </div>

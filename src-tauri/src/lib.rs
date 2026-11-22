@@ -56,6 +56,17 @@ pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
 /// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
+    // 启动维护：回收站按保留期自动清理（默认 30 天；环境变量设为 0 可关闭）。
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = modules::storage::purge_expired_on_start();
+        let purged = result
+            .get("purged")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if purged > 0 {
+            eprintln!("[trash] 已清理 {purged} 个过期回收站条目：{result}");
+        }
+    });
     let rotate_app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
@@ -242,6 +253,22 @@ pub fn run() {
             commands::copy_sessions_cross,
             commands::audit_session_duplicates,
             commands::hide_duplicate_group,
+            commands::hide_exact_subgroup,
+            commands::account_merge_scan,
+            commands::export_session_markdown,
+            commands::search_sessions,
+            commands::canonical_resolve,
+            commands::canonical_audit,
+            commands::divergence_preview,
+            commands::import_preview_file,
+            commands::import_file,
+            commands::account_merge_apply,
+            commands::storage_scan,
+            commands::storage_orphan_scan,
+            commands::storage_orphan_trash,
+            commands::storage_move_to_trash,
+            commands::storage_restore_trash,
+            commands::storage_purge_trash,
             commands::list_duplicate_hides,
             commands::restore_duplicate_hide,
             commands::dedup_sessions,

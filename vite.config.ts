@@ -58,6 +58,12 @@ export default defineConfig(async () => ({
     },
   },
 
+  // 注意：不要在这里加 build.rollupOptions.output.manualChunks。
+  // 2026-11-22 用过一次（拆 react/radix/vendor，主包 658KB→212KB）：产物照样构建成功，
+  // 但拆出的 radix chunk 只有 1,101 B（空壳），入口模块求值失败，桌面端直接白屏
+  // 并显示「应用启动失败」，而当时所有门禁都是绿的。
+  // 若确实要拆，先确认 scripts/smoke-webui.py 能在真实浏览器里挂载成功再提交。
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

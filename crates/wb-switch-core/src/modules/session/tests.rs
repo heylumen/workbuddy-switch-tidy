@@ -52,7 +52,8 @@ impl Env {
                     created_at INTEGER,
                     updated_at INTEGER,
                     deleted_at INTEGER,
-                    is_playground INTEGER
+                    is_playground INTEGER,
+                    space_id TEXT
                 );",
         )
         .unwrap();
@@ -96,7 +97,8 @@ impl Env {
                     created_at INTEGER,
                     updated_at INTEGER,
                     deleted_at INTEGER,
-                    is_playground INTEGER
+                    is_playground INTEGER,
+                    space_id TEXT
                 );"
         ))
         .unwrap();
@@ -1393,10 +1395,13 @@ fn variant_isolation_keeps_groups_separate() {
     let mut seen = std::collections::HashSet::new();
     for group in &store.groups {
         for member in &group.members {
+            // 不把 sessionId 写进 panic 消息（CodeQL rust/cleartext-logging）：
+            // 只报第几个成员冲突，已足够定位。
+            let fresh = seen.insert(member.session_id.clone());
             assert!(
-                seen.insert(member.session_id.clone()),
-                "会话 {} 同时出现在两个档位的组里",
-                member.session_id
+                fresh,
+                "第 {} 个成员会话同时出现在两个档位的组里",
+                seen.len()
             );
         }
     }
@@ -2073,6 +2078,83 @@ fn insert_session_copy_duplicates_row_with_target_uid() {
         updated_at.is_some_and(|value| value > 2000),
         "updated_at 必须刷新为本次时间：{updated_at:?}"
     );
+}
+
+#[test]
+fn insert_session_copy_works_on_legacy_schema_without_space_id() {
+    // WorkBuddy 5.11 之前没有 space_id 列。复制逻辑按**目标表列名**匹配，
+    // 旧库缺列必须自然跳过，而不是报错（跨版本迁移场景）。
+    let env = ready_env("insert-legacy");
+    let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+    conn.execute("ALTER TABLE sessions DROP COLUMN space_id", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, cwd, created_at, updated_at, deleted_at,
+                               is_playground)
+         VALUES ('src-legacy', 'uid-a', '旧库会话', '/ws', 1000, 2000, NULL, 0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let outcome = insert_session_copy(
+        &env.paths(),
+        &env.paths(),
+        "new-uuid-legacy",
+        "src-legacy",
+        "uid-a",
+        "uid-b",
+    )
+    .unwrap();
+    assert_eq!(outcome, DbCopyOutcome::Inserted);
+
+    let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+    let (title, user_id): (String, String) = conn
+        .query_row(
+            "SELECT title, user_id FROM sessions WHERE id = 'new-uuid-legacy'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "旧库会话");
+    assert_eq!(user_id, "uid-b");
+}
+
+#[test]
+fn insert_session_copy_drops_source_space_id() {
+    // issue #219 同类：spaces 按账号隔离（spaces.user_id），源 space_id 在目标账号不存在。
+    // 沿用会让客户端把副本归到不存在的分组（分组错乱 / 新建任务后消失），必须归一为 NULL。
+    let env = ready_env("insert-space");
+    let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, title, cwd, created_at, updated_at, deleted_at,
+                               is_playground, space_id)
+         VALUES ('src-space', 'uid-a', '分组会话', '/ws', 1000, 2000, NULL, 0, 'space-of-source')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let outcome = insert_session_copy(
+        &env.paths(),
+        &env.paths(),
+        "new-uuid-space",
+        "src-space",
+        "uid-a",
+        "uid-b",
+    )
+    .unwrap();
+    assert_eq!(outcome, DbCopyOutcome::Inserted);
+
+    let conn = Connection::open(env.paths().workbuddy_db()).unwrap();
+    let space_id: Option<String> = conn
+        .query_row(
+            "SELECT space_id FROM sessions WHERE id = 'new-uuid-space'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(space_id, None, "副本不得继承源账号的 space_id");
 }
 
 #[test]
@@ -6627,4 +6709,26 @@ fn dedup_soft_deletes_rows_but_keeps_jsonl_bodies() {
         )
         .unwrap();
     assert_eq!(deleted, 1);
+}
+
+#[test]
+fn markdown_export_keeps_readable_text_and_skips_noise() {
+    let jsonl = [
+        r#"{"role":"user","content":[{"type":"text","text":"你好"}],"timestamp":1760000000000}"#,
+        r#"{"type":"tool_call","content":[],"timestamp":1760000001000}"#,
+        r#"{"role":"assistant","content":[{"type":"text","text":"收到"}],"timestamp":1760000002000}"#,
+    ]
+    .join("\n");
+    let export =
+        crate::modules::session::markdown_from_jsonl(&jsonl, "sid-1", "标题A", "uid-1", "cn");
+    let (markdown, kept, total) = (export.markdown, export.messages, export.records);
+    assert!(export.read_error.is_none());
+    assert_eq!(total, 3);
+    assert_eq!(kept, 2, "工具调用无文本应被跳过");
+    assert!(markdown.starts_with("# 标题A"));
+    assert!(markdown.contains("### user"));
+    assert!(markdown.contains("你好"));
+    assert!(markdown.contains("### assistant"));
+    assert!(markdown.contains("收到"));
+    assert!(!markdown.contains("tool_call"));
 }

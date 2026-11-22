@@ -3,6 +3,7 @@ import { Download, FolderOpen, Loader2 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -64,6 +65,8 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
   const [error, setError] = useState("");
   /** 桌面端导出成功后的文件路径（webui 用浏览器下载，无此状态）。 */
   const [savedPath, setSavedPath] = useState<string | null>(null);
+  /** 可选口令：填了就导出加密信封（PBKDF2 + AES-256-GCM），留空导出明文。 */
+  const [password, setPassword] = useState("");
 
   useEffect(() => {
     if (open) {
@@ -71,6 +74,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
       setBusy(false);
       setError("");
       setSavedPath(null);
+      setPassword("");
     }
   }, [open]);
 
@@ -110,7 +114,7 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
           filters: [{ name: "JSON", extensions: ["json"] }],
         });
         if (!path) return; // 用户取消保存对话框
-        const res = await api.exportAccountsToPath(ids, path);
+        const res = await api.exportAccountsToPath(ids, path, password.trim() || undefined);
         setSavedPath(res.path);
         onExported?.(ids.length);
       }
@@ -133,8 +137,24 @@ export function ExportAccountsDialog({ open, onOpenChange, accounts, onExported 
           <AlertTitle>安全提示</AlertTitle>
           <AlertDescription>
             导出文件含登录 token，等同密码，请勿上传网盘或发送给他人。
+            {password.trim() ? " 本次将写入加密文件，口令遗失后无法恢复。" : " 填写口令可以加密导出。"}
           </AlertDescription>
         </Alert>
+
+        <div className="space-y-1.5">
+          <label htmlFor="export-password" className="text-sm font-medium">
+            加密口令（可选）
+          </label>
+          <Input
+            id="export-password"
+            type="password"
+            autoComplete="new-password"
+            placeholder="留空则导出未加密的明文 JSON"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            disabled={busy}
+          />
+        </div>
 
         {accounts.length === 0 ? (
           <p className="py-4 text-center text-sm text-muted-foreground">暂无账号可导出。</p>

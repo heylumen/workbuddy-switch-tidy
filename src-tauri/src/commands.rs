@@ -8,11 +8,12 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, account_memory, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
-    codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
-    export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    account, account_memory, account_merge, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide,
+    codebuddy_ide, codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits,
+    error_log, export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, session_groups, session_link, storage, switch,
+    token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 #[derive(Serialize)]
@@ -496,9 +497,24 @@ pub fn export_accounts(account_ids: Vec<String>) -> Result<Value, String> {
 
 /// POST /api/export-accounts-to-path —— 把勾选账号的完整记录写入用户选择的路径（保存对话框产物）。
 #[tauri::command]
-pub fn export_accounts_to_path(account_ids: Vec<String>, path: String) -> Result<Value, String> {
-    export_import::export_accounts_to_path(&account_ids, &path)
-        .map(|path| json!({ "ok": true, "path": path }))
+pub async fn export_accounts_to_path(
+    account_ids: Vec<String>,
+    path: String,
+    password: Option<String>,
+) -> Result<Value, String> {
+    // 加密导出要跑 PBKDF2（210k 轮）+ AES，必须离开同步命令线程，
+    // 否则导出几 MB 备份时窗口会明显卡住（与导入命令保持一致的做法）。
+    tauri::async_runtime::spawn_blocking(move || {
+        let written = match password.map(|value| value.trim().to_string()) {
+            Some(pw) if !pw.is_empty() => {
+                export_import::export_accounts_encrypted_to_path(&account_ids, &path, &pw)?
+            }
+            _ => export_import::export_accounts_to_path(&account_ids, &path)?,
+        };
+        Ok(json!({ "ok": true, "path": written }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 /// POST /api/import/preview —— 解析导入文件并返回脱敏预览（含文件内索引）。
@@ -584,7 +600,6 @@ pub async fn switch_account(
     app: tauri::AppHandle,
     account_id: String,
     restart: Option<bool>,
-    share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
     sync_selections: Option<Value>,
 ) -> Result<Value, String> {
@@ -592,7 +607,6 @@ pub async fn switch_account(
         return Err("缺少 accountId".to_string());
     }
     let restart = restart.unwrap_or(true);
-    let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
     // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
     // 不在命令层做业务判定。
@@ -605,7 +619,6 @@ pub async fn switch_account(
             Some(&progress),
             &account_id,
             restart,
-            share_sessions,
             &copy_ids,
             &sync_selections,
         )
@@ -1560,6 +1573,316 @@ pub async fn hide_duplicate_group(
             &title,
             &keep_session_id,
             unlink_linked.unwrap_or(false),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 只软隐藏「完全相同子组」中除保留项外的成员（同组内的分叉成员保持不动）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn hide_exact_subgroup(
+    account_id: String,
+    cwd: String,
+    title: String,
+    session_ids: Vec<String>,
+    keep_session_id: String,
+    unlink_linked: Option<bool>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    if session_ids.len() < 2 {
+        return Err("子组至少需要 2 个成员".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let target = account::find_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
+        let variant = account::variant_of(&target);
+        let uid = target
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if uid.is_empty() {
+            return Err("账号缺少 uid".to_string());
+        }
+        if process::is_workbuddy_running(variant) {
+            return Err("请先退出 WorkBuddy 再软隐藏重复会话".to_string());
+        }
+        Ok(session::hide_exact_subgroup_for_user(
+            variant,
+            &uid,
+            &cwd,
+            &title,
+            &session_ids,
+            &keep_session_id,
+            unlink_linked.unwrap_or(false),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 存储占用扫描（按类别）。`variant` 取 `cn` / `ai`。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn storage_scan(variant: String) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || Ok(storage::scan_storage(parsed)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 把某个「允许回收」的类别整体移入回收站（不物理删除业务数据）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn storage_move_to_trash(variant: String, category_id: String) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || Ok(storage::move_to_trash(parsed, &category_id)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 从回收站恢复到原位。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn storage_restore_trash(entry_id: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(storage::restore_from_trash(&entry_id)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 清空回收站：`olderThanDays = 0` 表示全部清空。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn storage_purge_trash(older_than_days: u32) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(storage::purge_trash(older_than_days)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn parse_variant_hint(raw: &str) -> Result<wb_switch_core::modules::variant::WbVariant, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "cn" | "" => Ok(wb_switch_core::modules::variant::WbVariant::Cn),
+        "ai" => Ok(wb_switch_core::modules::variant::WbVariant::Ai),
+        other => Err(format!("未知档位：{other}")),
+    }
+}
+
+/// 扫描「账号资料迁移」条目（人格 / 本地记忆 / 偏好 / 专家）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn account_merge_scan(
+    account_id: String,
+    target_account_id: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let (variant, source_uid, target_uid) =
+            resolve_merge_pair(&account_id, &target_account_id)?;
+        Ok(account_merge::scan_account_artifacts(
+            variant,
+            &source_uid,
+            &target_uid,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 执行「账号资料迁移」； 时跳过目标已存在的条目。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn account_merge_apply(
+    account_id: String,
+    target_account_id: String,
+    item_ids: Vec<String>,
+    overwrite: Option<bool>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let (variant, source_uid, target_uid) =
+            resolve_merge_pair(&account_id, &target_account_id)?;
+        if process::is_workbuddy_running(variant) {
+            return Err("请先退出 WorkBuddy 再迁移账号资料".to_string());
+        }
+        Ok(account_merge::merge_account_artifacts(
+            variant,
+            &source_uid,
+            &target_uid,
+            &item_ids,
+            overwrite.unwrap_or(false),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn resolve_merge_pair(
+    account_id: &str,
+    target_account_id: &str,
+) -> Result<(wb_switch_core::modules::variant::WbVariant, String, String), String> {
+    use wb_switch_core::modules::variant::WbVariant;
+    let source = account::find_account(account_id).ok_or_else(|| "来源账号不存在".to_string())?;
+    let target =
+        account::find_account(target_account_id).ok_or_else(|| "目标账号不存在".to_string())?;
+    let variant = account::variant_of(&source);
+    if account::variant_of(&target) != variant {
+        return Err("暂不支持跨档位迁移（国内版 / 国际版请分开处理）".to_string());
+    }
+    let _ = WbVariant::Cn;
+    let source_uid = account::get_str(&source, "uid").unwrap_or_default();
+    let target_uid = account::get_str(&target, "uid").unwrap_or_default();
+    if source_uid.trim().is_empty() || target_uid.trim().is_empty() {
+        return Err("账号缺少 uid".to_string());
+    }
+    if source_uid == target_uid {
+        return Err("来源与目标是同一个账号".to_string());
+    }
+    Ok((variant, source_uid, target_uid))
+}
+
+/// 扫描「已删除会话的正文残留」（只读）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn storage_orphan_scan(variant: String) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || Ok(storage::scan_orphan_bodies(parsed)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 把「已删除会话的正文残留」移入回收站（多文件条目，可整条恢复）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn storage_orphan_trash(variant: String) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || Ok(storage::trash_orphan_bodies(parsed)))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// 导出指定会话为 Markdown（只读）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn export_session_markdown(
+    account_id: String,
+    session_id: String,
+    title: Option<String>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let target = account::find_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
+        let variant = account::variant_of(&target);
+        let uid = target
+            .get("uid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if uid.is_empty() {
+            return Err("账号缺少 uid".to_string());
+        }
+        session::export_session_markdown(variant, &uid, &session_id, title.as_deref().unwrap_or(""))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 全局会话搜索：标题（数据库 LIKE）+ 可选正文扫描。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn search_sessions(
+    variant: String,
+    query: String,
+    limit: Option<usize>,
+    include_body: Option<bool>,
+) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(session::search_sessions(
+            parsed,
+            &query,
+            limit.unwrap_or(30),
+            include_body.unwrap_or(false),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 按路径预览导入文件（桌面端：解析在 Rust 侧完成，避免大文件卡住界面）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn import_preview_file(path: String, password: Option<String>) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        export_import::preview_accounts_file_auto(&path, password.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 按路径导入账号。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn import_file(
+    path: String,
+    indexes: Vec<usize>,
+    password: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result =
+            export_import::import_accounts_file_auto(&path, password.as_deref(), &indexes)?;
+        serde_json::to_value(result).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 解析会话的逻辑身份（canonical/alias 模型）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn canonical_resolve(
+    variant: String,
+    uid: String,
+    session_id: String,
+) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = session::SessionPaths::for_variant(parsed);
+        Ok(session_link::resolve_canonical(
+            &paths,
+            parsed,
+            &uid,
+            &session_id,
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 逻辑会话普查（只读）：跨账号同一段对话的族群，标出未被关联组覆盖的。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn canonical_audit(
+    variant: String,
+    limit: Option<usize>,
+    force: Option<bool>,
+) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(session::audit_canonical(
+            parsed,
+            limit.unwrap_or(30),
+            force.unwrap_or(false),
+        ))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 消息级分叉预览：列出各副本「超出共同前缀」的消息。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn divergence_preview(
+    group_id: String,
+    variant: String,
+    max_messages: Option<usize>,
+) -> Result<Value, String> {
+    let parsed = parse_variant_hint(&variant)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = session::SessionPaths::for_variant(parsed);
+        Ok(session::divergence_preview(
+            &paths,
+            parsed,
+            &group_id,
+            max_messages.unwrap_or(10),
         ))
     })
     .await

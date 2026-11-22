@@ -129,6 +129,17 @@ fn print_status(variant: WbVariant) {
 
 #[tokio::main]
 async fn main() {
+    // 启动维护：回收站按保留期自动清理（默认 30 天；环境变量设为 0 可关闭）。
+    {
+        let result = wb_switch_core::modules::storage::purge_expired_on_start();
+        let purged = result
+            .get("purged")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if purged > 0 {
+            eprintln!("[trash] 已清理 {purged} 个过期回收站条目");
+        }
+    }
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("serve");
     match cmd {
@@ -240,7 +251,12 @@ async fn serve(args: &[String]) {
 
     spawn_background_loops();
 
-    axum::serve(listener, app).await.unwrap();
+    // 服务循环意外结束（端口被抢占、accept 失败等）：打印原因并以非零码退出，
+    // 不留一个看起来正常、实际不再响应的进程（生产代码禁止 unwrap）。
+    if let Err(error) = axum::serve(listener, app).await {
+        eprintln!("[server] HTTP 服务异常退出：{error}");
+        std::process::exit(1);
+    }
 }
 
 fn open_browser(url: &str) {

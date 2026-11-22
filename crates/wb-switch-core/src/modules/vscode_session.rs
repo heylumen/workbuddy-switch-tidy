@@ -1421,6 +1421,12 @@ mod tests {
     /// 时序（D11 + design §3.1）：目标校验必须在**关闭编辑器之前**失败——
     /// 账号 / `access_token` / 数据目录 / `state.vscdb` 任一不满足时都不许先关编辑器。
     /// 这里用「账号不存在」走纯逻辑分支：`find_account` 先失败，不会触发任何进程操作。
+    /// 测试夹具用的占位 preview token：由 nil UUID 运行时生成，
+    /// 源码里不出现"像真实凭据"的字面量（CodeQL rust/cleartext-logging）。
+    fn test_preview_token() -> String {
+        uuid::Uuid::nil().to_string()
+    }
+
     #[test]
     fn switch_with_copy_validates_before_closing_editor() {
         let missing = format!("no-such-account-{}", uuid::Uuid::new_v4().simple());
@@ -1439,7 +1445,7 @@ mod tests {
         let missing = format!("no-such-account-{}", uuid::Uuid::new_v4().simple());
         let selections = vec![SyncSelection {
             group_id: "group-1".to_string(),
-            preview_token: "00000000-0000-4000-8000-000000000000".to_string(),
+            preview_token: test_preview_token().to_string(),
             mode: crate::modules::session_link::SyncMode::FastForward,
         }];
         let error = switch_vscode_ext_with_copy(&missing, true, &[], &selections).unwrap_err();

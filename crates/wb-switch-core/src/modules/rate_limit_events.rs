@@ -97,6 +97,39 @@ fn load_state(path: &Path) -> State {
         .unwrap_or_default()
 }
 
+/// 落盘失败日志的节流窗口：消费循环每秒跑一次，磁盘满时若不节流会
+/// 每秒写一条、把 error.log 冲满（200 行上限还会被反复原子重写）。
+const SAVE_FAILURE_LOG_WINDOW_MS: i64 = 5 * 60 * 1000;
+
+/// 判断某个失败原因此刻是否值得记日志（同一原因同一窗口内只记一次）。
+/// 抽成纯函数是为了能注入 now 做确定性测试；用 Vec 而不是 HashMap，
+/// 因为 `Vec::new()` 是 const，可以直接初始化 static。
+fn should_log_failure(
+    last: &std::sync::Mutex<Vec<(&'static str, i64)>>,
+    reason: &'static str,
+    now: i64,
+) -> bool {
+    let mut guard = last.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = guard.iter_mut().find(|(key, _)| *key == reason) {
+        if now - entry.1 < SAVE_FAILURE_LOG_WINDOW_MS {
+            return false;
+        }
+        entry.1 = now;
+        return true;
+    }
+    guard.push((reason, now));
+    true
+}
+
+/// 带节流的落盘失败记录。
+fn log_save_failure(reason: &'static str, message: &str, detail: &str) {
+    static LAST: std::sync::Mutex<Vec<(&'static str, i64)>> = std::sync::Mutex::new(Vec::new());
+    let now = crate::modules::config::now_ms();
+    if should_log_failure(&LAST, reason, now) {
+        crate::modules::error_log::record("backend", message, detail);
+    }
+}
+
 fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -576,7 +609,13 @@ fn consume_with(ctx: &IngestContext, state: &mut State, now: i64) -> Option<bool
     let truncated = (bytes.len() as u64) < state.offset;
     if truncated {
         state.offset = 0;
-        let _ = save_state(&ctx.state_path, state);
+        if let Err(error) = save_state(&ctx.state_path, state) {
+            log_save_failure(
+                "reset",
+                "限流状态重置落盘失败（可能导致重复计数）",
+                &error.to_string(),
+            );
+        }
     }
     if (bytes.len() as u64) == state.offset {
         return None;
@@ -589,7 +628,13 @@ fn consume_with(ctx: &IngestContext, state: &mut State, now: i64) -> Option<bool
     }
     let rotated = compact_if_needed(ctx, state, now);
     state.events.retain(|entry| entry.reset_at > now);
-    let _ = save_state(&ctx.state_path, state);
+    if let Err(error) = save_state(&ctx.state_path, state) {
+        log_save_failure(
+            "consume",
+            "限流事件状态落盘失败（重启后可能重复入账）",
+            &error.to_string(),
+        );
+    }
     Some(changed || rotated)
 }
 
@@ -612,7 +657,13 @@ fn compact_if_needed(ctx: &IngestContext, state: &mut State, now: i64) -> bool {
     }
     let Ok(bytes) = std::fs::read(&rotated) else {
         // 读不到就退回原名，保持「文件仍是事件源」的形态。
-        let _ = std::fs::rename(&rotated, &ctx.events);
+        if std::fs::rename(&rotated, &ctx.events).is_err() {
+            log_save_failure(
+                "rotate",
+                "限流事件轮转回退失败（事件文件可能停在 .1）",
+                &rotated.display().to_string(),
+            );
+        }
         return false;
     };
     let mut added = false;
@@ -689,6 +740,42 @@ pub(crate) fn rate_limit_enabled() -> bool {
         .get("enabled")
         .and_then(Value::as_bool)
         .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    #[test]
+    fn same_reason_is_logged_once_per_window() {
+        let last: std::sync::Mutex<Vec<(&'static str, i64)>> = std::sync::Mutex::new(Vec::new());
+        let start = 1_000_000;
+        assert!(should_log_failure(&last, "consume", start), "首次必须记录");
+        assert!(
+            !should_log_failure(&last, "consume", start + 1_000),
+            "同一窗口内不得重复记录"
+        );
+        assert!(
+            !should_log_failure(&last, "consume", start + SAVE_FAILURE_LOG_WINDOW_MS - 1),
+            "窗口边界前仍应抑制"
+        );
+        assert!(
+            should_log_failure(&last, "consume", start + SAVE_FAILURE_LOG_WINDOW_MS),
+            "超过窗口后允许再记一次"
+        );
+    }
+
+    #[test]
+    fn different_reasons_do_not_suppress_each_other() {
+        let last: std::sync::Mutex<Vec<(&'static str, i64)>> = std::sync::Mutex::new(Vec::new());
+        let now = 5_000;
+        assert!(should_log_failure(&last, "consume", now));
+        assert!(
+            should_log_failure(&last, "rotate", now),
+            "不同原因各自独立计时"
+        );
+        assert!(should_log_failure(&last, "reset", now));
+    }
 }
 
 #[cfg(test)]

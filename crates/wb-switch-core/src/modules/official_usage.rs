@@ -195,7 +195,13 @@ fn save_official_usage_cache_to(path: &Path, payload: &Value) {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(store_dir);
-    let _ = std::fs::create_dir_all(parent).and_then(|_| atomic_write(path, &content));
+    if let Err(error) = std::fs::create_dir_all(parent).and_then(|_| atomic_write(path, &content)) {
+        crate::modules::error_log::record(
+            "backend",
+            "官方用量缓存落盘失败",
+            &format!("{}: {error}", path.display()),
+        );
+    }
 }
 
 fn remembered_official_usage() -> Option<Value> {

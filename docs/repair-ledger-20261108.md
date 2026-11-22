@@ -1,5 +1,8 @@
 # Repair Ledger — 2026-11-08
 
+> **续篇**：2026-11-22 的新发现见 [`repair-ledger-20261122.md`](./repair-ledger-20261122.md)
+> （含"修复过程中暴露的新问题"：内存/静默截断/UUID 归一/阈值耦合/排查误判/拆分失败等 11 条）。
+
 Baseline: `aa705ea` → `5b5f4a7`
 
 This ledger is the compact, repository-tracked index of reviewed findings and their disposition. Detailed evidence remains in the workspace review report.

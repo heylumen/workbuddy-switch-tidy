@@ -11,6 +11,7 @@ import {
 import { toast } from "sonner";
 
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
+import { StorageManager } from "@/components/storage-manager";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -2022,6 +2023,19 @@ function RateLimitCard() {
   );
 }
 
+/** 存储管理：按类别查看体积，可回收项移入回收站。 */
+function StorageCard() {
+  return (
+    <SettingsGroup id="settings-storage" title="存储管理">
+      <CardContent className="space-y-0 p-0">
+        <div className="px-4 py-3 sm:px-5">
+          <StorageManager />
+        </div>
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 /** 设置页：演示模式不渲染自动签到。 */
 export default function SettingsPage() {
   return (
@@ -2042,6 +2056,7 @@ export default function SettingsPage() {
         <RateLimitCard />
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         <NotificationHistoryCard />
+        <StorageCard />
         <ErrorLogCard />
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
       </div>

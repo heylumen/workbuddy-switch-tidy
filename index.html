@@ -97,10 +97,41 @@
       阈值 10s 宽松于正常冷启动，只有真正启动失败时才会出现。
     -->
     <script>
+      // 启动失败留痕：兜底页此前什么都不记录，导致白屏只能靠猜（2026-11-22 事故）。
+      // 这里尽早挂上监听，把资源 404、脚本异常、未处理的 Promise 拒绝收进数组，
+      // 兜底页会把它渲染出来，截图即可定位原因；冒烟脚本也从这里取诊断信息。
+      window.__WB_BOOT_ERRORS__ = [];
+      (function () {
+        function push(text) {
+          try {
+            if (window.__WB_BOOT_ERRORS__.length < 5) {
+              window.__WB_BOOT_ERRORS__.push(String(text).slice(0, 300));
+            }
+          } catch (error) {}
+        }
+        window.addEventListener(
+          "error",
+          function (event) {
+            var target = event && event.target;
+            if (target && (target.src || target.href)) {
+              push("资源加载失败: " + (target.src || target.href));
+            } else {
+              push("脚本错误: " + ((event && event.message) || "未知"));
+            }
+          },
+          true
+        );
+        window.addEventListener("unhandledrejection", function (event) {
+          var reason = event && event.reason;
+          push("未处理的 Promise 拒绝: " + ((reason && (reason.stack || reason.message)) || reason));
+        });
+      })();
+    </script>
+    <script>
       (function () {
         var timeoutMs = 10000;
         // 与 src/lib/update.ts 的 GITHUB_RELEASE_URL 一致（内联脚本不能引用打包产物）。
-        var releaseUrl = "https://github.com/changexbc/workbuddy-switch/releases/latest";
+        var releaseUrl = "https://github.com/heylumen/workbuddy-switch-tidy/releases/latest";
         window.setTimeout(function () {
           if (window.__WB_MOUNTED__) return;
           var root = document.getElementById("root");
@@ -141,6 +172,17 @@
           wrap.appendChild(title);
           wrap.appendChild(text);
           wrap.appendChild(actions);
+
+          var details = window.__WB_BOOT_ERRORS__ || [];
+          if (details.length) {
+            var detail = document.createElement("div");
+            detail.className = "wb-boot-detail";
+            detail.style.cssText =
+              "margin-top:10px;max-width:520px;font-size:12px;line-height:1.5;opacity:.75;" +
+              "white-space:pre-wrap;word-break:break-all;text-align:left;";
+            detail.textContent = "错误详情（可截图反馈）：\n" + details.join("\n");
+            wrap.appendChild(detail);
+          }
 
           root.textContent = "";
           root.appendChild(wrap);

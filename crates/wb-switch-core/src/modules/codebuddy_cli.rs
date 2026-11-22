@@ -811,7 +811,13 @@ fn configured_helper_path(path: &Path) -> Result<PathBuf, String> {
 
 fn restore_file(path: &Path, previous: Option<&str>) {
     if let Some(previous) = previous {
-        let _ = atomic_write(path, previous);
+        if let Err(error) = atomic_write(path, previous) {
+            crate::modules::error_log::record(
+                "backend",
+                "CLI 配置回滚失败（配置文件可能未恢复原状）",
+                &format!("{}: {error}", path.display()),
+            );
+        }
     } else {
         let _ = std::fs::remove_file(path);
     }

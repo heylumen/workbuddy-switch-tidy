@@ -1269,7 +1269,7 @@ mod tests {
             WbVariant::Cn
         ));
         assert!(is_workbuddy_exe_file_name(
-            Path::new(r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe"),
+            Path::new(r"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe"),
             WbVariant::Cn
         ));
         assert!(!is_workbuddy_exe_file_name(
@@ -1326,8 +1326,8 @@ mod tests {
     #[test]
     fn ai_process_rows_do_not_swallow_cn_processes() {
         let stdout = "\
-1001|WorkBuddyAI|D:\\Users\\Zhou\\AppData\\Local\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe
-1002|WorkBuddy|D:\\Users\\Zhou\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe
+1001|WorkBuddyAI|D:\\Users\\tester\\AppData\\Local\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe
+1002|WorkBuddy|D:\\Users\\tester\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe
 1003|workbuddy-switch|C:\\apps\\workbuddy-switch.exe
 ";
         let rows = parse_windows_process_rows(stdout);
@@ -1360,15 +1360,15 @@ mod tests {
     fn parse_display_icon_strips_quotes_and_index() {
         assert_eq!(
             parse_windows_display_icon(
-                r#""D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe,0""#
+                r#""D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe,0""#
             ),
-            Some(r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string())
+            Some(r"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string())
         );
         assert_eq!(
             parse_windows_display_icon(
-                r#""D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe",0"#
+                r#""D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe",0"#
             ),
-            Some(r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string())
+            Some(r"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string())
         );
         assert_eq!(
             parse_windows_display_icon(r"C:\Program Files\WorkBuddy\WorkBuddy.exe"),
@@ -1378,16 +1378,16 @@ mod tests {
     }
 
     #[test]
-    fn fallback_candidates_include_d_drive_for_zhou() {
+    fn fallback_candidates_include_d_drive_for_custom_user() {
         let cands = windows_fallback_exe_candidates(
-            Some(r"C:\Users\Zhou\AppData\Local"),
+            Some(r"C:\Users\tester\AppData\Local"),
             Some(r"C:\Program Files"),
             Some(r"C:\Program Files (x86)"),
-            Some("Zhou"),
+            Some("tester"),
             &['C', 'D'],
             WbVariant::Cn,
         );
-        let want = r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe";
+        let want = r"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe";
         assert!(
             cands.iter().any(|p| p.to_string_lossy() == want),
             "missing {want} in {cands:?}"
@@ -1397,7 +1397,7 @@ mod tests {
             cands.iter().any(|p| p.to_string_lossy() == d_pf),
             "missing {d_pf} in {cands:?}"
         );
-        let local_default = r"C:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe";
+        let local_default = r"C:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe";
         assert!(
             cands.iter().any(|p| p.to_string_lossy() == local_default),
             "missing {local_default} in {cands:?}"
@@ -1407,10 +1407,10 @@ mod tests {
     #[test]
     fn ai_fallback_candidates_stay_within_variant() {
         let cands = windows_fallback_exe_candidates(
-            Some(r"C:\Users\Zhou\AppData\Local"),
+            Some(r"C:\Users\tester\AppData\Local"),
             None,
             None,
-            Some("Zhou"),
+            Some("tester"),
             &['D'],
             WbVariant::Ai,
         );
@@ -1420,7 +1420,7 @@ mod tests {
             .collect();
         assert!(
             s.contains(
-                &r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddyAI\WorkBuddyAI.exe".to_string()
+                &r"D:\Users\tester\AppData\Local\Programs\WorkBuddyAI\WorkBuddyAI.exe".to_string()
             ),
             "missing AI candidate in {s:?}"
         );
@@ -1435,7 +1435,7 @@ mod tests {
         let stdout = "\
 1001|workbuddy-switch|C:\\apps\\workbuddy-switch.exe
 1002|wb-switch|
-1003|WorkBuddy|D:\\Users\\Zhou\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe
+1003|WorkBuddy|D:\\Users\\tester\\AppData\\Local\\Programs\\WorkBuddy\\WorkBuddy.exe
 1004|crashpad_handler|C:\\x\\crashpad_handler.exe
 1005|CodeBuddy|
 1006|WorkBuddy Helper|
@@ -1448,7 +1448,7 @@ mod tests {
 
     #[test]
     fn only_switcher_process_is_not_workbuddy_running() {
-        let stdout = "4400|workbuddy-switch.exe|C:\\Users\\Zhou\\AppData\\Local\\Programs\\wb-switch\\workbuddy-switch.exe\n";
+        let stdout = "4400|workbuddy-switch.exe|C:\\Users\\tester\\AppData\\Local\\Programs\\wb-switch\\workbuddy-switch.exe\n";
         let kept =
             filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout), WbVariant::Cn);
         assert!(kept.is_empty());
@@ -1479,10 +1479,10 @@ INFO: No tasks are running which match the specified criteria.
     #[test]
     fn registry_lines_parse_display_icon_and_skip_self() {
         let stdout = r#"
-"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe,0"
-C:\Users\Zhou\AppData\Local\Programs\workbuddy-switch\workbuddy-switch.exe
+"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe,0"
+C:\Users\tester\AppData\Local\Programs\workbuddy-switch\workbuddy-switch.exe
 D:\Program Files\WorkBuddy\Uninstall.exe
-D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
+D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
 "#;
         let paths = parse_windows_registry_path_lines(stdout, WbVariant::Cn);
         let s: Vec<String> = paths
@@ -1491,7 +1491,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
             .collect();
         assert_eq!(
             s,
-            vec![r"D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string(),]
+            vec![r"D:\Users\tester\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe".to_string(),]
         );
         assert!(parse_windows_registry_path_lines(stdout, WbVariant::Ai).is_empty());
     }

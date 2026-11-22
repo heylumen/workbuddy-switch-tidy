@@ -35,6 +35,8 @@ fn child(root: &Path, mode: &str) -> Command {
 
 #[test]
 fn worker() {
+    // 同一进程内需要连续切换，放行切号频率保护（仅测试）。
+    std::env::set_var("WB_SWITCH_DISABLE_RATE_GUARD", "1");
     let Ok(mode) = std::env::var("WB_SWITCH_AUTH_WORKER") else {
         return;
     };
@@ -71,7 +73,7 @@ fn worker() {
             let callback: switch::ProgressFn = Box::new(move |_| {
                 count.fetch_add(1, Ordering::SeqCst);
             });
-            let result = switch::switch_account(Some(&callback), "fixture", false, false, &[], &[]);
+            let result = switch::switch_account(Some(&callback), "fixture", false, &[], &[]);
             assert!(
                 matches!(result, Err(ref e) if e.starts_with(state_lock::BUSY_PREFIX)),
                 "busy switch must fail before any side effect"
@@ -106,7 +108,7 @@ fn worker() {
                 }
             });
             let result =
-                switch::switch_account(Some(&callback), "fixture", false, false, &[], &[]).unwrap();
+                switch::switch_account(Some(&callback), "fixture", false, &[], &[]).unwrap();
             assert_eq!(result["ok"], true);
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(
@@ -122,7 +124,7 @@ fn worker() {
             );
             // A completed update before the next switch must be read afresh.
             account::upsert_account(&fixture("new")).unwrap();
-            switch::switch_account(None, "fixture", false, false, &[], &[]).unwrap();
+            switch::switch_account(None, "fixture", false, &[], &[]).unwrap();
             let exported = auth_file::read_auth_file(WbVariant::Cn).unwrap();
             assert_eq!(
                 exported["auth"]["accessToken"],
@@ -136,7 +138,7 @@ fn worker() {
         "write-failure" => {
             std::fs::create_dir_all(auth_path.parent().unwrap().parent().unwrap()).unwrap();
             std::fs::write(auth_path.parent().unwrap(), b"not a directory").unwrap();
-            assert!(switch::switch_account(None, "fixture", false, false, &[], &[]).is_err());
+            assert!(switch::switch_account(None, "fixture", false, &[], &[]).is_err());
             let guard = state_lock::try_auth().expect("Failed switch leaked auth lock");
             drop(guard);
         }

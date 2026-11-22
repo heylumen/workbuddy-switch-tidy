@@ -22,6 +22,7 @@
 //! 基线——对齐 git fast-forward 的 ancestor 语义，追加同步零覆盖。
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -181,9 +182,60 @@ const SUMMARY_CACHE_MAX_ENTRIES: usize = 32;
 const SUMMARY_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const SUMMARY_CACHE_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const SUMMARY_CACHE_MAX_RECORDS: usize = 10_000;
-/// 详情页自动校验的硬上限：真实数据中存在数百 MB 的副本，逐行扫描会让界面失去响应。
+/// 详情页自动校验的默认硬上限：真实数据中存在数百 MB 的副本，逐行扫描会让界面失去响应。
 /// 超过该值只保留尾部预览，并明确显示“文件过大、未自动校验”，不静默假装一致。
-pub(crate) const SUMMARY_SCAN_MAX_BYTES: u64 = 32 * 1024 * 1024;
+///
+/// 2026-11-22：默认由 32 MiB → 128 MiB → **512 MiB**（实测本地 P99=338MB、50 个会话 >128MB），并允许用环境变量
+/// `WB_SWITCH_SESSION_SUMMARY_MAX_MB`（8–2048）覆盖——超过默认值的会话只会
+/// 「不能参与同步判定」，复制路径不受影响；需要同步超大会话时可临时调高。
+pub(crate) const DEFAULT_SUMMARY_SCAN_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+const SUMMARY_MAX_MB_ENV: &str = "WB_SWITCH_SESSION_SUMMARY_MAX_MB";
+const SUMMARY_MAX_RECORDS_ENV: &str = "WB_SWITCH_SESSION_SUMMARY_MAX_RECORDS";
+const SUMMARY_MAX_RECORDS_DEFAULT: usize = 300_000;
+const SUMMARY_MAX_RECORDS_FLOOR: usize = 10_000;
+const SUMMARY_MAX_RECORDS_CEIL: usize = 5_000_000;
+/// 审计专用上限：审计是显式触发的「慢但彻底」操作，允许读到 2 GB。
+const AUDIT_SUMMARY_MAX_BYTES: u64 = 2048 * 1024 * 1024;
+
+/// 解析并夹取记录数上限。纯函数，便于单测。
+fn parse_summary_max_records(raw: Option<&str>) -> usize {
+    let Some(text) = raw else {
+        return SUMMARY_MAX_RECORDS_DEFAULT;
+    };
+    let Ok(value) = text.trim().parse::<usize>() else {
+        return SUMMARY_MAX_RECORDS_DEFAULT;
+    };
+    value.clamp(SUMMARY_MAX_RECORDS_FLOOR, SUMMARY_MAX_RECORDS_CEIL)
+}
+
+/// 当前生效的记录数上限（环境变量仅在首次调用时读取）。
+fn summary_scan_max_records() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        parse_summary_max_records(std::env::var(SUMMARY_MAX_RECORDS_ENV).ok().as_deref())
+    })
+}
+const SUMMARY_MAX_MB_MIN: u64 = 8;
+const SUMMARY_MAX_MB_MAX: u64 = 2048;
+
+/// 解析并夹取上限（MB → 字节）。纯函数，便于单测；空/非法值回退默认。
+fn parse_summary_max_mb(raw: Option<&str>) -> u64 {
+    let Some(text) = raw else {
+        return DEFAULT_SUMMARY_SCAN_MAX_BYTES;
+    };
+    let Ok(value) = text.trim().parse::<u64>() else {
+        return DEFAULT_SUMMARY_SCAN_MAX_BYTES;
+    };
+    let clamped = value.clamp(SUMMARY_MAX_MB_MIN, SUMMARY_MAX_MB_MAX);
+    clamped * 1024 * 1024
+}
+
+/// 当前生效的扫描上限（环境变量仅在进程启动后首次调用时读取）。
+pub(crate) fn summary_scan_max_bytes() -> u64 {
+    static CACHED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| parse_summary_max_mb(std::env::var(SUMMARY_MAX_MB_ENV).ok().as_deref()))
+}
 
 type SummaryKey = (PathBuf, u64, u128, String);
 type SummaryValue = (String, NormalizedContent);
@@ -247,6 +299,16 @@ fn summary_cache_key(path: &Path, own_session_id: &str) -> Option<SummaryKey> {
 
 /// 读取只用于判定/统计的正文摘要；命中缓存时不读文件，未命中则读一次并缓存。
 pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
+    read_content_summary_capped(path, own_session_id, summary_scan_max_bytes())
+}
+
+/// 审计专用：显式放宽到 [`AUDIT_SUMMARY_MAX_BYTES`]（但不超过环境变量给的上限）。
+pub fn read_content_summary_for_audit(path: &Path, own_session_id: &str) -> ContentState {
+    let env_max = summary_scan_max_bytes();
+    read_content_summary_capped(path, own_session_id, env_max.max(AUDIT_SUMMARY_MAX_BYTES))
+}
+
+fn read_content_summary_capped(path: &Path, own_session_id: &str, scan_max: u64) -> ContentState {
     let Some(key) = summary_cache_key(path, own_session_id) else {
         return match std::fs::metadata(path) {
             Err(error) if error.kind() == ErrorKind::NotFound => ContentState::Missing,
@@ -255,10 +317,12 @@ pub fn read_content_summary(path: &Path, own_session_id: &str) -> ContentState {
         };
     };
     // 超大文件只保留尾部预览，禁止在详情页逐行扫描数百 MB 副本。
-    if key.1 > SUMMARY_SCAN_MAX_BYTES {
+    if key.1 > scan_max {
         return ContentState::Unavailable(format!(
-            "会话文件过大（{:.1} MB），已跳过内容校验",
-            key.1 as f64 / 1024.0 / 1024.0
+            "会话文件过大（{:.1} MB，超过校验上限 {:.0} MB），已跳过内容校验：\
+这类会话仍可「复制」到其它账号，但不会参与增量同步；如需同步，可调高 {SUMMARY_MAX_MB_ENV}（8–2048）后重启",
+            key.1 as f64 / 1024.0 / 1024.0,
+            scan_max as f64 / 1024.0 / 1024.0
         ));
     }
     // 2MB–32MB 不进缓存，但仍流式计算摘要，避免整文件读入造成峰值。
@@ -326,6 +390,7 @@ fn read_content_summary_streaming(path: &Path, own_session_id: &str) -> ContentS
     };
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
+    let max_records = summary_scan_max_records();
     let mut line_digests: Vec<String> = Vec::new();
     let mut pending_empty = 0usize;
     let mut buf = Vec::new();
@@ -361,6 +426,12 @@ fn read_content_summary_streaming(path: &Path, own_session_id: &str) -> ContentS
             return ContentState::Unavailable(format!(
                 "第 {} 行的格式无法识别，内容可能不完整",
                 line_digests.len() + 1
+            ));
+        }
+        if line_digests.len() >= max_records {
+            return ContentState::Unavailable(format!(
+                "会话记录条数过多（超过 {max_records} 条），已跳过内容校验：\
+这类会话仍可「复制」，但不会参与增量同步；如需同步，可调高 {SUMMARY_MAX_RECORDS_ENV} 后重启"
             ));
         }
         line_digests.push(line_digest_of(
@@ -1423,6 +1494,90 @@ pub fn with_link_store_write<T>(
         }
     })?;
     Ok(outcome)
+}
+
+/// 取某个逻辑会话（组）的成员快照，供分叉预览使用。
+pub fn group_members_of(
+    paths: &SessionPaths,
+    group_id: &str,
+) -> Option<Vec<(String, String, MemberState, WbVariant)>> {
+    match load_store(paths) {
+        StoreState::Ready(store) => {
+            store
+                .groups
+                .iter()
+                .find(|group| group.id == group_id)
+                .map(|group| {
+                    group
+                        .members
+                        .iter()
+                        .map(|member| {
+                            (
+                                member.uid.clone(),
+                                member.session_id.clone(),
+                                member.state,
+                                member_variant(group, member),
+                            )
+                        })
+                        .collect()
+                })
+        }
+        _ => None,
+    }
+}
+
+/// 解析别名：任意 (uid, sessionId) → 其逻辑会话（canonical）与同族副本。
+///
+/// canonical/alias 模型的入口：`LinkGroup.id` 充当 canonical id，成员的 `sessionId`
+/// 是各账号下的 alias。未登记进任何组的会话返回 `covered: false`——
+/// 这类会话要靠「逻辑身份发现」才能与其它账号的副本关联起来。
+pub fn resolve_canonical(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    uid: &str,
+    session_id: &str,
+) -> Value {
+    match load_store(paths) {
+        StoreState::Ready(store) => {
+            let Some(group) = find_group_for_identity(&store, variant, uid, session_id) else {
+                return json!({ "ok": true, "covered": false, "canonicalId": Value::Null });
+            };
+            let members: Vec<Value> = group
+                .members
+                .iter()
+                .map(|member| {
+                    json!({
+                        "uid": member.uid,
+                        "sessionId": member.session_id,
+                        "state": member.state.as_str(),
+                        "variant": member_variant(group, member).as_str(),
+                    })
+                })
+                .collect();
+            json!({
+                "ok": true,
+                "covered": true,
+                "canonicalId": group.id,
+                "variant": group.variant.as_str(),
+                "createdAt": group.created_at,
+                "memberCount": members.len(),
+                "accountCount": group
+                    .members
+                    .iter()
+                    .map(|member| member.uid.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                "members": members,
+            })
+        }
+        StoreState::Missing => json!({
+            "ok": true,
+            "covered": false,
+            "canonicalId": Value::Null,
+            "reason": "没有关联记录",
+        }),
+        StoreState::Unavailable(reason) => json!({ "ok": false, "reason": reason }),
+    }
 }
 
 /// 按 (variant, uid, sessionId) 查找所属组（身份唯一归组；成员档位取 `member_variant`）。
@@ -3841,5 +3996,47 @@ mod tests {
             load_pair_baseline(&paths, &group, "m-uid-a-sess-1", "m-uid-b-sess-b"),
             BaselineState::Unverifiable(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod summary_limit_tests {
+    use super::{parse_summary_max_mb, DEFAULT_SUMMARY_SCAN_MAX_BYTES};
+
+    #[test]
+    fn default_when_missing_or_invalid() {
+        assert_eq!(parse_summary_max_mb(None), DEFAULT_SUMMARY_SCAN_MAX_BYTES);
+        assert_eq!(
+            parse_summary_max_mb(Some("  ")),
+            DEFAULT_SUMMARY_SCAN_MAX_BYTES
+        );
+        assert_eq!(
+            parse_summary_max_mb(Some("abc")),
+            DEFAULT_SUMMARY_SCAN_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn clamps_to_safe_range() {
+        assert_eq!(parse_summary_max_mb(Some("1")), 8 * 1024 * 1024);
+        assert_eq!(parse_summary_max_mb(Some("99999")), 2048 * 1024 * 1024);
+        assert_eq!(parse_summary_max_mb(Some("256")), 256 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod summary_records_limit_tests {
+    use super::{parse_summary_max_records, SUMMARY_MAX_RECORDS_DEFAULT};
+
+    #[test]
+    fn records_clamp_and_default() {
+        assert_eq!(parse_summary_max_records(None), SUMMARY_MAX_RECORDS_DEFAULT);
+        assert_eq!(
+            parse_summary_max_records(Some("abc")),
+            SUMMARY_MAX_RECORDS_DEFAULT
+        );
+        assert_eq!(parse_summary_max_records(Some("1")), 10_000);
+        assert_eq!(parse_summary_max_records(Some("99999999")), 5_000_000);
+        assert_eq!(parse_summary_max_records(Some("500000")), 500_000);
     }
 }

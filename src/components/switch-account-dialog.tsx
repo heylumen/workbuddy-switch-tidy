@@ -200,7 +200,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       const linkedCount = copyReport?.alreadyLinked?.length ?? 0;
       const copyErrors = copyReport?.errors ?? [];
       if (copiedCount > 0) parts.push(`已复制 ${copiedCount} 个会话`);
-      if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个之前复制过的会话`);
+      if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个之前复制过的会话（新增内容可在「关联会话」同步）`);
       if (copyErrors.length > 0) parts.push(`会话复制失败 ${copyErrors.length} 个`);
       const syncReport = res.sessionSync;
       const syncedItems = syncReport?.synced ?? [];

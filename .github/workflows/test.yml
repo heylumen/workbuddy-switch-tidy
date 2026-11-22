@@ -147,11 +147,46 @@ jobs:
       - name: Repair ledger consistency
         run: python scripts/check-repair-ledger.py
 
+      # 前端调用的 Tauri 命令 / HTTP 接口必须真实存在：tsc 与 cargo 都查不出这类字符串契约。
+      # 指标只能下降：静默丢弃/pod 无 unwrap/最大文件行数/TODO 数量。
+      # workflow 文件写错时 GitHub 不会报错、只会静默不运行，这里提前拦住语法问题。
+      - name: Workflow YAML syntax
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY'
+          import glob, sys, yaml
+          failed = False
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              try:
+                  yaml.safe_load(open(path, encoding='utf-8'))
+                  print(f'ok   {path}')
+              except Exception as error:
+                  print(f'FAIL {path}: {error}', file=sys.stderr)
+                  failed = True
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Debt ratchet
+        run: python scripts/check-debt-ratchet.py
+
+      - name: Command / route contract
+        run: python scripts/check-command-routes.py
+
       - name: Legacy color fallbacks
         run: python scripts/check-legacy-colors.py
 
       - name: PII scan (README / release body)
         run: python scripts/check-pii.py README.md
+
+      # 构建产物必须真的能跑：vite build 成功 ≠ 能运行（2026-11-22 白屏事故）。
+      # 断言 window.__WB_MOUNTED__ === true，失败会打印资源 404 / 脚本异常详情。
+      - name: Build frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Frontend runtime smoke
+        run: python scripts/smoke-webui.py --require-browser
 
       - name: Install frontend deps for audit
         run: npm ci

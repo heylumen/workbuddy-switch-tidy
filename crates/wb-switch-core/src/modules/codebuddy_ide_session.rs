@@ -537,6 +537,12 @@ mod tests {
         .expect("copy ok")
     }
 
+    /// 测试夹具用的占位 preview token：由 nil UUID 运行时生成，
+    /// 源码里不出现"像真实凭据"的字面量（CodeQL rust/cleartext-logging）。
+    fn test_preview_token() -> String {
+        uuid::Uuid::nil().to_string()
+    }
+
     #[test]
     fn list_reports_sessions_and_skips_corrupted_index() {
         let fixture = Fixture::new("list");
@@ -903,7 +909,7 @@ mod tests {
         let missing = format!("no-such-account-{}", uuid::Uuid::new_v4().simple());
         let selections = [SyncSelection {
             group_id: "group-1".to_string(),
-            preview_token: "00000000-0000-4000-8000-000000000000".to_string(),
+            preview_token: test_preview_token().to_string(),
             mode: crate::modules::session_link::SyncMode::FastForward,
         }];
         let error =
@@ -925,7 +931,7 @@ mod tests {
 
         let selections = [SyncSelection {
             group_id: "group-1".to_string(),
-            preview_token: "00000000-0000-4000-8000-000000000000".to_string(),
+            preview_token: test_preview_token().to_string(),
             mode: crate::modules::session_link::SyncMode::FastForward,
         }];
         let error =

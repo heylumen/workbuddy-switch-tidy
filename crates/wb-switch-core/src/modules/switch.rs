@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::modules::account;
 use crate::modules::auth_file;
+use crate::modules::config::now_ms;
 use crate::modules::process::{close_workbuddy, launch_workbuddy};
 use crate::modules::session::{self, SessionPaths, SyncSelection};
 use crate::modules::session_link::{
@@ -133,6 +134,158 @@ fn reject_session_writes_without_restart(
     (copy, sync)
 }
 
+/// 切号最小间隔（毫秒）：防误连点，也避免短时间多次切号触发风控。
+const SWITCH_MIN_INTERVAL_ENV: &str = "WB_SWITCH_MIN_INTERVAL_MS";
+#[cfg(not(test))]
+const SWITCH_MIN_INTERVAL_DEFAULT_MS: u64 = 5_000;
+/// 单位窗口内容许的切号次数。
+const SWITCH_MAX_PER_WINDOW_ENV: &str = "WB_SWITCH_MAX_PER_WINDOW";
+const SWITCH_MAX_PER_WINDOW_DEFAULT: usize = 5;
+/// 频率统计窗口（毫秒）。
+const SWITCH_RATE_WINDOW_MS: i64 = 60_000;
+
+fn env_u64(name: &str, default: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(|value| value.min(max))
+        .unwrap_or(default)
+}
+
+fn switch_min_interval_ms() -> u64 {
+    // 测试进程里默认放行：单元测试会在同一进程内连续调用切换。
+    // 生产默认 5s：既挡住误连点，又不至于让"选错号立刻切回"等 10 秒。
+    #[cfg(test)]
+    let default_ms = 0;
+    #[cfg(not(test))]
+    let default_ms = SWITCH_MIN_INTERVAL_DEFAULT_MS;
+    env_u64(SWITCH_MIN_INTERVAL_ENV, default_ms, 600_000)
+}
+
+fn switch_max_per_window() -> usize {
+    env_u64(
+        SWITCH_MAX_PER_WINDOW_ENV,
+        SWITCH_MAX_PER_WINDOW_DEFAULT as u64,
+        100,
+    ) as usize
+}
+
+/// 纯函数：判断本次切号是否放行。`history` 为最近的切号时间戳（毫秒，升序）。
+///
+/// 两条规则（任一不满足即拒绝，并给出还需等待多久）：
+/// 1. 与上一次切号间隔 ≥ 最小间隔；
+/// 2. 最近 60 秒内的切号次数 < 上限。
+///
+/// 拒绝时不改动 `history`，放行由调用方负责记录。
+fn evaluate_switch_rate(
+    history: &[i64],
+    now: i64,
+    min_interval_ms: u64,
+    max_per_window: usize,
+) -> Result<(), String> {
+    if let Some(last) = history.last() {
+        let elapsed = now.saturating_sub(*last);
+        if elapsed < min_interval_ms as i64 {
+            let wait_ms = min_interval_ms as i64 - elapsed;
+            return Err(format!(
+                "距离上次切换账号仅 {:.0} 秒，请等待 {} 秒后再切换",
+                elapsed as f64 / 1000.0,
+                (wait_ms + 999) / 1000
+            ));
+        }
+    }
+    let in_window = history
+        .iter()
+        .filter(|ts| now.saturating_sub(**ts) < SWITCH_RATE_WINDOW_MS)
+        .count();
+    if in_window >= max_per_window {
+        let oldest = history
+            .iter()
+            .filter(|ts| now.saturating_sub(**ts) < SWITCH_RATE_WINDOW_MS)
+            .min()
+            .copied()
+            .unwrap_or(now);
+        let wait_ms = SWITCH_RATE_WINDOW_MS - now.saturating_sub(oldest);
+        return Err(format!(
+            "1 分钟内已切换 {in_window} 次，已触发切号保护；请等待 {} 秒后再试（可用 {SWITCH_MAX_PER_WINDOW_ENV} 调整上限）",
+            (wait_ms.max(0) + 999) / 1000
+        ));
+    }
+    Ok(())
+}
+
+/// 记录并校验切号频率（进程级）。
+fn guard_switch_rate(now: i64) -> Result<(), String> {
+    // 集成测试会在同一进程内连续切换，用该开关整体放行（生产环境不应设置）。
+    if std::env::var("WB_SWITCH_DISABLE_RATE_GUARD")
+        .map(|value| value.trim() == "1")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    use std::sync::{Mutex, OnceLock};
+    static HISTORY: OnceLock<Mutex<Vec<i64>>> = OnceLock::new();
+    let history = HISTORY.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = match history.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    evaluate_switch_rate(
+        &guard,
+        now,
+        switch_min_interval_ms(),
+        switch_max_per_window(),
+    )?;
+    guard.push(now);
+    // 只保留窗口内的记录，避免长期运行无限增长。
+    guard.retain(|ts| now.saturating_sub(*ts) < SWITCH_RATE_WINDOW_MS * 2);
+    Ok(())
+}
+
+/// 把可能是秒或毫秒的时间戳归一为毫秒。
+fn normalize_epoch_ms(value: i64) -> i64 {
+    if value > 0 && value < 10_000_000_000 {
+        value.saturating_mul(1000)
+    } else {
+        value
+    }
+}
+
+/// 切号前预检目标账号的登录态。
+///
+/// - 访问令牌已过期但刷新令牌仍有效 → 放行并返回提示（切号流程会刷新）；
+/// - 两者都过期或缺少刷新令牌 → 拒绝，避免用户关掉客户端后才发现登不上。
+fn precheck_target_account(acc: &Value) -> Result<Option<String>, String> {
+    let Some(expires_at) = acc.get("expiresAt").and_then(Value::as_i64) else {
+        return Ok(None);
+    };
+    let now = now_ms();
+    let expires_ms = normalize_epoch_ms(expires_at);
+    if expires_ms > now {
+        return Ok(None);
+    }
+    let has_refresh = acc
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let refresh_ok = acc
+        .get("refreshExpiresAt")
+        .and_then(Value::as_i64)
+        .map(normalize_epoch_ms)
+        .map(|value| value > now)
+        .unwrap_or(false);
+    if has_refresh && refresh_ok {
+        return Ok(Some(
+            "目标账号访问令牌已过期，切换过程中会自动刷新".to_string(),
+        ));
+    }
+    Err(
+        "目标账号登录态已过期（刷新令牌也失效），请先在账号页刷新 Token 或重新登录后再切换"
+            .to_string(),
+    )
+}
+
 /// 切换账号。
 ///
 /// `copy_session_ids` 非空时按路径 B 复制勾选会话（新 id，云端可同步）；
@@ -142,10 +295,11 @@ pub fn switch_account(
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
     restart: bool,
-    share_sessions: bool,
     copy_session_ids: &[String],
     sync_selections: &[SyncSelection],
 ) -> Result<Value, String> {
+    // 切号频率保护（最小间隔 + 窗口内次数上限）：在产生任何副作用之前拦下误连点。
+    guard_switch_rate(now_ms())?;
     // Snapshot and export must be one transaction with token refresh.
     // Acquire before backups/process management so a busy switch has no side effects.
     let auth_guard = crate::modules::auth_transaction::try_auth().map_err(|e| e.to_string())?;
@@ -161,10 +315,13 @@ pub fn switch_account(
         account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
     // 档位以账号自身为准：签名里的参数无法表达「用 A 档位操作 B 档位账号」。
     let variant = account::variant_of(&acc);
-    let backup = auth_file::backup_auth_file(variant);
+    // 目标账号登录态预检：过期且无法刷新时直接拒绝，不进入关客户端流程。
+    if let Some(note) = precheck_target_account(&acc)? {
+        progress(&note);
+    }
+    let backup = auth_file::backup_auth_file(variant)?;
 
     let mut copy_report: Option<Value> = None;
-    let mut session_report: Option<Value> = None;
     let mut sync_report: Option<Value> = None;
     let mut recovery_report: Option<Value> = None;
     if restart {
@@ -243,10 +400,6 @@ pub fn switch_account(
                 },
             );
         }
-        if share_sessions {
-            // 旧的「全体转移」兼容路径（默认关闭），Rust 版暂未实现
-            session_report = Some(json!({"error": "share_sessions 兼容路径暂未在 Rust 版实现"}));
-        }
         // 本次复制/同步新留下的未完成操作：不带着不一致的会话内容写认证并启动 App
         // （design §5 / R5）。未完成写入也不在这里被报告成成功——错误已在各自报告里，
         // 这里只决定「暂停」。未开始写入的失败（预览过期、源会话被删等）不产生操作记录，
@@ -292,9 +445,6 @@ pub fn switch_account(
     });
     if let Some(c) = copy_report {
         result["sessionCopy"] = c;
-    }
-    if let Some(s) = session_report {
-        result["sessionShare"] = s;
     }
     if let Some(s) = sync_report {
         result["sessionSync"] = s;
@@ -521,5 +671,51 @@ mod tests {
         // 都没有写入意图：不产生任何报告（保持原有语义）。
         let (copy, sync) = reject_session_writes_without_restart(false, false);
         assert!(copy.is_none() && sync.is_none());
+    }
+}
+
+#[cfg(test)]
+mod switch_rate_tests {
+    use super::*;
+
+    #[test]
+    fn first_switch_is_allowed() {
+        assert!(evaluate_switch_rate(&[], 1_000_000, 10_000, 5).is_ok());
+    }
+
+    #[test]
+    fn min_interval_blocks_fast_repeat() {
+        let err = evaluate_switch_rate(&[1_000_000], 1_005_000, 10_000, 5).unwrap_err();
+        assert!(err.contains("请等待 5 秒"), "{err}");
+        assert!(evaluate_switch_rate(&[1_000_000], 1_010_000, 10_000, 5).is_ok());
+    }
+
+    #[test]
+    fn window_limit_blocks_burst() {
+        let history = vec![1_000_000, 1_020_000, 1_030_000, 1_040_000, 1_050_000];
+        let err = evaluate_switch_rate(&history, 1_055_000, 0, 5).unwrap_err();
+        assert!(err.contains("已切换 5 次"), "{err}");
+        // 窗口外的旧记录不计入
+        assert!(evaluate_switch_rate(&history, 1_200_000, 0, 5).is_ok());
+    }
+
+    #[test]
+    fn epoch_seconds_are_normalized() {
+        assert_eq!(normalize_epoch_ms(1_760_000_000), 1_760_000_000_000);
+        assert_eq!(normalize_epoch_ms(1_760_000_000_000), 1_760_000_000_000);
+    }
+
+    #[test]
+    fn precheck_allows_valid_and_blocks_dead_login() {
+        let now = now_ms();
+        let valid = json!({ "expiresAt": now + 600_000, "refresh_token": "r", "refreshExpiresAt": now + 600_000 });
+        assert!(precheck_target_account(&valid).unwrap().is_none());
+
+        let refreshable = json!({ "expiresAt": now - 1000, "refresh_token": "r", "refreshExpiresAt": now + 600_000 });
+        assert!(precheck_target_account(&refreshable).unwrap().is_some());
+
+        let dead =
+            json!({ "expiresAt": now - 1000, "refresh_token": "", "refreshExpiresAt": now - 2000 });
+        assert!(precheck_target_account(&dead).is_err());
     }
 }
