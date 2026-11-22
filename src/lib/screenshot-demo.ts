@@ -1,3 +1,5 @@
+import { APP_VERSION } from "@/lib/app-version";
+import { GITHUB_REPOSITORY_URL } from "@/lib/update";
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
@@ -778,7 +780,7 @@ function buildDemoSessionGroups(
 /** Read-only demo response provider. It never reads or mutates real user data. */
 export function screenshotDemoResponse(command: string, args?: Record<string, unknown>): unknown {
   const demoAccounts = hydratedAccounts();
-  const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
+  const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: APP_VERSION };
   const activeIndex = Math.max(0, demoAccounts.findIndex((account) => account.id === demoActiveCliAccountId));
   const activeAccount = demoAccounts[activeIndex] ?? demoAccounts[0];
   const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, activeAccountVariant: accountVariant(activeAccount), accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
@@ -1000,7 +1002,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "rotate_status": return rotateStatus;
     case "get_rotate_logs": return { logs: rotateLogs() };
     case "get_github_config": return githubConfig;
-    case "check_update": return { ok: true, current: "0.1.24", latest: "0.1.25", latestTag: "v0.1.25", hasUpdate: true, releaseName: "更新提示演示", releaseUrl: "https://github.com/changexbc/workbuddy-switch/releases/tag/v0.1.25" };
+    case "check_update": return { ok: true, current: APP_VERSION, latest: APP_VERSION, latestTag: `v${APP_VERSION}`, hasUpdate: true, releaseName: "更新提示演示", releaseUrl: `${GITHUB_REPOSITORY_URL}/releases/latest` };
     case "get_launch_at_login_enabled": return true;
     case "switch_progress": return { running: false, progress: null };
     default: throw new Error(`演示模式缺少只读数据: ${command}`);
