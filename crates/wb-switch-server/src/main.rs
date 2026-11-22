@@ -100,6 +100,22 @@ fn variant_arg(args: &[String]) -> WbVariant {
     WbVariant::parse(raw.as_deref())
 }
 
+/// 只保留首字符：终端/日志里不出现完整昵称。
+fn mask_label(text: &str) -> String {
+    let chars: Vec<char> = text.trim().chars().collect();
+    match chars.len() {
+        0 => "未知".to_string(),
+        1 => "*".to_string(),
+        n => format!("{}{}", chars[0], "*".repeat(n - 1)),
+    }
+}
+
+/// uid 只保留前 6 位，便于用户自己核对是哪个账号，又不至于完整暴露。
+fn mask_uid(uid: &str) -> String {
+    let head: String = uid.trim().chars().take(6).collect();
+    format!("{head}…")
+}
+
 fn print_status(variant: WbVariant) {
     let auth = auth_file::read_auth_file(variant);
     let current = auth.as_ref().map(|a| {
@@ -118,8 +134,16 @@ fn print_status(variant: WbVariant) {
             let name = c
                 .get("nickname")
                 .and_then(|v| v.as_str())
-                .or_else(|| c.get("email").and_then(|v| v.as_str()))
-                .unwrap_or("未知");
+                .filter(|v| !v.trim().is_empty())
+                .map(mask_label)
+                .or_else(|| {
+                    // 没有昵称时用 uid 前缀，绝不回退到邮箱：终端输出常被贴进 issue。
+                    c.get("uid")
+                        .and_then(|v| v.as_str())
+                        .filter(|v| !v.trim().is_empty())
+                        .map(mask_uid)
+                })
+                .unwrap_or_else(|| "未知".to_string());
             println!("当前账号: {name}");
         }
         None => println!("当前账号: 未登录"),
