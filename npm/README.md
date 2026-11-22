@@ -45,7 +45,7 @@ webui 界面与桌面 App 一致，功能覆盖下方全部模块。
 | VS Code CodeBuddy 插件 | 支持切换 VS Code 内的 CodeBuddy 插件账号；VS Code 运行时可自动关闭并在写入后重新打开 |
 | 插件会话复制 | 切换插件账号时，可把当前插件账号的会话复制给目标账号（加法，源账号不变） |
 | 自动轮换 | 后台把积分最紧迫的账号设为 CodeBuddy CLI 后续启动账号；检测到 CLI 会话运行时会跳过 |
-| 自动更新 | 从 GitHub Releases 检查新版本，整包更新经签名校验 |
+| 更新检查 | 从 GitHub Releases 检查新版本；发现后打开发布页手动下载单文件 EXE（不做应用内安装） |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
 
 ## 使用
@@ -55,7 +55,7 @@ webui 界面与桌面 App 一致，功能覆盖下方全部模块。
 3. **查看积分与统计**：账号页自动查询各账号积分到期情况，点「刷新积分」手动更新；侧栏进入「积分统计」「Token 统计」查看用量明细
 4. **切换各客户端账号**：CodeBuddy CLI、CodeBuddy IDE、VS Code CodeBuddy 插件均可在账号卡片一键切换；其中 VS Code 插件支持在弹窗中勾选复制当前账号的会话。CodeBuddy IDE 首次使用前需先手动打开并登录一次
 5. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后按积分紧迫程度自动设置默认账号
-6. **更新**：设置 → 自动更新可检查公开 GitHub Releases 源；npm 版本也可通过 `npm update -g workbuddy-switch` 升级
+6. **更新**：设置页可检查公开 GitHub Releases；桌面版到发布页下载单文件 EXE 覆盖即可，npm 版用 `npm update -g workbuddy-switch` 升级
 
 ## macOS 权限说明
 

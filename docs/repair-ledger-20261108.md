@@ -6,7 +6,12 @@
 Baseline: `aa705ea` → `5b5f4a7`
 
 This ledger is the compact, repository-tracked index of reviewed findings and their disposition. Detailed evidence remains in the workspace review report.
-Current HEAD: `e4150b411727a99c63936eb90e1a9fc3451ea169` (1.0.13 single-file); latest verification: core 823 / server 15 / Tauri 34 / frontend 82; test CI `42572822638`.
+
+> **历史快照**：以下「Current HEAD / verification」是 **2026-11-08（1.0.13 时代）** 的数值，
+> 仅用于说明当时的验证口径，**不代表当前状态**。当前基线见
+> [`repair-ledger-20261122.md`](./repair-ledger-20261122.md)（core 883 / server 15 / 前端 9 文件）。
+
+Current HEAD at that time: `e4150b411727a99c63936eb90e1a9fc3451ea169` (1.0.13 single-file); verification then: core 823 / server 15 / Tauri 34 / frontend 82; test CI `42572822638`.
 
 ## Fixed
 

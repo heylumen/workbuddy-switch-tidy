@@ -17,10 +17,12 @@
 
 | 检查 | 作用 |
 |---|---|
-| `quality-gates` | 版本一致性、修复台账、legacy 颜色回退、PII、`npm audit`、`cargo audit` |
-| `rust-tests` | 三平台 core 测试 |
-| `lint` | tsc、fmt、clippy、server/Tauri 测试 |
+| `quality-gates` | 版本一致性、修复台账、legacy 颜色回退、PII、命令/路由契约、债务棘轮、workflow YAML 语法、前端构建与运行时冒烟、`npm audit`、`cargo audit` |
+| `rust-tests` | 三平台 core 测试（ubuntu 额外跑 linux cfg 的 clippy） |
+| `lint` | tsc、fmt、clippy（`-D warnings`）、server/Tauri 测试 |
 | `frontend-tests` | 前端逻辑回归 |
+
+另有非阻塞的 `release-smoke`（发版后自动验收：前端挂载 / 资产结构 / EXE 启动存活）。
 
 ## 跨平台规则
 
@@ -42,18 +44,31 @@
 ```bash
 npx tsc --noEmit
 npm test -- --run
+npm run build                      # 构建产物 + 下面用 --dist 冒烟
+
 cargo fmt --all -- --check
-cargo clippy -p wb-switch-core -p wb-switch-server --all-targets -- -D warnings
+# 必须带 -D warnings：CI 就是这么跑的，少了它会出现「本地绿、CI 红」（2026-11-22 踩过）
+cargo clippy -p wb-switch-core -p wb-switch-server -p wb-switch-rust \
+  --all-targets --no-deps -- -D warnings
 cargo test -p wb-switch-core --lib
+cargo test -p wb-switch-core --tests
 cargo test -p wb-switch-server
-CARGO_INCREMENTAL=0 cargo test -p wb-switch-rust --lib
+
+cargo audit                        # 要求 0 vulnerabilities
+
+python scripts/smoke-webui.py --dist dist        # 前端挂载冒烟（防白屏）
+python scripts/check-version-consistency.py
+python scripts/check-command-routes.py           # 改了命令/接口必跑
+python scripts/check-debt-ratchet.py             # 想加 TODO 或长文件会在这里被拦
+python scripts/check-repair-ledger.py docs/repair-ledger-20261122.md
 python scripts/check-portability.py
 python scripts/check-demo-commands.py
-python scripts/check-version-consistency.py
-python scripts/check-repair-ledger.py
 python scripts/check-legacy-colors.py
-python scripts/check-pii.py README.md
+python scripts/check-pii.py README.md docs/*.md
 ```
+
+> 文档改动：`docs/*.md` 的结构描述要跟着实现走；改了模块职责请同步
+> `docs/ARCHITECTURE.md`，改了流程请同步 `docs/DEVELOPMENT.md`。
 
 ## 涉及关联表/会话数据的改动
 
