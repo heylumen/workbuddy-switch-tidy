@@ -112,6 +112,8 @@ export default function SessionsPage() {
   }
   const scope = client === "codebuddyIde" ? variantScope : undefined;
   const listRequestId = useRef(0);
+  /** 回填结果缓存：同组「最后活动时间 + 成员数」不变时不重复拉详情（防翻页/切档位重复扫）。 */
+  const summaryCacheRef = useRef(new Map<string, Pick<SessionGroupSummary, "title" | "projectLabel" | "latestActivityAt" | "summaryStatus" | "summaryText" | "safeSourceMemberId" | "hasSafeSource">>());
   const detailRequestId = useRef(0);
   const previewRequestId = useRef(0);
   const contextRef = useRef({ client, scope, selectedGroupId, sourceMemberId });
@@ -141,12 +143,65 @@ export default function SessionsPage() {
     if (accounts.length === 0) void fetchAll();
   }, [accounts.length, fetchAll]);
 
+  /**
+   * 应用列表结果。整表刷新时后端返回的是**轻量行**（摘要状态为 unknown/pending），
+   * 若直接覆盖，回填 effect 会把当前页每一组都重新 `getSessionGroup` 一遍
+   * （每次都要读成员与正文预览）——这就是“刷新一下仿佛重扫所有会话”。
+   * 这里按「最后活动时间 + 成员数」判断该组确实没变时，沿用已有的摘要结果。
+   */
   const applyListResult = useCallback((result: SessionGroupList) => {
-    setGroups(result.groups);
+    setGroups((previous) => {
+      if (previous.length === 0) return result.groups;
+      const known = new Map(previous.map((item) => [item.groupId, item]));
+      return result.groups.map((item) => {
+        const old = known.get(item.groupId);
+        const lightweightRow = item.summaryStatus === "unknown" || item.summaryStatus === "pending";
+        const unchanged = old
+          && old.latestActivityAt === item.latestActivityAt
+          && old.memberCount === item.memberCount
+          && old.activeMemberCount === item.activeMemberCount;
+        if (lightweightRow && unchanged && old.summaryStatus !== "unknown" && old.summaryStatus !== "pending") {
+          return {
+            ...item,
+            summaryStatus: old.summaryStatus,
+            summaryText: old.summaryText,
+            safeSourceMemberId: old.safeSourceMemberId,
+            hasSafeSource: old.hasSafeSource,
+          };
+        }
+        return item;
+      });
+    });
     setLightweight(Boolean(result.lightweight));
     setGroupsRevision((value) => value + 1);
     setStoreStatus(result.storeStatus);
     setStoreError(result.storeError ?? null);
+  }, []);
+
+  /**
+   * 就地更新列表里的一行。写操作（同步 / 统一 / 新增 / 取消关联）后只有这一组会变，
+   * 以前一律 `reloadGroups()` 整表重扫，会把 `groupsRevision` +1 并触发「轻量列表回填」
+   * 对整页 pending 组逐个重拉详情 —— 一个操作就能引发几十次请求，越用越卡。
+   */
+  const patchGroupRow = useCallback((next: SessionGroupDetail) => {
+    setGroups((current) => current.map((item) => item.groupId === next.groupId ? {
+      ...item,
+      title: next.title,
+      projectLabel: next.projectLabel,
+      latestActivityAt: next.latestActivityAt,
+      memberCount: next.members.length,
+      activeMemberCount: next.members.filter((member) => member.linkState === "active").length,
+      accountNames: next.members.map((member) => member.accountName),
+      summaryStatus: next.summaryStatus,
+      summaryText: next.summaryText,
+      safeSourceMemberId: next.safeSourceMemberId,
+      hasSafeSource: next.hasSafeSource,
+    } : item));
+  }, []);
+
+  /** 组已不存在（取消关联到空组 / 删除关联）：从列表移除这一行，不重扫整表。 */
+  const dropGroupRow = useCallback((groupId: string) => {
+    setGroups((current) => current.filter((item) => item.groupId !== groupId));
   }, []);
 
   const reloadGroups = useCallback(async () => {
@@ -246,24 +301,63 @@ export default function SessionsPage() {
 
   useEffect(() => { setPage(1); }, [statusFilter, sortOrder, client, scope]);
 
-  // 轻量列表只回填当前页可见组；翻页/刷新时作废旧请求，避免后台扫描全部组。
+  /**
+   * 轻量列表只回填当前页可见组。
+   *
+   * 三个防卡要点（2026-11-23 优化）：
+   * 1. **摘要缓存**：键为「档位:范围:组:最后活动时间:成员数」，三者不变就不重复拉详情——
+   *    翻页来回、切换档位再切回、手动刷新后都不会再扫一遍；
+   * 2. **批量提交**：结果先在 Map 里攒 4 条再 `setGroups` 一次，避免逐条 setState 触发
+   *    连续重渲染（列表越大越明显）；
+   * 3. **只扫当前页**：`visibleGroupKey` 变化才重启，且 2 个 worker 兜住并发上限。
+   */
   useEffect(() => {
     const visibleIds = new Set(visibleGroups.map((group) => group.groupId));
     const pending = groups.filter((group) => (group.summaryStatus === "unknown" || group.summaryStatus === "pending") && visibleIds.has(group.groupId));
     if (!lightweight || pending.length === 0) return;
+
+    const cache = summaryCacheRef.current;
+    const keyOf = (group: SessionGroupSummary) =>
+      `${client}:${scope ?? "all"}:${group.groupId}:${group.latestActivityAt}:${group.memberCount}`;
+
+    type SummaryPatch = Pick<SessionGroupSummary, "title" | "projectLabel" | "latestActivityAt"
+      | "summaryStatus" | "summaryText" | "safeSourceMemberId" | "hasSafeSource">;
+
+    // ① 先消化缓存命中项
+    const cached = new Map<string, SummaryPatch>();
+    const missed: SessionGroupSummary[] = [];
+    for (const group of pending) {
+      const hit = cache.get(keyOf(group));
+      if (hit) cached.set(group.groupId, hit);
+      else missed.push(group);
+    }
+    if (cached.size > 0) {
+      setGroups((current) => current.map((item) => cached.has(item.groupId)
+        ? { ...item, ...cached.get(item.groupId)! }
+        : item));
+    }
+    if (missed.length === 0) return;
+
     let cancelled = false;
     let cursor = 0;
+    const batch = new Map<string, SummaryPatch>();
+    const flush = () => {
+      if (batch.size === 0) return;
+      const patch = new Map(batch);
+      batch.clear();
+      setGroups((current) => current.map((item) => patch.has(item.groupId)
+        ? { ...item, ...patch.get(item.groupId)! }
+        : item));
+    };
     setEnriching(true);
-    const revision = groupsRevision;
     const worker = async () => {
       while (!cancelled) {
-        const group = pending[cursor++];
+        const group = missed[cursor++];
         if (!group) return;
         try {
           const next = await api.getSessionGroup(client, group.groupId, scope);
-          if (cancelled || groupsRevision !== revision) return;
-          setGroups((current) => current.map((item) => item.groupId === group.groupId ? {
-            ...item,
+          if (cancelled) return;
+          const summary: SummaryPatch = {
             title: next.title,
             projectLabel: next.projectLabel,
             latestActivityAt: next.latestActivityAt,
@@ -271,17 +365,24 @@ export default function SessionsPage() {
             summaryText: next.summaryText,
             safeSourceMemberId: next.safeSourceMemberId,
             hasSafeSource: next.hasSafeSource,
-          } : item));
+          };
+          if (cache.size > 200) cache.clear();
+          cache.set(keyOf(group), summary);
+          batch.set(group.groupId, summary);
+          if (batch.size >= 4) flush();
         } catch {
           // 单组确认失败保留“无法确认”，不影响其它组。
         }
       }
     };
     void Promise.all([worker(), worker()]).finally(() => {
-      if (!cancelled) setEnriching(false);
+      if (cancelled) return;
+      flush();
+      setEnriching(false);
     });
     return () => {
       cancelled = true;
+      flush();
       setEnriching(false);
     };
     // 只看当前页；groups 更新由 revision/visibleGroupKey 触发，避免每次回填重启任务。
@@ -483,7 +584,7 @@ export default function SessionsPage() {
         setSelectedGroupId(null);
         setDetail(null);
         setDetailError(null);
-        await reloadGroups();
+        dropGroupRow(groupId);
       } else {
         toast.success(`已取消「${member.accountName}」的关联`);
         await reloadSelectedGroup();
@@ -511,7 +612,7 @@ export default function SessionsPage() {
         setDetail(null);
         setDetailError(null);
       }
-      await reloadGroups();
+      dropGroupRow(group.groupId);
     } catch (error) {
       // 失败时保留确认框，方便直接重试。
       toast.error("删除关联失败", { description: api.asError(error) });
@@ -520,7 +621,18 @@ export default function SessionsPage() {
     }
   }
 
-  async function reloadSelectedGroup() {
+  /**
+   * 刷新当前打开的会话组。
+   *
+   * `refreshList` 默认 **false**：写操作（同步/新增/解除关联）后只需要更新这一组。
+   * 早先这里无条件 `await reloadGroups()`，导致每次同步都要重扫整张列表；
+   * 而列表重扫会把 `groupsRevision` +1 → 触发「轻量列表回填」effect 对当前页
+   * **所有** pending 组逐个重新 `getSessionGroup`（每次都要读成员与正文预览），
+   * 于是「同步一次 = 全量刷新 + N 次详情请求」，表现为重复刷新、越用越卡。
+   * 现在的做法：拿回这一组的详情后，只就地替换 `groups` 中对应的那一行。
+   * 需要整表刷新时由调用方显式传 `{ refreshList: true }`（顶部「刷新」按钮 / 新增关联）。
+   */
+  async function reloadSelectedGroup(options: { refreshList?: boolean } = {}) {
     const key = `${client}:${scope ?? "all"}:${selectedGroupId ?? "none"}`;
     // An operation may finish after the user selected another group/client.
     if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}:${contextRef.current.selectedGroupId ?? "none"}` !== key || !selectedGroupId) return;
@@ -530,9 +642,11 @@ export default function SessionsPage() {
     previewRequestId.current += 1;
     setUnifyPlan(null);
     setUnifyLoading(null);
-    await reloadGroups();
-    if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}:${contextRef.current.selectedGroupId ?? "none"}` !== key) return;
-    if (!selectedGroupId) return;
+    if (options.refreshList) {
+      await reloadGroups();
+      if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}:${contextRef.current.selectedGroupId ?? "none"}` !== key) return;
+      if (!selectedGroupId) return;
+    }
     try {
       const next = await api.getSessionGroup(client, selectedGroupId, scope);
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}:${contextRef.current.selectedGroupId ?? "none"}` !== key || detailRequestId.current !== requestId) return;
@@ -542,6 +656,9 @@ export default function SessionsPage() {
       previewRequestId.current += 1;
       setUnifyPlan(null);
       setUnifyLoading(null);
+      // 只替换这一行：同步后列表里需要变的也就是标题/时间/成员数/摘要状态，
+      // 不必整表重扫（也不动 groupsRevision，避免触发回填 effect 重启）。
+      patchGroupRow(next);
     } catch (error) {
       if (`${contextRef.current.client}:${contextRef.current.scope ?? "all"}:${contextRef.current.selectedGroupId ?? "none"}` === key && detailRequestId.current === requestId) setDetailError(api.asError(error));
     } finally {
@@ -582,8 +699,8 @@ export default function SessionsPage() {
             <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
               <SessionSearchDialog variant={variantScope} />
               <CanonicalAuditDialog variant={variantScope} />
-              <Button variant="outline" size="sm" className="shrink-0" onClick={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} disabled={loading || detailLoading}><RefreshCw className={loading ? "animate-spin" : undefined} />刷新</Button>
-              <AddLinkedSessionDialog client={client} disabled={loading} onDone={() => void (selectedGroupId ? reloadSelectedGroup() : reloadGroups())} requestRestartConfirm={(actionLabel, run) => setRestartPrompt({ actionLabel, run })} />
+              <Button variant="outline" size="sm" className="shrink-0" onClick={() => void (selectedGroupId ? reloadSelectedGroup({ refreshList: true }) : reloadGroups())} disabled={loading || detailLoading}><RefreshCw className={loading ? "animate-spin" : undefined} />刷新</Button>
+              <AddLinkedSessionDialog client={client} disabled={loading} onDone={() => void (selectedGroupId ? reloadSelectedGroup({ refreshList: true }) : reloadGroups())} requestRestartConfirm={(actionLabel, run) => setRestartPrompt({ actionLabel, run })} />
             </div>
           </div>
           <Tabs value={client} onValueChange={changeClient} className="mt-4">
